@@ -192,7 +192,7 @@ class HarvestRunner:
         metadata = {}
         result = None
         deadlock_retries = 0
-        max_deadlock_retries = 2
+        max_deadlock_retries = 5
         try:
             while True:
                 try:
@@ -216,7 +216,8 @@ class HarvestRunner:
                         "collector job deadlock, retrying",
                         extra={"job_name": job_name, "source": source, "deadlock_retries": deadlock_retries},
                     )
-                    await asyncio.sleep(0.25 * deadlock_retries)
+                    sleep_seconds = min(5.0, 0.5 * (2 ** (deadlock_retries - 1)))
+                    await asyncio.sleep(sleep_seconds)
                 except Exception as exc:
                     status = "error"
                     error_code = type(exc).__name__
