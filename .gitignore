@@ -1,0 +1,31 @@
+# 仅跟踪 Polaris 项目目录，仓库根目录其余内容默认忽略
+/*
+!/.gitignore
+!/Polaris/
+!/Polaris/**
+
+# Python / tooling artifacts
+**/.venv/
+**/__pycache__/
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+**/*.pyc
+**/*.pyo
+**/*.pyd
+**/*.log
+
+# local env
+**/.env
+
+# build artifacts
+**/dist/
+**/build/
+**/*.egg-info/
+
+# local database or temp dumps
+**/*.sqlite
+**/*.db
+
+# research / legacy artifacts
+analysis_final/
