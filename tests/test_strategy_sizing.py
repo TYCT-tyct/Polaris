@@ -5,6 +5,7 @@ from datetime import UTC, datetime, timedelta
 from polaris.arb.config import ArbConfig, arb_config_from_settings
 from polaris.arb.contracts import PriceLevel, RunMode, TokenSnapshot
 from polaris.arb.strategies.strategy_a import StrategyA
+from polaris.arb.strategies.strategy_c import StrategyC
 from polaris.arb.strategies.strategy_f import StrategyF
 from polaris.config import PolarisSettings
 
@@ -22,6 +23,10 @@ def _token(
     market_id: str,
     event_id: str,
     ask: float,
+    *,
+    side: str = "YES",
+    outcome_label: str = "YES",
+    outcome_index: int = 0,
     min_order_size: float | None = None,
     end_after_hours: float = 6.0,
 ) -> TokenSnapshot:
@@ -32,9 +37,9 @@ def _token(
         event_id=event_id,
         market_question="q",
         market_end=now + timedelta(hours=end_after_hours),
-        outcome_label="YES",
-        outcome_side="YES",
-        outcome_index=0,
+        outcome_label=outcome_label,
+        outcome_side=side,
+        outcome_index=outcome_index,
         min_order_size=min_order_size,
         tick_size=0.01,
         best_bid=max(0.01, ask - 0.01),
@@ -75,3 +80,31 @@ def test_strategy_f_raises_size_to_min_order_size() -> None:
     leg = signals[0].features["legs"][0]
     assert float(leg["shares"]) >= 7.0
     assert float(leg["notional_usd"]) >= float(leg["price"]) * 7.0
+
+
+def test_strategy_c_limits_candidates_per_event() -> None:
+    settings = PolarisSettings(
+        database_url="postgresql://postgres:postgres@localhost:55432/polaris",
+        arb_single_risk_usd=20.0,
+        arb_c_min_edge_pct=0.01,
+        arb_c_max_candidates_per_event=1,
+    )
+    config = arb_config_from_settings(settings)
+    strategy = StrategyC(config)
+    event_id = "event-c"
+
+    # 构造四个互斥 market，确保策略 C 产生多个候选，再验证只保留最优。
+    snapshots = [
+        _token("m1-yes", "m1", event_id, ask=0.18, side="YES", outcome_label="YES", outcome_index=0),
+        _token("m1-no", "m1", event_id, ask=0.06, side="NO", outcome_label="NO", outcome_index=1),
+        _token("m2-yes", "m2", event_id, ask=0.20, side="YES", outcome_label="YES", outcome_index=0),
+        _token("m2-no", "m2", event_id, ask=0.08, side="NO", outcome_label="NO", outcome_index=1),
+        _token("m3-yes", "m3", event_id, ask=0.22, side="YES", outcome_label="YES", outcome_index=0),
+        _token("m3-no", "m3", event_id, ask=0.09, side="NO", outcome_label="NO", outcome_index=1),
+        _token("m4-yes", "m4", event_id, ask=0.24, side="YES", outcome_label="YES", outcome_index=0),
+        _token("m4-no", "m4", event_id, ask=0.10, side="NO", outcome_label="NO", outcome_index=1),
+    ]
+
+    signals = strategy.scan(RunMode.SHADOW, "polymarket", snapshots)
+    assert len(signals) == 1
+    assert signals[0].strategy_code.value == "C"

@@ -58,11 +58,24 @@ class ArbOrchestrator:
     async def run_once(self, mode: RunMode, source_code: str = "polymarket") -> dict[str, int]:
         snapshots = await self._load_live_snapshots()
         if not snapshots:
-            return {"signals": 0, "executed": 0}
+            return {"signals": 0, "processed": 0, "executed": 0}
 
         all_signals = self._scan_all(mode, source_code, snapshots)
         ordered = self._order_signals(all_signals)
+        if self.config.max_signals_per_cycle > 0 and len(ordered) > self.config.max_signals_per_cycle:
+            logger.info(
+                "arb signal cap applied",
+                extra={
+                    "mode": mode.value,
+                    "source_code": source_code,
+                    "total_signals": len(ordered),
+                    "cap": self.config.max_signals_per_cycle,
+                },
+            )
+            ordered = ordered[: self.config.max_signals_per_cycle]
         executed = 0
+        snapshot_map = {item.token_id: item for item in snapshots}
+        risk_state = await self.risk_gate.load_state(mode, source_code)
         for signal in ordered:
             if signal.is_expired():
                 await self._record_signal(signal, SignalStatus.EXPIRED)
@@ -75,17 +88,23 @@ class ArbOrchestrator:
                     continue
 
             notional = _estimate_capital(signal)
-            decision = await self.risk_gate.assess(signal, notional)
+            decision = await self.risk_gate.assess(signal, notional, state=risk_state)
             if not decision.allowed:
                 await self._record_signal(signal, SignalStatus.REJECTED, note=decision.reason)
                 await self.risk_gate.record_risk_event(signal.mode, signal.strategy_code, signal.source_code, decision)
                 continue
 
+            self.risk_gate.reserve_exposure(risk_state, notional)
             plan = self._build_plan(signal)
             await self._record_signal(signal, SignalStatus.NEW)
-            result = await self.order_router.execute(plan, {item.token_id: item for item in snapshots})
+            result = await self.order_router.execute(plan, snapshot_map)
             success = result.status == "filled"
-            self.risk_gate.note_execution_outcome(success)
+            self.risk_gate.settle_execution(
+                state=risk_state,
+                success=success,
+                capital_required_usd=notional,
+                realized_pnl_usd=result.net_pnl_usd if success else 0.0,
+            )
             if success:
                 executed += 1
                 await self._record_cash_ledger(result)
@@ -97,7 +116,7 @@ class ArbOrchestrator:
         if mode == RunMode.PAPER_LIVE:
             await self._maybe_run_optimization()
 
-        return {"signals": len(all_signals), "executed": executed}
+        return {"signals": len(all_signals), "processed": len(ordered), "executed": executed}
 
     async def run_forever(self, mode: RunMode, source_code: str = "polymarket") -> None:
         while True:
@@ -189,6 +208,8 @@ class ArbOrchestrator:
         return {"strategies": float(len(per_strategy)), "net_pnl": total_net}
 
     async def _load_live_snapshots(self) -> list[TokenSnapshot]:
+        now = datetime.now(tz=UTC)
+        window_end = now + timedelta(hours=self.config.universe_max_hours)
         rows = await self.db.fetch_all(
             """
             select
@@ -206,13 +227,20 @@ class ArbOrchestrator:
                 m.end_date
             from dim_token t
             join dim_market m on m.market_id = t.market_id
-            where m.active = true and m.closed = false and m.archived = false
-            """
+            where m.active = true
+              and m.closed = false
+              and m.archived = false
+              and m.end_date is not null
+              and m.end_date > %s
+              and m.end_date <= %s
+            order by m.end_date asc, m.liquidity desc nulls last, t.outcome_index asc
+            limit %s
+            """,
+            (now, window_end, self.config.universe_token_limit),
         )
         if not rows:
             return []
 
-        now = datetime.now(tz=UTC)
         token_ids = []
         for row in rows:
             token_id = str(row["token_id"])
@@ -256,7 +284,7 @@ class ArbOrchestrator:
                     is_placeholder_outcome=bool(row["is_placeholder_outcome"]),
                     bids=tuple(PriceLevel(price=float(level.price), size=float(level.size)) for level in book.bids),
                     asks=tuple(PriceLevel(price=float(level.price), size=float(level.size)) for level in book.asks),
-                    captured_at=datetime.now(tz=UTC),
+                    captured_at=now,
                 )
             )
         return snapshots

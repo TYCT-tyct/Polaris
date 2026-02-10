@@ -78,6 +78,9 @@ class PolarisSettings(BaseSettings):
     arb_optimize_interval_sec: int = Field(default=86400)
     arb_optimize_replay_days: int = Field(default=14)
     arb_optimize_paper_hours: int = Field(default=24)
+    arb_max_signals_per_cycle: int = Field(default=48)
+    arb_universe_max_hours: float = Field(default=72.0)
+    arb_universe_token_limit: int = Field(default=2000)
 
     # module2: risk and sizing
     arb_min_order_notional_usd: float = Field(default=1.0)
@@ -104,6 +107,7 @@ class PolarisSettings(BaseSettings):
     arb_a_min_edge_pct: float = Field(default=0.015)
     arb_b_min_edge_pct: float = Field(default=0.012)
     arb_c_min_edge_pct: float = Field(default=0.015)
+    arb_c_max_candidates_per_event: int = Field(default=1)
     arb_f_min_prob: float = Field(default=0.94)
     arb_f_max_hours_to_resolve: float = Field(default=12.0)
     arb_f_min_annualized_return: float = Field(default=0.08)

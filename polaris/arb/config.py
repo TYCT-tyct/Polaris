@@ -12,6 +12,9 @@ class ArbConfig:
     optimize_interval_sec: int
     optimize_replay_days: int
     optimize_paper_hours: int
+    max_signals_per_cycle: int
+    universe_max_hours: float
+    universe_token_limit: int
 
     min_order_notional_usd: float
     single_risk_usd: float
@@ -35,6 +38,7 @@ class ArbConfig:
     a_min_edge_pct: float
     b_min_edge_pct: float
     c_min_edge_pct: float
+    c_max_candidates_per_event: int
     f_min_prob: float
     f_max_hours_to_resolve: float
     f_min_annualized_return: float
@@ -57,6 +61,9 @@ def arb_config_from_settings(settings: PolarisSettings) -> ArbConfig:
         optimize_interval_sec=settings.arb_optimize_interval_sec,
         optimize_replay_days=settings.arb_optimize_replay_days,
         optimize_paper_hours=settings.arb_optimize_paper_hours,
+        max_signals_per_cycle=settings.arb_max_signals_per_cycle,
+        universe_max_hours=settings.arb_universe_max_hours,
+        universe_token_limit=settings.arb_universe_token_limit,
         min_order_notional_usd=settings.arb_min_order_notional_usd,
         single_risk_usd=settings.arb_single_risk_usd,
         max_exposure_usd=settings.arb_max_exposure_usd,
@@ -77,6 +84,7 @@ def arb_config_from_settings(settings: PolarisSettings) -> ArbConfig:
         a_min_edge_pct=settings.arb_a_min_edge_pct,
         b_min_edge_pct=settings.arb_b_min_edge_pct,
         c_min_edge_pct=settings.arb_c_min_edge_pct,
+        c_max_candidates_per_event=settings.arb_c_max_candidates_per_event,
         f_min_prob=settings.arb_f_min_prob,
         f_max_hours_to_resolve=settings.arb_f_max_hours_to_resolve,
         f_min_annualized_return=settings.arb_f_min_annualized_return,
