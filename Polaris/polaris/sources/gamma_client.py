@@ -1,0 +1,147 @@
+from __future__ import annotations
+
+import json
+from datetime import datetime
+from typing import Any
+
+import httpx
+
+from polaris.config import RetryConfig
+from polaris.infra.rate_limiter import AsyncTokenBucket
+from polaris.infra.retry import with_retry
+from polaris.sources.models import TokenDescriptor
+
+
+class GammaClient:
+    def __init__(
+        self,
+        limiter: AsyncTokenBucket,
+        retry: RetryConfig,
+        timeout_seconds: float = 25.0,
+    ) -> None:
+        self._limiter = limiter
+        self._retry = retry
+        self._client = httpx.AsyncClient(
+            base_url="https://gamma-api.polymarket.com",
+            timeout=timeout_seconds,
+            headers={"accept": "application/json", "accept-encoding": "gzip"},
+        )
+
+    async def close(self) -> None:
+        await self._client.aclose()
+
+    async def fetch_markets_page(self, limit: int, offset: int) -> list[dict[str, Any]]:
+        params = {
+            "limit": str(limit),
+            "offset": str(offset),
+            "order": "id",
+            "ascending": "false",
+        }
+        return await self._get_json("/markets", params=params)
+
+    async def iter_markets(self, page_size: int = 500, max_pages: int = 20) -> list[dict[str, Any]]:
+        all_rows: list[dict[str, Any]] = []
+        for page in range(max_pages):
+            offset = page * page_size
+            rows = await self.fetch_markets_page(page_size, offset)
+            if not rows:
+                break
+            all_rows.extend(rows)
+            if len(rows) < page_size:
+                break
+        return all_rows
+
+    @staticmethod
+    def market_record(raw: dict[str, Any]) -> dict[str, Any]:
+        market_id = str(raw.get("id"))
+        return {
+            "market_id": market_id,
+            "gamma_market_id": raw.get("id"),
+            "condition_id": raw.get("conditionId"),
+            "question": raw.get("question") or "",
+            "slug": raw.get("slug") or f"market-{market_id}",
+            "event_slug": raw.get("eventSlug"),
+            "category": raw.get("category"),
+            "start_date": _parse_ts(raw.get("startDate")),
+            "end_date": _parse_ts(raw.get("endDate")),
+            "neg_risk": bool(raw.get("negRisk") or False),
+            "active": bool(raw.get("active") or False),
+            "closed": bool(raw.get("closed") or False),
+            "archived": bool(raw.get("archived") or False),
+            "spread": _to_float(raw.get("spread")),
+            "liquidity": _to_float(raw.get("liquidityNum") or raw.get("liquidity")),
+            "volume": _to_float(raw.get("volumeNum") or raw.get("volume")),
+            "updated_from_source_at": _parse_ts(raw.get("updatedAt")),
+        }
+
+    @staticmethod
+    def token_descriptors(raw: dict[str, Any]) -> list[TokenDescriptor]:
+        market_id = str(raw.get("id"))
+        outcomes = _parse_json_list(raw.get("outcomes"))
+        token_ids = _parse_json_list(raw.get("clobTokenIds"))
+        descriptors: list[TokenDescriptor] = []
+        for idx, token_id in enumerate(token_ids):
+            if not token_id:
+                continue
+            label = outcomes[idx] if idx < len(outcomes) else f"OUTCOME_{idx}"
+            side = "YES" if idx == 0 else "NO"
+            descriptors.append(
+                TokenDescriptor(
+                    token_id=str(token_id),
+                    market_id=market_id,
+                    outcome_label=str(label),
+                    outcome_side=side,
+                )
+            )
+        return descriptors
+
+    async def _get_json(self, path: str, params: dict[str, str]) -> list[dict[str, Any]]:
+        async def _do() -> list[dict[str, Any]]:
+            await self._limiter.acquire()
+            response = await self._client.get(path, params=params)
+            response.raise_for_status()
+            payload = response.json()
+            if isinstance(payload, list):
+                return payload
+            return []
+
+        return await with_retry(_do, self._retry)
+
+
+def _parse_json_list(raw: Any) -> list[Any]:
+    if raw is None:
+        return []
+    if isinstance(raw, list):
+        return raw
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, list):
+                return parsed
+        except json.JSONDecodeError:
+            return []
+    return []
+
+
+def _parse_ts(raw: Any) -> datetime | None:
+    if raw in (None, ""):
+        return None
+    if isinstance(raw, datetime):
+        return raw
+    if isinstance(raw, str):
+        text = raw.replace("Z", "+00:00")
+        try:
+            return datetime.fromisoformat(text)
+        except ValueError:
+            return None
+    return None
+
+
+def _to_float(raw: Any) -> float | None:
+    if raw in (None, ""):
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
