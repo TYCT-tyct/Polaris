@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from datetime import UTC, datetime, timedelta
 from typing import Awaitable, Callable
+
+from psycopg.errors import DeadlockDetected
 
 from polaris.config import PolarisSettings
 from polaris.db.pool import Database
@@ -188,17 +191,39 @@ class HarvestRunner:
         error_message = None
         metadata = {}
         result = None
+        deadlock_retries = 0
+        max_deadlock_retries = 2
         try:
-            result = await fn()
-            rows_written = _infer_rows(result)
-            metadata = {"result_type": type(result).__name__}
-            return result
-        except Exception as exc:
-            status = "error"
-            error_code = type(exc).__name__
-            error_message = str(exc)
-            logger.exception("collector job failed", extra={"job_name": job_name, "source": source})
-            return None
+            while True:
+                try:
+                    result = await fn()
+                    rows_written = _infer_rows(result)
+                    metadata = {"result_type": type(result).__name__, "deadlock_retries": deadlock_retries}
+                    return result
+                except DeadlockDetected as exc:
+                    deadlock_retries += 1
+                    if deadlock_retries > max_deadlock_retries:
+                        status = "error"
+                        error_code = type(exc).__name__
+                        error_message = str(exc)
+                        metadata = {"deadlock_retries": deadlock_retries}
+                        logger.exception(
+                            "collector job failed after deadlock retries",
+                            extra={"job_name": job_name, "source": source, "deadlock_retries": deadlock_retries},
+                        )
+                        return None
+                    logger.warning(
+                        "collector job deadlock, retrying",
+                        extra={"job_name": job_name, "source": source, "deadlock_retries": deadlock_retries},
+                    )
+                    await asyncio.sleep(0.25 * deadlock_retries)
+                except Exception as exc:
+                    status = "error"
+                    error_code = type(exc).__name__
+                    error_message = str(exc)
+                    metadata = {"deadlock_retries": deadlock_retries}
+                    logger.exception("collector job failed", extra={"job_name": job_name, "source": source})
+                    return None
         finally:
             elapsed = int((time.perf_counter() - start_perf) * 1000)
             finished = datetime.now(tz=UTC)
