@@ -9,6 +9,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from statistics import fmean
 from typing import Annotated
 
 import typer
@@ -589,6 +590,45 @@ def arb_export(
     asyncio.run(_run())
 
 
+@app.command("arb-benchmark")
+def arb_benchmark(
+    mode: Annotated[str, typer.Option("--mode", help="shadow|paper_live|live")] = "paper_live",
+    rounds: Annotated[int, typer.Option("--rounds", min=1, max=500)] = 20,
+    warmup: Annotated[int, typer.Option("--warmup", min=0, max=100)] = 2,
+    output: Annotated[str, typer.Option("--output", help="Optional output json path")] = "",
+) -> None:
+    """Run repeated Module2 cycles and print latency percentiles."""
+    refresh_process_env_from_file()
+    load_settings.cache_clear()
+    settings = load_settings()
+    setup_logging(settings.log_level)
+    _ensure_windows_selector_loop()
+    run_mode = parse_run_mode(mode)
+    out_path = Path(output).expanduser() if output else None
+
+    async def _run() -> None:
+        ctx = await create_arb_runtime(settings)
+        try:
+            for _ in range(warmup):
+                await ctx.orchestrator.run_once(run_mode)
+
+            rows: list[dict[str, int]] = []
+            for _ in range(rounds):
+                rows.append(await ctx.orchestrator.run_once(run_mode))
+
+            report = _summarize_cycle_stats(rows)
+            text = json.dumps(report, ensure_ascii=False, indent=2)
+            typer.echo(text)
+            if out_path:
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                out_path.write_text(text, encoding="utf-8")
+                typer.echo(f"benchmark report saved: {out_path}")
+        finally:
+            await close_arb_runtime(ctx)
+
+    asyncio.run(_run())
+
+
 async def _watch_env_file(
     path: Path,
     reload_event: asyncio.Event,
@@ -622,6 +662,39 @@ def _default_export_path(table: str, export_format: ExportFormat) -> Path:
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     suffix = "csv" if export_format == "csv" else "json"
     return Path("exports") / f"{table.strip().lower()}_{stamp}.{suffix}"
+
+
+def _pct(values: list[float], p: float) -> float:
+    if not values:
+        return 0.0
+    sorted_values = sorted(values)
+    idx = int(round((p / 100.0) * (len(sorted_values) - 1)))
+    return float(sorted_values[idx])
+
+
+def _summarize_cycle_stats(rows: list[dict[str, int]]) -> dict[str, object]:
+    metric_keys = [
+        "signals",
+        "processed",
+        "executed",
+        "snapshot_load_ms",
+        "scan_ms",
+        "process_ms",
+        "total_ms",
+    ]
+    summary: dict[str, object] = {
+        "rounds": len(rows),
+        "generated_at": datetime.now().isoformat(),
+    }
+    for key in metric_keys:
+        values = [float(row.get(key, 0)) for row in rows]
+        summary[key] = {
+            "avg": round(fmean(values), 2) if values else 0.0,
+            "p50": round(_pct(values, 50), 2),
+            "p95": round(_pct(values, 95), 2),
+            "max": round(max(values), 2) if values else 0.0,
+        }
+    return summary
 
 
 if __name__ == "__main__":

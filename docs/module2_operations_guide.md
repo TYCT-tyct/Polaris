@@ -30,6 +30,8 @@
   `python -m polaris.cli arb-report --group-by strategy,mode,source`
 - 导出：
   `python -m polaris.cli arb-export --table arb_trade_result --format csv --since-hours 24`
+- 基准压测（延迟 p50/p95）：
+  `python -m polaris.cli arb-benchmark --mode paper_live --rounds 30 --warmup 3`
 
 ## 5. 常见排查
 - 无信号：先检查 `dim_market` 和 `dim_token` 是否有 active 市场。
