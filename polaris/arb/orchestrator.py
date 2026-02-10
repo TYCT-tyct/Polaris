@@ -518,30 +518,35 @@ class ArbOrchestrator:
 
     async def _record_position_lots(self, result) -> None:
         signal = result.signal
-        for fill in result.fills:
-            await self.db.execute(
-                """
-                insert into arb_position_lot(
-                    mode, strategy_code, source_code, market_id, token_id, side,
-                    open_price, open_size, open_notional_usd, remaining_size,
-                    status, opened_at, closed_at, close_price, realized_pnl_usd
-                )
-                values (%s, %s, %s, %s, %s, %s, %s, %s, %s, 0, 'closed', now(), now(), %s, %s)
-                """,
-                (
-                    signal.mode.value,
-                    signal.strategy_code.value,
-                    signal.source_code,
-                    fill.market_id,
-                    fill.token_id,
-                    fill.side,
-                    fill.fill_price,
-                    fill.fill_size,
-                    fill.fill_notional_usd,
-                    fill.fill_price,
-                    result.net_pnl_usd,
-                ),
+        rows = [
+            (
+                signal.mode.value,
+                signal.strategy_code.value,
+                signal.source_code,
+                fill.market_id,
+                fill.token_id,
+                fill.side,
+                fill.fill_price,
+                fill.fill_size,
+                fill.fill_notional_usd,
+                fill.fill_price,
+                result.net_pnl_usd,
             )
+            for fill in result.fills
+        ]
+        if not rows:
+            return
+        await self.db.executemany(
+            """
+            insert into arb_position_lot(
+                mode, strategy_code, source_code, market_id, token_id, side,
+                open_price, open_size, open_notional_usd, remaining_size,
+                status, opened_at, closed_at, close_price, realized_pnl_usd
+            )
+            values (%s, %s, %s, %s, %s, %s, %s, %s, %s, 0, 'closed', now(), now(), %s, %s)
+            """,
+            rows,
+        )
 
     async def _maybe_run_optimization(self) -> None:
         now = datetime.now(tz=UTC)

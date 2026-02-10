@@ -49,3 +49,4 @@
 - `POLARIS_ARB_C_MAX_CANDIDATES_PER_EVENT=1`：策略 C 每个事件只执行最优候选，减少重复腿。
 - `POLARIS_ARB_CLOB_BOOKS_BATCH_SIZE=500`：`/books` 批量大小，过大可能触发 400。
 - `POLARIS_ARB_CLOB_BOOKS_MAX_CONCURRENCY=4`：并发批次上限，过高会放大网络抖动。
+- 说明：系统已内置 `/books` 的 400/413 自动拆分回退，不会因为单个大批次失败而整轮中断。

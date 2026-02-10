@@ -50,22 +50,38 @@ class ClobClient:
 
         async def _run(batch: list[str]) -> list[ClobBook]:
             async with semaphore:
-                try:
-                    return await self._get_books_batch(batch)
-                except httpx.HTTPStatusError as exc:
-                    if exc.response.status_code != 404:
-                        raise
-                    logger.info(
-                        "clob /books returned 404, fallback to per-token lookup",
-                        extra={"batch_size": len(batch)},
-                    )
-                    return await self._get_books_batch_fallback(batch)
+                return await self._get_books_batch_resilient(batch)
 
         results = await asyncio.gather(*[_run(batch) for batch in batches])
         books: list[ClobBook] = []
         for rows in results:
             books.extend(rows)
         return books
+
+    async def _get_books_batch_resilient(self, token_ids: list[str]) -> list[ClobBook]:
+        if not token_ids:
+            return []
+        try:
+            return await self._get_books_batch(token_ids)
+        except httpx.HTTPStatusError as exc:
+            status_code = exc.response.status_code
+            if status_code == 404:
+                logger.info(
+                    "clob /books returned 404, fallback to per-token lookup",
+                    extra={"batch_size": len(token_ids)},
+                )
+                return await self._get_books_batch_fallback(token_ids)
+            if status_code in {400, 413}:
+                if len(token_ids) == 1:
+                    single = await self.get_book_optional(token_ids[0])
+                    return [single] if single is not None else []
+                middle = max(1, len(token_ids) // 2)
+                left, right = await asyncio.gather(
+                    self._get_books_batch_resilient(token_ids[:middle]),
+                    self._get_books_batch_resilient(token_ids[middle:]),
+                )
+                return [*left, *right]
+            raise
 
     async def _get_books_batch(self, token_ids: list[str]) -> list[ClobBook]:
         if not token_ids:

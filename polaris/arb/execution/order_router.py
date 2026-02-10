@@ -47,26 +47,69 @@ class OrderRouter:
     ) -> TradeResult:
         fills: list[FillEvent] = []
         total_notional = 0.0
+        event_rows: list[tuple[str, str, int, str, str]] = []
+        fill_rows: list[tuple[str, str, str, str, float, float, float, float]] = []
         for intent in plan.intents:
             snap = snapshots.get(intent.token_id)
             if snap is None:
                 if persist:
-                    await self._record_order_event(intent.intent_id, "reject", 404, "missing_snapshot", {})
+                    event_rows.append(
+                        (
+                            str(intent.intent_id),
+                            "reject",
+                            404,
+                            "missing_snapshot",
+                            json.dumps({}, ensure_ascii=True),
+                        )
+                    )
                 continue
             fill = _simulate_intent_fill(intent.limit_price, intent.shares, intent.notional_usd, intent.side, snap)
             if fill is None:
                 if persist:
-                    await self._record_order_event(intent.intent_id, "reject", 422, "insufficient_liquidity", {})
+                    event_rows.append(
+                        (
+                            str(intent.intent_id),
+                            "reject",
+                            422,
+                            "insufficient_liquidity",
+                            json.dumps({}, ensure_ascii=True),
+                        )
+                    )
                 continue
             fills.append(fill)
             total_notional += fill.fill_notional_usd
             if persist:
-                await self._record_order_event(intent.intent_id, "fill", 200, "paper_fill", {
-                    "price": fill.fill_price,
-                    "size": fill.fill_size,
-                    "notional": fill.fill_notional_usd,
-                })
-                await self._record_fill(intent.intent_id, fill)
+                event_rows.append(
+                    (
+                        str(intent.intent_id),
+                        "fill",
+                        200,
+                        "paper_fill",
+                        json.dumps(
+                            {
+                                "price": fill.fill_price,
+                                "size": fill.fill_size,
+                                "notional": fill.fill_notional_usd,
+                            },
+                            ensure_ascii=True,
+                        ),
+                    )
+                )
+                fill_rows.append(
+                    (
+                        str(intent.intent_id),
+                        fill.market_id,
+                        fill.token_id,
+                        fill.side,
+                        fill.fill_price,
+                        fill.fill_size,
+                        fill.fill_notional_usd,
+                        fill.fee_usd,
+                    )
+                )
+        if persist:
+            await self._record_order_events(event_rows)
+            await self._record_fills(fill_rows)
 
         gross, fees, slip = _estimate_trade_pnl(plan.signal.features, fills)
         return TradeResult(
@@ -86,8 +129,17 @@ class OrderRouter:
         try:
             from py_clob_client.clob_types import OrderArgs, OrderType, PostOrdersArgs
         except Exception as exc:  # pragma: no cover - runtime dependency path
-            for intent in plan.intents:
-                await self._record_order_event(intent.intent_id, "error", 500, "py_clob_client_missing", {"error": str(exc)})
+            event_rows = [
+                (
+                    str(intent.intent_id),
+                    "error",
+                    500,
+                    "py_clob_client_missing",
+                    json.dumps({"error": str(exc)}, ensure_ascii=True),
+                )
+                for intent in plan.intents
+            ]
+            await self._record_order_events(event_rows)
             return TradeResult(
                 signal=plan.signal,
                 status="error",
@@ -103,8 +155,17 @@ class OrderRouter:
 
         client = self._get_live_client()
         if client is None:
-            for intent in plan.intents:
-                await self._record_order_event(intent.intent_id, "error", 500, "missing_live_key", {})
+            event_rows = [
+                (
+                    str(intent.intent_id),
+                    "error",
+                    500,
+                    "missing_live_key",
+                    json.dumps({}, ensure_ascii=True),
+                )
+                for intent in plan.intents
+            ]
+            await self._record_order_events(event_rows)
             return TradeResult(
                 signal=plan.signal,
                 status="error",
@@ -121,40 +182,79 @@ class OrderRouter:
         live_books = await self._load_preflight_books(plan.intents)
         fills: list[FillEvent] = []
         total_notional = 0.0
+        event_rows: list[tuple[str, str, int, str, str]] = []
+        fill_rows: list[tuple[str, str, str, str, float, float, float, float]] = []
 
         submit_payload: list[dict[str, Any]] = []
         for intent in plan.intents:
             baseline = snapshots.get(intent.token_id)
             if baseline is None:
-                await self._record_order_event(intent.intent_id, "reject", 404, "missing_snapshot", {})
+                event_rows.append(
+                    (
+                        str(intent.intent_id),
+                        "reject",
+                        404,
+                        "missing_snapshot",
+                        json.dumps({}, ensure_ascii=True),
+                    )
+                )
                 continue
 
             live_snap = live_books.get(intent.token_id, baseline)
             shares = _resolve_shares(intent.limit_price, intent.shares, intent.notional_usd, intent.side, live_snap)
             if shares <= 0:
-                await self._record_order_event(intent.intent_id, "reject", 422, "invalid_size", {})
+                event_rows.append(
+                    (
+                        str(intent.intent_id),
+                        "reject",
+                        422,
+                        "invalid_size",
+                        json.dumps({}, ensure_ascii=True),
+                    )
+                )
                 continue
             price = _resolve_price(intent.limit_price, intent.side, live_snap)
             if price <= 0:
-                await self._record_order_event(intent.intent_id, "reject", 422, "invalid_price", {})
+                event_rows.append(
+                    (
+                        str(intent.intent_id),
+                        "reject",
+                        422,
+                        "invalid_price",
+                        json.dumps({}, ensure_ascii=True),
+                    )
+                )
                 continue
             if not _preflight_price_ok(intent.side, price, live_snap, self.config.slippage_bps):
-                await self._record_order_event(
-                    intent.intent_id,
-                    "reject",
-                    409,
-                    "preflight_price_drift",
-                    {
-                        "limit_price": price,
-                        "best_bid": live_snap.best_bid,
-                        "best_ask": live_snap.best_ask,
-                        "slippage_bps": self.config.slippage_bps,
-                    },
+                event_rows.append(
+                    (
+                        str(intent.intent_id),
+                        "reject",
+                        409,
+                        "preflight_price_drift",
+                        json.dumps(
+                            {
+                                "limit_price": price,
+                                "best_bid": live_snap.best_bid,
+                                "best_ask": live_snap.best_ask,
+                                "slippage_bps": self.config.slippage_bps,
+                            },
+                            ensure_ascii=True,
+                        ),
+                    )
                 )
                 continue
             normalized = _normalize_order_params(price, shares, intent.side, live_snap)
             if normalized is None:
-                await self._record_order_event(intent.intent_id, "reject", 422, "below_min_order_size", {})
+                event_rows.append(
+                    (
+                        str(intent.intent_id),
+                        "reject",
+                        422,
+                        "below_min_order_size",
+                        json.dumps({}, ensure_ascii=True),
+                    )
+                )
                 continue
             norm_price, norm_shares = normalized
             submit_payload.append(
@@ -167,6 +267,7 @@ class OrderRouter:
             )
 
         if not submit_payload:
+            await self._record_order_events(event_rows)
             return TradeResult(
                 signal=plan.signal,
                 status="rejected",
@@ -189,7 +290,15 @@ class OrderRouter:
                 rows = await asyncio.to_thread(_submit_live_orders, client, chunk, order_type, OrderArgs, PostOrdersArgs)
             except Exception as exc:  # pragma: no cover - network/runtime path
                 for item in chunk:
-                    await self._record_order_event(item["intent"].intent_id, "error", 500, "live_submit_error", {"error": str(exc)})
+                    event_rows.append(
+                        (
+                            str(item["intent"].intent_id),
+                            "error",
+                            500,
+                            "live_submit_error",
+                            json.dumps({"error": str(exc)}, ensure_ascii=True),
+                        )
+                    )
                 continue
 
             for item, row in zip(chunk, rows, strict=False):
@@ -200,7 +309,15 @@ class OrderRouter:
                 code = 200 if success else 422
                 event = "submit" if success else "reject"
                 message = payload.get("errorMsg") or status or ("live_submit" if success else "live_reject")
-                await self._record_order_event(intent.intent_id, event, code, message, payload)
+                event_rows.append(
+                    (
+                        str(intent.intent_id),
+                        event,
+                        code,
+                        message,
+                        json.dumps(payload, ensure_ascii=True),
+                    )
+                )
                 if not success:
                     rejected += 1
                     continue
@@ -217,11 +334,25 @@ class OrderRouter:
                     )
                     fills.append(fill)
                     total_notional += fill.fill_notional_usd
-                    await self._record_fill(intent.intent_id, fill)
+                    fill_rows.append(
+                        (
+                            str(intent.intent_id),
+                            fill.market_id,
+                            fill.token_id,
+                            fill.side,
+                            fill.fill_price,
+                            fill.fill_size,
+                            fill.fill_notional_usd,
+                            fill.fee_usd,
+                        )
+                    )
                 elif status in {"live", "delayed"}:
                     logger.info("live order accepted but not immediately matched", extra={"intent_id": str(intent.intent_id), "status": status})
                 else:
                     rejected += 1
+
+        await self._record_order_events(event_rows)
+        await self._record_fills(fill_rows)
 
         gross, fees, slip = _estimate_trade_pnl(plan.signal.features, fills)
         return TradeResult(
@@ -326,32 +457,56 @@ class OrderRouter:
         message: str,
         payload: dict[str, Any],
     ) -> None:
-        await self.db.execute(
+        await self._record_order_events(
+            [
+                (
+                    str(intent_id),
+                    event_type,
+                    status_code,
+                    message,
+                    json.dumps(payload, ensure_ascii=True),
+                )
+            ]
+        )
+
+    async def _record_fill(self, intent_id: Any, fill: FillEvent) -> None:
+        await self._record_fills(
+            [
+                (
+                    str(intent_id),
+                    fill.market_id,
+                    fill.token_id,
+                    fill.side,
+                    fill.fill_price,
+                    fill.fill_size,
+                    fill.fill_notional_usd,
+                    fill.fee_usd,
+                )
+            ]
+        )
+
+    async def _record_order_events(self, rows: list[tuple[str, str, int, str, str]]) -> None:
+        if not rows:
+            return
+        await self.db.executemany(
             """
             insert into arb_order_event(intent_id, event_type, status_code, message, payload, created_at)
             values (%s, %s, %s, %s, %s::jsonb, now())
             """,
-            (str(intent_id), event_type, status_code, message, json.dumps(payload, ensure_ascii=True)),
+            rows,
         )
 
-    async def _record_fill(self, intent_id: Any, fill: FillEvent) -> None:
-        await self.db.execute(
+    async def _record_fills(self, rows: list[tuple[str, str, str, str, float, float, float, float]]) -> None:
+        if not rows:
+            return
+        await self.db.executemany(
             """
             insert into arb_fill(
                 intent_id, market_id, token_id, side, fill_price, fill_size, fill_notional_usd, fee_usd, created_at
             )
             values (%s, %s, %s, %s, %s, %s, %s, %s, now())
             """,
-            (
-                str(intent_id),
-                fill.market_id,
-                fill.token_id,
-                fill.side,
-                fill.fill_price,
-                fill.fill_size,
-                fill.fill_notional_usd,
-                fill.fee_usd,
-            ),
+            rows,
         )
 
     async def _record_trade_result(self, result: TradeResult, started_at: datetime) -> None:
