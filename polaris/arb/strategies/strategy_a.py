@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from polaris.arb.config import ArbConfig
 from polaris.arb.contracts import ArbSignal, RunMode, StrategyCode, TokenSnapshot
-from polaris.arb.strategies.common import executable_buy_price, group_by_event
+from polaris.arb.strategies.common import executable_buy_price, group_by_event, uniform_basket_shares
 
 
 class StrategyA:
@@ -24,8 +24,17 @@ class StrategyA:
             if len(yes_tokens) < 3:
                 continue
 
-            # 每条腿使用同一份额，成本使用深度加权成交价，不用单点 best ask。
-            target_shares = max(1.0, self.config.min_order_notional_usd)
+            top_prices = {
+                token.token_id: float(token.best_ask or 0.0)
+                for token in yes_tokens
+                if token.best_ask is not None and float(token.best_ask) > 0
+            }
+            if len(top_prices) < len(yes_tokens):
+                continue
+            # 对套利篮子使用统一份额，避免腿间名义金额不一致破坏对冲。
+            target_shares = uniform_basket_shares(yes_tokens, top_prices, self.config.min_order_notional_usd)
+            if target_shares <= 0:
+                continue
             total_cost_per_share = 0.0
             legs: list[dict[str, float | str]] = []
             executable = True
@@ -55,6 +64,9 @@ class StrategyA:
             if edge_pct < self.config.a_min_edge_pct:
                 continue
 
+            capital_used = target_shares * total_cost_per_share
+            if capital_used > self.config.single_risk_usd:
+                continue
             expected_pnl = target_shares * edge_pct
             signal = ArbSignal(
                 strategy_code=StrategyCode.A,
@@ -70,6 +82,7 @@ class StrategyA:
                     "legs": legs,
                     "total_cost_per_share": total_cost_per_share,
                     "target_shares": target_shares,
+                    "capital_used_usd": capital_used,
                     "expected_edge_pct": edge_pct,
                     "expected_hold_minutes": 30,
                 },

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import logging
 from collections import defaultdict
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 from polaris.arb.ai.gate import AiGate
@@ -44,9 +44,10 @@ class ArbOrchestrator:
         self.clob_client = clob_client
         self.config = config
         self.ai_gate = ai_gate
-        self.order_router = OrderRouter(db, config)
+        self.order_router = OrderRouter(db, config, clob_client)
         self.risk_gate = RiskGate(db, config)
         self._last_optimize_at: datetime | None = None
+        self._missing_token_resume_at: dict[str, datetime] = {}
 
         self.strategy_a = StrategyA(config)
         self.strategy_b = StrategyB(config)
@@ -201,9 +202,26 @@ class ArbOrchestrator:
         if not rows:
             return []
 
-        token_ids = [row["token_id"] for row in rows]
+        now = datetime.now(tz=UTC)
+        token_ids = []
+        for row in rows:
+            token_id = str(row["token_id"])
+            resume_at = self._missing_token_resume_at.get(token_id)
+            if resume_at and now < resume_at:
+                continue
+            token_ids.append(token_id)
+        if not token_ids:
+            return []
+
         books = await self.clob_client.get_books(token_ids)
-        by_token = {book.asset_id: book for book in books}
+        by_token = {book.asset_id: book for book in books if book.asset_id}
+        returned = set(by_token.keys())
+        for token_id in token_ids:
+            if token_id in returned:
+                self._missing_token_resume_at.pop(token_id, None)
+                continue
+            self._missing_token_resume_at[token_id] = now + timedelta(minutes=5)
+
         snapshots: list[TokenSnapshot] = []
         for row in rows:
             book = by_token.get(row["token_id"])
@@ -328,11 +346,7 @@ class ArbOrchestrator:
         priority = {name: idx for idx, name in enumerate(self.config.strategy_priority)}
         return sorted(
             signals,
-            key=lambda signal: (
-                priority.get(signal.strategy_code.value, 999),
-                -signal.edge_pct,
-                -signal.expected_pnl_usd,
-            ),
+            key=lambda signal: _signal_rank_key(signal, priority),
         )
 
     def _build_plan(self, signal: ArbSignal) -> ExecutionPlan:
@@ -569,6 +583,19 @@ def _estimate_capital(signal: ArbSignal) -> float:
         shares = float(leg.get("shares", 0.0) or 0.0)
         total += price * shares
     return total
+
+
+def _signal_rank_key(signal: ArbSignal, priority: dict[str, int]) -> tuple[float, float, float, float]:
+    capital = max(_estimate_capital(signal), 1e-6)
+    hold_minutes = float(signal.features.get("expected_hold_minutes") or 60.0)
+    roi = signal.expected_pnl_usd / capital
+    turnover = signal.expected_pnl_usd / max(hold_minutes, 1.0)
+    return (
+        float(priority.get(signal.strategy_code.value, 999)),
+        -roi,
+        -turnover,
+        -signal.edge_pct,
+    )
 
 
 async def _sleep(seconds: float) -> None:

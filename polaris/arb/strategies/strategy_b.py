@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from polaris.arb.config import ArbConfig
 from polaris.arb.contracts import ArbSignal, RunMode, StrategyCode, TokenSnapshot
-from polaris.arb.strategies.common import executable_buy_price, group_by_market
+from polaris.arb.strategies.common import executable_buy_price, group_by_market, uniform_basket_shares
 
 
 class StrategyB:
@@ -22,7 +22,18 @@ class StrategyB:
             no = next((t for t in tokens if t.outcome_side == "NO"), None)
             if not yes or not no:
                 continue
-            shares = max(1.0, self.config.min_order_notional_usd)
+            if yes.best_ask is None or no.best_ask is None:
+                continue
+            shares = uniform_basket_shares(
+                [yes, no],
+                {
+                    yes.token_id: float(yes.best_ask),
+                    no.token_id: float(no.best_ask),
+                },
+                self.config.min_order_notional_usd,
+            )
+            if shares <= 0:
+                continue
             yes_price = executable_buy_price(yes, shares)
             no_price = executable_buy_price(no, shares)
             if yes_price is None or no_price is None:
@@ -30,6 +41,9 @@ class StrategyB:
             total = yes_price + no_price
             edge_pct = 1.0 - total
             if edge_pct < self.config.b_min_edge_pct:
+                continue
+            capital_used = total * shares
+            if capital_used > self.config.single_risk_usd:
                 continue
 
             legs = [
@@ -51,6 +65,7 @@ class StrategyB:
                         "legs": legs,
                         "total_cost_per_share": total,
                         "target_shares": shares,
+                        "capital_used_usd": capital_used,
                         "expected_edge_pct": edge_pct,
                         "expected_hold_minutes": 20,
                     },

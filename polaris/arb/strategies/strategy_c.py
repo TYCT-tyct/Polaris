@@ -4,7 +4,7 @@ from collections import defaultdict
 
 from polaris.arb.config import ArbConfig
 from polaris.arb.contracts import ArbSignal, RunMode, StrategyCode, TokenSnapshot
-from polaris.arb.strategies.common import executable_buy_price
+from polaris.arb.strategies.common import executable_buy_price, min_shares_for_order
 
 
 class StrategyC:
@@ -58,7 +58,13 @@ class StrategyC:
                 if base_no is None:
                     continue
                 notional = min(self.config.single_risk_usd, max(self.config.min_order_notional_usd, 1.0))
-                sized_shares = notional / max(no_price, 1e-6)
+                sized_shares = max(
+                    notional / max(no_price, 1e-6),
+                    min_shares_for_order(base_no, no_price, self.config.min_order_notional_usd),
+                )
+                notional = sized_shares * no_price
+                if notional > self.config.single_risk_usd:
+                    continue
                 signals.append(
                     ArbSignal(
                         strategy_code=StrategyCode.C,

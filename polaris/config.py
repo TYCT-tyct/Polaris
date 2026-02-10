@@ -89,6 +89,7 @@ class PolarisSettings(BaseSettings):
     arb_patch_fill_threshold: float = Field(default=0.8)
     arb_unwind_fill_threshold: float = Field(default=0.5)
     arb_slippage_bps: int = Field(default=40)
+    arb_live_order_type: str = Field(default="FAK")
 
     # module2: strategy switches
     arb_enable_strategy_a: bool = Field(default=True)

@@ -38,8 +38,9 @@ async def test_live_gamma_and_clob_endpoints() -> None:
         for row in rows:
             tokens.extend(gamma.token_descriptors(row))
         assert tokens, "no token descriptors found"
-        book = await clob.get_book(tokens[0].token_id)
-        assert book.asset_id == tokens[0].token_id
+        sample_ids = [token.token_id for token in tokens[:100]]
+        books = await clob.get_books(sample_ids)
+        assert books, "no active orderbooks returned for sampled tokens"
     finally:
         await gamma.close()
         await clob.close()

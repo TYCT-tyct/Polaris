@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
+import os
+from math import ceil, floor
 from datetime import UTC, datetime
 from typing import Any
 
@@ -8,12 +12,16 @@ from polaris.arb.config import ArbConfig
 from polaris.arb.contracts import ExecutionPlan, FillEvent, RunMode, TokenSnapshot, TradeResult
 from polaris.arb.execution.fill_simulator import simulate_buy_fill, simulate_sell_fill
 from polaris.db.pool import Database
+from polaris.sources.clob_client import ClobClient
 
+logger = logging.getLogger(__name__)
 
 class OrderRouter:
-    def __init__(self, db: Database, config: ArbConfig) -> None:
+    def __init__(self, db: Database, config: ArbConfig, clob_client: ClobClient) -> None:
         self.db = db
         self.config = config
+        self.clob_client = clob_client
+        self._live_client: Any = None
 
     async def execute(self, plan: ExecutionPlan, snapshots: dict[str, TokenSnapshot]) -> TradeResult:
         signal = plan.signal
@@ -64,10 +72,8 @@ class OrderRouter:
         )
 
     async def _execute_live(self, plan: ExecutionPlan, snapshots: dict[str, TokenSnapshot]) -> TradeResult:
-        # live mode keeps the same execution contract, but requires py-clob-client at runtime.
         try:
-            from py_clob_client.client import ClobClient as LiveClient
-            from py_clob_client.clob_types import OrderArgs, OrderType
+            from py_clob_client.clob_types import OrderArgs, OrderType, PostOrdersArgs
         except Exception as exc:  # pragma: no cover - runtime dependency path
             for intent in plan.intents:
                 await self._record_order_event(intent.intent_id, "error", 500, "py_clob_client_missing", {"error": str(exc)})
@@ -84,13 +90,8 @@ class OrderRouter:
                 metadata={"error": "py_clob_client_missing"},
             )
 
-        # live credentials are read from process env to keep secrets out of source control.
-        import os
-
-        host = os.getenv("POLARIS_ARB_LIVE_HOST", "https://clob.polymarket.com")
-        key = os.getenv("POLARIS_ARB_LIVE_PRIVATE_KEY")
-        chain_id = int(os.getenv("POLARIS_ARB_LIVE_CHAIN_ID", "137"))
-        if not key:
+        client = self._get_live_client()
+        if client is None:
             for intent in plan.intents:
                 await self._record_order_event(intent.intent_id, "error", 500, "missing_live_key", {})
             return TradeResult(
@@ -106,44 +107,115 @@ class OrderRouter:
                 metadata={"error": "missing_live_key"},
             )
 
-        client = LiveClient(host=host, key=key, chain_id=chain_id)
-        client.set_api_creds(client.create_or_derive_api_creds())
+        live_books = await self._load_preflight_books(plan.intents)
         fills: list[FillEvent] = []
         total_notional = 0.0
+
+        submit_payload: list[dict[str, Any]] = []
         for intent in plan.intents:
-            snap = snapshots.get(intent.token_id)
-            if snap is None:
+            baseline = snapshots.get(intent.token_id)
+            if baseline is None:
                 await self._record_order_event(intent.intent_id, "reject", 404, "missing_snapshot", {})
                 continue
-            shares = _resolve_shares(intent.limit_price, intent.shares, intent.notional_usd, intent.side, snap)
+
+            live_snap = live_books.get(intent.token_id, baseline)
+            shares = _resolve_shares(intent.limit_price, intent.shares, intent.notional_usd, intent.side, live_snap)
             if shares <= 0:
                 await self._record_order_event(intent.intent_id, "reject", 422, "invalid_size", {})
                 continue
-            price = _resolve_price(intent.limit_price, intent.side, snap)
-            args = OrderArgs(token_id=intent.token_id, side=intent.side, price=price, size=shares)
-            try:
-                signed = client.create_order(args)
-                resp = client.post_order(signed, OrderType.GTC)
-                await self._record_order_event(intent.intent_id, "submit", 200, "live_submit", {"response": resp})
-                fill = FillEvent(
-                    token_id=intent.token_id,
-                    market_id=intent.market_id,
-                    side=intent.side,
-                    fill_price=price,
-                    fill_size=shares,
-                    fill_notional_usd=shares * price,
-                    fee_usd=0.0,
+            price = _resolve_price(intent.limit_price, intent.side, live_snap)
+            if price <= 0:
+                await self._record_order_event(intent.intent_id, "reject", 422, "invalid_price", {})
+                continue
+            if not _preflight_price_ok(intent.side, price, live_snap, self.config.slippage_bps):
+                await self._record_order_event(
+                    intent.intent_id,
+                    "reject",
+                    409,
+                    "preflight_price_drift",
+                    {
+                        "limit_price": price,
+                        "best_bid": live_snap.best_bid,
+                        "best_ask": live_snap.best_ask,
+                        "slippage_bps": self.config.slippage_bps,
+                    },
                 )
-                fills.append(fill)
-                total_notional += fill.fill_notional_usd
-                await self._record_fill(intent.intent_id, fill)
+                continue
+            normalized = _normalize_order_params(price, shares, intent.side, live_snap)
+            if normalized is None:
+                await self._record_order_event(intent.intent_id, "reject", 422, "below_min_order_size", {})
+                continue
+            norm_price, norm_shares = normalized
+            submit_payload.append(
+                {
+                    "intent": intent,
+                    "price": norm_price,
+                    "shares": norm_shares,
+                    "market_id": live_snap.market_id,
+                }
+            )
+
+        if not submit_payload:
+            return TradeResult(
+                signal=plan.signal,
+                status="rejected",
+                gross_pnl_usd=0.0,
+                fees_usd=0.0,
+                slippage_usd=0.0,
+                net_pnl_usd=0.0,
+                capital_used_usd=0.0,
+                hold_minutes=None,
+                fills=[],
+                metadata={"mode": plan.signal.mode.value, "intent_count": len(plan.intents), "submitted": 0},
+            )
+
+        order_type = _parse_order_type(self.config.live_order_type, OrderType)
+        chunks = [submit_payload[i : i + 15] for i in range(0, len(submit_payload), 15)]
+        submitted = 0
+        rejected = 0
+        for chunk in chunks:
+            try:
+                rows = await asyncio.to_thread(_submit_live_orders, client, chunk, order_type, OrderArgs, PostOrdersArgs)
             except Exception as exc:  # pragma: no cover - network/runtime path
-                await self._record_order_event(intent.intent_id, "error", 500, "live_submit_error", {"error": str(exc)})
+                for item in chunk:
+                    await self._record_order_event(item["intent"].intent_id, "error", 500, "live_submit_error", {"error": str(exc)})
+                continue
+
+            for item, row in zip(chunk, rows, strict=False):
+                intent = item["intent"]
+                payload = row if isinstance(row, dict) else {"response": row}
+                success = bool(payload.get("success", False))
+                status = str(payload.get("status", "")).lower()
+                code = 200 if success else 422
+                event = "submit" if success else "reject"
+                message = payload.get("errorMsg") or status or ("live_submit" if success else "live_reject")
+                await self._record_order_event(intent.intent_id, event, code, message, payload)
+                if not success:
+                    rejected += 1
+                    continue
+                submitted += 1
+                if status in {"matched", "filled"}:
+                    fill = FillEvent(
+                        token_id=intent.token_id,
+                        market_id=str(item["market_id"]),
+                        side=intent.side,
+                        fill_price=float(item["price"]),
+                        fill_size=float(item["shares"]),
+                        fill_notional_usd=float(item["price"]) * float(item["shares"]),
+                        fee_usd=0.0,
+                    )
+                    fills.append(fill)
+                    total_notional += fill.fill_notional_usd
+                    await self._record_fill(intent.intent_id, fill)
+                elif status in {"live", "delayed"}:
+                    logger.info("live order accepted but not immediately matched", extra={"intent_id": str(intent.intent_id), "status": status})
+                else:
+                    rejected += 1
 
         gross, fees, slip = _estimate_trade_pnl(plan.signal.features, fills)
         return TradeResult(
             signal=plan.signal,
-            status="filled" if fills else "error",
+            status="filled" if fills else ("submitted" if submitted > 0 else "error"),
             gross_pnl_usd=gross,
             fees_usd=fees,
             slippage_usd=slip,
@@ -151,8 +223,55 @@ class OrderRouter:
             capital_used_usd=total_notional,
             hold_minutes=float(plan.signal.features.get("expected_hold_minutes", 0) or 0),
             fills=fills,
-            metadata={"mode": plan.signal.mode.value, "intent_count": len(plan.intents)},
+            metadata={
+                "mode": plan.signal.mode.value,
+                "intent_count": len(plan.intents),
+                "submitted": submitted,
+                "rejected": rejected,
+                "live_order_type": self.config.live_order_type,
+            },
         )
+
+    async def _load_preflight_books(self, intents: list[Any]) -> dict[str, TokenSnapshot]:
+        token_ids = sorted({intent.token_id for intent in intents if intent.token_id})
+        books = await self.clob_client.get_books(token_ids)
+        snapshots: dict[str, TokenSnapshot] = {}
+        now = datetime.now(tz=UTC)
+        for book in books:
+            best_bid, best_ask = self.clob_client.best_bid_ask(book)
+            snapshots[book.asset_id] = TokenSnapshot(
+                token_id=book.asset_id,
+                market_id=book.market or "",
+                event_id=None,
+                market_question="",
+                market_end=None,
+                outcome_label="",
+                outcome_side="",
+                outcome_index=0,
+                min_order_size=float(book.min_order_size) if book.min_order_size else None,
+                tick_size=float(book.tick_size) if book.tick_size else None,
+                best_bid=best_bid,
+                best_ask=best_ask,
+                captured_at=now,
+            )
+        return snapshots
+
+    def _get_live_client(self) -> Any | None:
+        if self._live_client is not None:
+            return self._live_client
+
+        key = os.getenv("POLARIS_ARB_LIVE_PRIVATE_KEY")
+        if not key:
+            return None
+
+        from py_clob_client.client import ClobClient as LiveClient  # pragma: no cover - runtime dependency path
+
+        host = os.getenv("POLARIS_ARB_LIVE_HOST", "https://clob.polymarket.com")
+        chain_id = int(os.getenv("POLARIS_ARB_LIVE_CHAIN_ID", "137"))
+        client = LiveClient(host=host, key=key, chain_id=chain_id)
+        client.set_api_creds(client.create_or_derive_api_creds())
+        self._live_client = client
+        return client
 
     async def _record_intents(self, plan: ExecutionPlan) -> None:
         rows = [
@@ -268,13 +387,14 @@ def _resolve_shares(
     snap: TokenSnapshot,
 ) -> float:
     if shares is not None and shares > 0:
-        return shares
+        return max(shares, float(snap.min_order_size or 0.0))
     if notional_usd is None or notional_usd <= 0:
         return 0.0
     base_price = _resolve_price(limit_price, side, snap)
     if base_price <= 0:
         return 0.0
-    return notional_usd / base_price
+    computed = notional_usd / base_price
+    return max(computed, float(snap.min_order_size or 0.0))
 
 
 def _simulate_intent_fill(
@@ -313,3 +433,63 @@ def _estimate_trade_pnl(features: dict[str, Any], fills: list[FillEvent]) -> tup
     fees = sum(f.fill_notional_usd for f in fills) * 0.001
     slippage = float(features.get("expected_slippage_usd") or 0.0)
     return gross, fees, slippage
+
+
+def _normalize_order_params(price: float, shares: float, side: str, snap: TokenSnapshot) -> tuple[float, float] | None:
+    if shares <= 0 or price <= 0:
+        return None
+    min_size = float(snap.min_order_size or 0.0)
+    shares = max(shares, min_size)
+    tick = float(snap.tick_size or 0.0)
+    if tick > 0:
+        ratio = price / tick
+        steps = ceil(ratio) if side.upper() == "BUY" else floor(ratio)
+        price = max(tick, steps * tick)
+    return price, shares
+
+
+def _preflight_price_ok(side: str, intended_price: float, live: TokenSnapshot, slippage_bps: int) -> bool:
+    side_upper = side.upper()
+    ratio = slippage_bps / 10_000.0
+    if side_upper == "BUY":
+        if live.best_ask is None:
+            return False
+        worst_allowed = intended_price * (1.0 + ratio)
+        return float(live.best_ask) <= worst_allowed
+    if live.best_bid is None:
+        return False
+    worst_allowed = intended_price * (1.0 - ratio)
+    return float(live.best_bid) >= worst_allowed
+
+
+def _parse_order_type(name: str, order_type_cls: Any) -> Any:
+    normalized = (name or "FAK").strip().upper()
+    if hasattr(order_type_cls, normalized):
+        return getattr(order_type_cls, normalized)
+    return getattr(order_type_cls, "FAK")
+
+
+def _submit_live_orders(
+    client: Any,
+    chunk: list[dict[str, Any]],
+    order_type: Any,
+    order_args_cls: Any,
+    post_orders_args_cls: Any,
+) -> list[dict[str, Any]]:
+    args = []
+    for item in chunk:
+        intent = item["intent"]
+        order_args = order_args_cls(
+            token_id=intent.token_id,
+            side=intent.side,
+            price=float(item["price"]),
+            size=float(item["shares"]),
+        )
+        signed = client.create_order(order_args)
+        args.append(post_orders_args_cls(order=signed, orderType=order_type))
+    result = client.post_orders(args)
+    if isinstance(result, list):
+        return [row if isinstance(row, dict) else {"response": row} for row in result]
+    if isinstance(result, dict):
+        return [result]
+    return [{"response": result}]

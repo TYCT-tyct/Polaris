@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import UTC, datetime, timedelta
 
 from polaris.db.pool import Database
 from polaris.sources.clob_client import ClobClient
@@ -13,6 +14,7 @@ class QuoteCollector:
         self.db = db
         self.clob_client = clob_client
         self.enable_l2 = enable_l2
+        self._missing_resume_at: dict[str, datetime] = {}
 
     async def collect_top_depth_l2(self, token_rows: list[dict]) -> tuple[int, int, int]:
         books = await self._fetch_books(token_rows)
@@ -46,9 +48,13 @@ class QuoteCollector:
     async def _fetch_books(self, token_rows: list[dict]) -> list[tuple[dict, object]]:
         token_ids: list[str] = []
         seen: set[str] = set()
+        now = datetime.now(tz=UTC)
         for token in token_rows:
             token_id = token.get("token_id")
             if not token_id or token_id in seen:
+                continue
+            resume_at = self._missing_resume_at.get(token_id)
+            if resume_at and now < resume_at:
                 continue
             token_ids.append(token_id)
             seen.add(token_id)
@@ -57,6 +63,12 @@ class QuoteCollector:
 
         books = await self.clob_client.get_books(token_ids)
         by_token_id = {book.asset_id: book for book in books if book.asset_id}
+        returned = set(by_token_id.keys())
+        for token_id in token_ids:
+            if token_id in returned:
+                self._missing_resume_at.pop(token_id, None)
+                continue
+            self._missing_resume_at[token_id] = now + timedelta(minutes=5)
         rows_with_books: list[tuple[dict, object]] = []
         missing = 0
         for token in token_rows:

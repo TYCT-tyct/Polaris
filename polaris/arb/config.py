@@ -22,6 +22,7 @@ class ArbConfig:
     patch_fill_threshold: float
     unwind_fill_threshold: float
     slippage_bps: int
+    live_order_type: str
 
     enable_strategy_a: bool
     enable_strategy_b: bool
@@ -65,6 +66,7 @@ def arb_config_from_settings(settings: PolarisSettings) -> ArbConfig:
         patch_fill_threshold=settings.arb_patch_fill_threshold,
         unwind_fill_threshold=settings.arb_unwind_fill_threshold,
         slippage_bps=settings.arb_slippage_bps,
+        live_order_type=settings.arb_live_order_type.strip().upper(),
         enable_strategy_a=settings.arb_enable_strategy_a,
         enable_strategy_b=settings.arb_enable_strategy_b,
         enable_strategy_c=settings.arb_enable_strategy_c,

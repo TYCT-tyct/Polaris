@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 from typing import Any
 
@@ -40,11 +41,20 @@ class ClobClient:
 
         return await with_retry(_do, self._retry)
 
-    async def get_books(self, token_ids: list[str], batch_size: int = 500) -> list[ClobBook]:
+    async def get_books(self, token_ids: list[str], batch_size: int = 500, max_concurrency: int = 4) -> list[ClobBook]:
+        if not token_ids:
+            return []
+        batches = [token_ids[start : start + batch_size] for start in range(0, len(token_ids), batch_size)]
+        semaphore = asyncio.Semaphore(max(1, max_concurrency))
+
+        async def _run(batch: list[str]) -> list[ClobBook]:
+            async with semaphore:
+                return await self._get_books_batch(batch)
+
+        results = await asyncio.gather(*[_run(batch) for batch in batches])
         books: list[ClobBook] = []
-        for start in range(0, len(token_ids), batch_size):
-            batch = token_ids[start : start + batch_size]
-            books.extend(await self._get_books_batch(batch))
+        for rows in results:
+            books.extend(rows)
         return books
 
     async def _get_books_batch(self, token_ids: list[str]) -> list[ClobBook]:

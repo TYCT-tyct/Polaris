@@ -44,3 +44,25 @@ def top_of_book_price(levels: tuple[PriceLevel, ...], ask: bool) -> float | None
     if ask:
         return min(level.price for level in levels)
     return max(level.price for level in levels)
+
+
+def min_shares_for_order(token: TokenSnapshot, price: float, min_notional_usd: float) -> float:
+    if price <= 0:
+        return 0.0
+    notional_shares = min_notional_usd / price
+    min_size = float(token.min_order_size or 0.0)
+    return max(notional_shares, min_size)
+
+
+def uniform_basket_shares(
+    tokens: list[TokenSnapshot],
+    prices: dict[str, float],
+    min_notional_usd: float,
+) -> float:
+    required = 0.0
+    for token in tokens:
+        price = float(prices.get(token.token_id) or 0.0)
+        if price <= 0:
+            continue
+        required = max(required, min_shares_for_order(token, price, min_notional_usd))
+    return required

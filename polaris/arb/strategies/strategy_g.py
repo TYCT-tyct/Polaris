@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from polaris.arb.config import ArbConfig
 from polaris.arb.contracts import ArbSignal, RunMode, StrategyCode, TokenSnapshot
-from polaris.arb.strategies.common import group_by_market, resolve_hours_left
+from polaris.arb.strategies.common import group_by_market, min_shares_for_order, resolve_hours_left
 
 
 class StrategyG:
@@ -43,7 +43,10 @@ class StrategyG:
                 continue
 
             notional = min(self.config.single_risk_usd, max(self.config.min_order_notional_usd, 1.0))
-            shares = notional / top_price
+            shares = max(notional / top_price, min_shares_for_order(top, top_price, self.config.min_order_notional_usd))
+            notional = shares * top_price
+            if notional > self.config.single_risk_usd:
+                continue
             signals.append(
                 ArbSignal(
                     strategy_code=StrategyCode.G,
