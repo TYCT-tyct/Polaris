@@ -25,13 +25,23 @@ class AsyncScheduler:
 
     async def run(self) -> None:
         self._workers = [asyncio.create_task(self._run_task(task)) for task in self.tasks]
-        await self._stop_event.wait()
-        for worker in self._workers:
-            worker.cancel()
-        await asyncio.gather(*self._workers, return_exceptions=True)
+        try:
+            await self._stop_event.wait()
+        finally:
+            await self._shutdown_workers()
 
     async def stop(self) -> None:
         self._stop_event.set()
+        await self._shutdown_workers()
+
+    async def _shutdown_workers(self) -> None:
+        if not self._workers:
+            return
+        for worker in self._workers:
+            if not worker.done():
+                worker.cancel()
+        await asyncio.gather(*self._workers, return_exceptions=True)
+        self._workers.clear()
 
     async def _run_task(self, task: TaskSpec) -> None:
         while not self._stop_event.is_set():
@@ -47,4 +57,3 @@ class AsyncScheduler:
             jitter = task.interval_sec * task.jitter_ratio
             sleep_for = max(base + random.uniform(-jitter, jitter), 0.1)
             await asyncio.sleep(sleep_for)
-

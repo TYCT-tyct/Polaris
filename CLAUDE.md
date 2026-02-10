@@ -58,6 +58,7 @@
    ├─ test_mapping_score.py
    ├─ test_exporter.py
    ├─ test_upsert_idempotency.py
+   ├─ test_scheduler.py
    ├─ test_live_sources.py
    └─ test_live_harvest_once.py
 ```
@@ -92,3 +93,4 @@
 - 2026-02-10：补齐在线来源测试与端到端 `harvest-once` 测试。
 - 2026-02-10：新增 Module 1 运维指南并修正 runbook 手工命令流程。
 - 2026-02-10：新增导出命令与热更新运行模式（.env 变更/SIGHUP 触发重载）。
+- 2026-02-10：修复热更新取消竞态，新增 scheduler 取消回收回归测试。
