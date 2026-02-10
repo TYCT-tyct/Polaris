@@ -10,7 +10,7 @@ sudo apt install -y python3.12 python3.12-venv python3-pip postgresql-client
 ```bash
 cd /opt
 git clone <your-repo-url> polaris
-cd polaris/Polaris
+cd polaris
 python3.12 -m venv .venv
 source .venv/bin/activate
 pip install --upgrade pip
@@ -39,9 +39,9 @@ After=network.target
 [Service]
 Type=simple
 User=ubuntu
-WorkingDirectory=/opt/polaris/Polaris
-EnvironmentFile=/opt/polaris/Polaris/.env
-ExecStart=/opt/polaris/Polaris/.venv/bin/python -m polaris.cli run --handle elonmusk
+WorkingDirectory=/opt/polaris
+EnvironmentFile=/opt/polaris/.env
+ExecStart=/opt/polaris/.venv/bin/python -m polaris.cli run --handle elonmusk
 Restart=always
 RestartSec=5
 
