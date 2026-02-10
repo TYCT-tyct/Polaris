@@ -75,3 +75,39 @@ sudo systemctl reload polaris-harvest
   - `select count(*) from ops_collector_run where started_at >= now() - interval '1 hour';`
   - `select count(*) from fact_quote_top_raw where captured_at >= now() - interval '1 hour';`
   - `select count(*) from fact_tweet_post;`
+
+## 6. Backup and Restore
+Install backup binary:
+```bash
+sudo apt install -y postgresql-client
+```
+
+Run one backup snapshot:
+```bash
+cd /home/ubuntu/polaris
+source .venv/bin/activate
+set -a; source .env; set +a
+python -m polaris.cli backup \
+  --output-dir backups \
+  --label daily \
+  --include-exports \
+  --export-since-hours 24 \
+  --keep-last 14
+```
+
+Automate daily backup with cron:
+```bash
+crontab -e
+```
+Add:
+```cron
+10 3 * * * cd /home/ubuntu/polaris && /home/ubuntu/polaris/.venv/bin/python -m polaris.cli backup --output-dir backups --label daily --include-exports --export-since-hours 24 --keep-last 14 >> /home/ubuntu/polaris/backups/backup.log 2>&1
+```
+
+Restore from dump:
+```bash
+set -a; source /home/ubuntu/polaris/.env; set +a
+pg_restore --clean --if-exists --no-owner \
+  -d "$POLARIS_DATABASE_URL" \
+  /home/ubuntu/polaris/backups/<snapshot>/polaris_db.dump
+```

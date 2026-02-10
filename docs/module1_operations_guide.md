@@ -187,6 +187,54 @@ scp -i "C:\Users\Shini\Documents\terauss.pem" \
   .
 ```
 
+## 8.3 一键备份（强烈建议每日执行）
+`backup` 会做三件事：
+- 执行 `pg_dump` 生成数据库快照（`polaris_db.dump`）。
+- 可选导出关键表 CSV（默认开启，便于你快速查看）。
+- 生成 `manifest.json`（文件大小 + sha256）并清理旧备份目录。
+
+```bash
+cd /home/ubuntu/polaris
+source .venv/bin/activate
+set -a; source .env; set +a
+
+python -m polaris.cli backup \
+  --output-dir backups \
+  --label daily \
+  --include-exports \
+  --export-since-hours 24 \
+  --export-limit 200000 \
+  --keep-last 14
+```
+
+备份目录示例：
+```text
+/home/ubuntu/polaris/backups/20260210_180000_daily/
+├─ polaris_db.dump
+├─ manifest.json
+└─ exports/
+   ├─ fact_tweet_post.csv
+   ├─ fact_quote_1m.csv
+   ├─ fact_market_state_snapshot.csv
+   ├─ ops_collector_run.csv
+   └─ view_quote_latest.csv
+```
+
+下载整包备份：
+```bash
+scp -i "C:\Users\Shini\Documents\terauss.pem" -r \
+  ubuntu@108.130.51.215:/home/ubuntu/polaris/backups/20260210_180000_daily \
+  .
+```
+
+恢复（谨慎执行，会覆盖目标库对象）：
+```bash
+set -a; source /home/ubuntu/polaris/.env; set +a
+pg_restore --clean --if-exists --no-owner \
+  -d "$POLARIS_DATABASE_URL" \
+  /home/ubuntu/polaris/backups/20260210_180000_daily/polaris_db.dump
+```
+
 ## 9. 常见故障与处理
 ### 9.1 服务是 `failed`
 ```bash

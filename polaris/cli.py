@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import signal
+import subprocess
 import sys
 from contextlib import suppress
 from dataclasses import dataclass
@@ -21,6 +22,15 @@ from polaris.harvest.runner import HarvestRunner
 from polaris.infra.rate_limiter import AsyncTokenBucket
 from polaris.logging import setup_logging
 from polaris.ops.backfill import BackfillService
+from polaris.ops.backup import (
+    DEFAULT_EXPORT_TABLES,
+    BackupArtifact,
+    backup_label,
+    export_backup_tables,
+    prune_backup_dirs,
+    run_pg_dump,
+    write_manifest,
+)
 from polaris.ops.exporter import ExportFormat, export_table, list_exportable_tables
 from polaris.ops.health import HealthAggregator
 from polaris.sources.clob_client import ClobClient
@@ -332,6 +342,76 @@ def export_data(
             await db.close()
 
     asyncio.run(_run())
+
+
+@app.command("backup")
+def backup(
+    output_dir: Annotated[str, typer.Option("--output-dir", help="Backup root directory")] = "backups",
+    label: Annotated[str, typer.Option("--label", help="Optional label suffix")] = "",
+    pg_dump_bin: Annotated[str, typer.Option("--pg-dump-bin", help="pg_dump executable path")] = "pg_dump",
+    timeout_sec: Annotated[int, typer.Option("--timeout-sec", min=30, max=14400)] = 1800,
+    include_exports: Annotated[
+        bool,
+        typer.Option("--include-exports/--no-include-exports", help="Include key table CSV exports"),
+    ] = True,
+    export_since_hours: Annotated[int, typer.Option("--export-since-hours", min=1, max=168)] = 24,
+    export_limit: Annotated[int, typer.Option("--export-limit", min=100, max=1_000_000)] = 200_000,
+    keep_last: Annotated[int, typer.Option("--keep-last", min=1, max=365)] = 14,
+) -> None:
+    """Create a consistent backup snapshot."""
+    refresh_process_env_from_file()
+    load_settings.cache_clear()
+    settings = load_settings()
+    setup_logging(settings.log_level)
+    _ensure_windows_selector_loop()
+
+    backup_root = Path(output_dir).expanduser()
+    run_label = backup_label(label or None)
+    backup_dir = backup_root / run_label
+    dump_file = backup_dir / "polaris_db.dump"
+    artifacts: list[BackupArtifact] = []
+
+    try:
+        run_pg_dump(
+            database_url=settings.database_url,
+            output_file=dump_file,
+            pg_dump_bin=pg_dump_bin,
+            timeout_sec=timeout_sec,
+        )
+    except FileNotFoundError as exc:
+        raise typer.BadParameter(
+            f"pg_dump not found: {pg_dump_bin}. install postgresql-client or set --pg-dump-bin"
+        ) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise typer.BadParameter(f"pg_dump timeout after {timeout_sec}s") from exc
+
+    artifacts.append(BackupArtifact.from_path(dump_file))
+
+    async def _run_exports() -> list[Path]:
+        db = Database(settings.database_url)
+        await db.open()
+        try:
+            return await export_backup_tables(
+                db=db,
+                backup_dir=backup_dir,
+                tables=list(DEFAULT_EXPORT_TABLES),
+                since_hours=export_since_hours,
+                limit=export_limit,
+            )
+        finally:
+            await db.close()
+
+    if include_exports:
+        export_files = asyncio.run(_run_exports())
+        artifacts.extend(BackupArtifact.from_path(path) for path in export_files)
+
+    manifest_file = write_manifest(backup_dir, artifacts)
+    artifacts.append(BackupArtifact.from_path(manifest_file))
+    pruned = prune_backup_dirs(backup_root, keep_last)
+
+    typer.echo(f"backup completed: {backup_dir}")
+    typer.echo(f"artifacts={len(artifacts)} keep_last={keep_last} pruned={len(pruned)}")
+    typer.echo(f"manifest={manifest_file}")
 
 
 async def _watch_env_file(
