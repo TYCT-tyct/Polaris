@@ -4,6 +4,7 @@ import json
 import logging
 from collections import defaultdict
 from datetime import UTC, datetime, timedelta
+from time import perf_counter
 from uuid import uuid4
 
 from polaris.arb.ai.gate import AiGate
@@ -56,12 +57,26 @@ class ArbOrchestrator:
         self.strategy_g = StrategyG(config)
 
     async def run_once(self, mode: RunMode, source_code: str = "polymarket") -> dict[str, int]:
+        total_started = perf_counter()
+        load_started = perf_counter()
         snapshots = await self._load_live_snapshots()
+        load_ms = int((perf_counter() - load_started) * 1000)
         if not snapshots:
-            return {"signals": 0, "processed": 0, "executed": 0}
+            total_ms = int((perf_counter() - total_started) * 1000)
+            return {
+                "signals": 0,
+                "processed": 0,
+                "executed": 0,
+                "snapshot_load_ms": load_ms,
+                "scan_ms": 0,
+                "process_ms": 0,
+                "total_ms": total_ms,
+            }
 
+        scan_started = perf_counter()
         all_signals = self._scan_all(mode, source_code, snapshots)
         ordered = self._order_signals(all_signals)
+        scan_ms = int((perf_counter() - scan_started) * 1000)
         if self.config.max_signals_per_cycle > 0 and len(ordered) > self.config.max_signals_per_cycle:
             logger.info(
                 "arb signal cap applied",
@@ -73,9 +88,11 @@ class ArbOrchestrator:
                 },
             )
             ordered = ordered[: self.config.max_signals_per_cycle]
+        process_started = perf_counter()
         executed = 0
         snapshot_map = {item.token_id: item for item in snapshots}
         risk_state = await self.risk_gate.load_state(mode, source_code)
+        cash_balance = await self._load_latest_cash_balance(mode, source_code)
         for signal in ordered:
             if signal.is_expired():
                 await self._record_signal(signal, SignalStatus.EXPIRED)
@@ -107,7 +124,7 @@ class ArbOrchestrator:
             )
             if success:
                 executed += 1
-                await self._record_cash_ledger(result)
+                cash_balance = await self._record_cash_ledger(result, cash_balance)
                 await self._record_position_lots(result)
                 await self._mark_signal_status(signal.signal_id, SignalStatus.EXECUTED)
             else:
@@ -116,7 +133,17 @@ class ArbOrchestrator:
         if mode == RunMode.PAPER_LIVE:
             await self._maybe_run_optimization()
 
-        return {"signals": len(all_signals), "processed": len(ordered), "executed": executed}
+        process_ms = int((perf_counter() - process_started) * 1000)
+        total_ms = int((perf_counter() - total_started) * 1000)
+        return {
+            "signals": len(all_signals),
+            "processed": len(ordered),
+            "executed": executed,
+            "snapshot_load_ms": load_ms,
+            "scan_ms": scan_ms,
+            "process_ms": process_ms,
+            "total_ms": total_ms,
+        }
 
     async def run_forever(self, mode: RunMode, source_code: str = "polymarket") -> None:
         while True:
@@ -448,8 +475,7 @@ class ArbOrchestrator:
     async def _mark_signal_status(self, signal_id, status: SignalStatus) -> None:
         await self.db.execute("update arb_signal set status = %s where signal_id = %s", (status.value, str(signal_id)))
 
-    async def _record_cash_ledger(self, result) -> None:
-        signal = result.signal
+    async def _load_latest_cash_balance(self, mode: RunMode, source_code: str) -> float:
         row = await self.db.fetch_one(
             """
             select balance_after_usd
@@ -458,10 +484,13 @@ class ArbOrchestrator:
             order by created_at desc
             limit 1
             """,
-            (signal.mode.value, signal.source_code),
+            (mode.value, source_code),
         )
-        before = float(row["balance_after_usd"]) if row else 0.0
-        after = before + result.net_pnl_usd
+        return float(row["balance_after_usd"]) if row else 0.0
+
+    async def _record_cash_ledger(self, result, balance_before: float) -> float:
+        signal = result.signal
+        after = balance_before + result.net_pnl_usd
         await self.db.execute(
             """
             insert into arb_cash_ledger(
@@ -475,12 +504,13 @@ class ArbOrchestrator:
                 signal.source_code,
                 "trade_net_pnl",
                 result.net_pnl_usd,
-                before,
+                balance_before,
                 after,
                 str(signal.signal_id),
                 json.dumps({"status": result.status}, ensure_ascii=True),
             ),
         )
+        return after
 
     async def _record_position_lots(self, result) -> None:
         signal = result.signal
