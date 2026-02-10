@@ -22,8 +22,10 @@ class JsonFormatter(logging.Formatter):
                 continue
             if key in {"levelno", "pathname", "filename", "module", "lineno", "funcName"}:
                 continue
+            if key in {"exc_info", "exc_text", "stack_info"}:
+                continue
             payload[key] = value
-        return json.dumps(payload, ensure_ascii=True)
+        return json.dumps(payload, ensure_ascii=True, default=str)
 
 
 def setup_logging(level: str = "INFO") -> None:
