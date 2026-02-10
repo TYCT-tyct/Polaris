@@ -54,43 +54,88 @@ class GammaClient:
     @staticmethod
     def market_record(raw: dict[str, Any]) -> dict[str, Any]:
         market_id = str(raw.get("id"))
+        event_id = None
+        events = raw.get("events")
+        event_slug = raw.get("eventSlug")
+        if isinstance(events, list) and events:
+            event_id = str(events[0].get("id")) if events[0].get("id") is not None else None
+            event_slug = event_slug or events[0].get("slug")
         return {
             "market_id": market_id,
             "gamma_market_id": raw.get("id"),
             "condition_id": raw.get("conditionId"),
+            "event_id": event_id,
             "question": raw.get("question") or "",
             "slug": raw.get("slug") or f"market-{market_id}",
-            "event_slug": raw.get("eventSlug"),
+            "event_slug": event_slug,
             "category": raw.get("category"),
             "start_date": _parse_ts(raw.get("startDate")),
             "end_date": _parse_ts(raw.get("endDate")),
             "neg_risk": bool(raw.get("negRisk") or False),
+            "neg_risk_augmented": bool(raw.get("negRiskOther") or False),
             "active": bool(raw.get("active") or False),
             "closed": bool(raw.get("closed") or False),
             "archived": bool(raw.get("archived") or False),
             "spread": _to_float(raw.get("spread")),
             "liquidity": _to_float(raw.get("liquidityNum") or raw.get("liquidity")),
             "volume": _to_float(raw.get("volumeNum") or raw.get("volume")),
+            "resolution_source": raw.get("resolutionSource") or None,
             "updated_from_source_at": _parse_ts(raw.get("updatedAt")),
         }
+
+    @staticmethod
+    def event_records(raw: dict[str, Any]) -> list[dict[str, Any]]:
+        events = raw.get("events")
+        if not isinstance(events, list):
+            return []
+        rows: list[dict[str, Any]] = []
+        for event in events:
+            event_id = event.get("id")
+            if event_id is None:
+                continue
+            rows.append(
+                {
+                    "event_id": str(event_id),
+                    "event_slug": event.get("slug"),
+                    "event_ticker": event.get("ticker"),
+                    "title": event.get("title"),
+                    "category": event.get("category"),
+                    "active": bool(event.get("active") or False),
+                    "closed": bool(event.get("closed") or False),
+                    "archived": bool(event.get("archived") or False),
+                    "start_date": _parse_ts(event.get("startDate")),
+                    "end_date": _parse_ts(event.get("endDate")),
+                }
+            )
+        return rows
 
     @staticmethod
     def token_descriptors(raw: dict[str, Any]) -> list[TokenDescriptor]:
         market_id = str(raw.get("id"))
         outcomes = _parse_json_list(raw.get("outcomes"))
         token_ids = _parse_json_list(raw.get("clobTokenIds"))
+        tick_size = _to_float(raw.get("orderPriceMinTickSize"))
+        min_order_size = _to_float(raw.get("orderMinSize"))
         descriptors: list[TokenDescriptor] = []
         for idx, token_id in enumerate(token_ids):
             if not token_id:
                 continue
             label = outcomes[idx] if idx < len(outcomes) else f"OUTCOME_{idx}"
             side = "YES" if idx == 0 else "NO"
+            normalized = str(label).strip().lower()
+            is_other = normalized in {"other", "others", "none of the above", "none"}
+            is_placeholder = "placeholder" in normalized or normalized == ""
             descriptors.append(
                 TokenDescriptor(
                     token_id=str(token_id),
                     market_id=market_id,
                     outcome_label=str(label),
                     outcome_side=side,
+                    tick_size=tick_size,
+                    min_order_size=min_order_size,
+                    outcome_index=idx,
+                    is_other_outcome=is_other,
+                    is_placeholder_outcome=is_placeholder,
                 )
             )
         return descriptors
@@ -144,4 +189,3 @@ def _to_float(raw: Any) -> float | None:
         return float(raw)
     except (TypeError, ValueError):
         return None
-

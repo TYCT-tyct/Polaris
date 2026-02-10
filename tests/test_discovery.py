@@ -1,4 +1,4 @@
-from polaris.harvest.discovery import is_elon_tweet_market
+from polaris.harvest.discovery import is_elon_tweet_market, is_open_market
 
 
 def test_market_filter_accepts_target() -> None:
@@ -14,3 +14,7 @@ def test_market_filter_rejects_non_target() -> None:
         "btc-above-120k-by-friday",
     )
 
+
+def test_open_market_filter() -> None:
+    assert is_open_market({"active": True, "closed": False, "archived": False})
+    assert not is_open_market({"active": False, "closed": False, "archived": False})

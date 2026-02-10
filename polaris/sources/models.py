@@ -88,4 +88,8 @@ class TokenDescriptor:
     market_id: str
     outcome_label: str
     outcome_side: str
-
+    tick_size: float | None = None
+    min_order_size: float | None = None
+    outcome_index: int = 0
+    is_other_outcome: bool = False
+    is_placeholder_outcome: bool = False

@@ -32,7 +32,7 @@ async def test_live_gamma_and_clob_endpoints() -> None:
     gamma = GammaClient(AsyncTokenBucket(2.0, 4), RetryConfig())
     clob = ClobClient(AsyncTokenBucket(5.0, 8), RetryConfig())
     try:
-        rows = await discover_target_markets(gamma)
+        rows = await discover_target_markets(gamma, scope="all")
         assert rows, "no target markets discovered"
         tokens = []
         for row in rows:
@@ -43,4 +43,3 @@ async def test_live_gamma_and_clob_endpoints() -> None:
     finally:
         await gamma.close()
         await clob.close()
-

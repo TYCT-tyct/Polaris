@@ -40,6 +40,32 @@ class ClobClient:
 
         return await with_retry(_do, self._retry)
 
+    async def get_books(self, token_ids: list[str], batch_size: int = 500) -> list[ClobBook]:
+        books: list[ClobBook] = []
+        for start in range(0, len(token_ids), batch_size):
+            batch = token_ids[start : start + batch_size]
+            books.extend(await self._get_books_batch(batch))
+        return books
+
+    async def _get_books_batch(self, token_ids: list[str]) -> list[ClobBook]:
+        if not token_ids:
+            return []
+
+        async def _do() -> list[ClobBook]:
+            await self._limiter.acquire()
+            payload = [{"token_id": token_id} for token_id in token_ids]
+            response = await self._client.post("/books", json=payload)
+            response.raise_for_status()
+            rows = response.json()
+            result: list[ClobBook] = []
+            for row in rows:
+                asset_id = row.get("asset_id")
+                row["asset_id"] = asset_id or ""
+                result.append(ClobBook.model_validate(row))
+            return result
+
+        return await with_retry(_do, self._retry)
+
     @staticmethod
     def timestamp_to_datetime(raw_ts: str | None) -> datetime | None:
         if not raw_ts:
@@ -102,4 +128,3 @@ def _depth_by_pct(levels: list[Any], best: float | None, is_bid: bool) -> dict[s
         if pct <= 5:
             totals["5"] += size
     return totals
-
