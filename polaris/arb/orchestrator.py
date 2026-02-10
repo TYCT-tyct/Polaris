@@ -111,26 +111,36 @@ class ArbOrchestrator:
             sleep_sec = max(1.0, self.config.scan_interval_sec - elapsed)
             await _sleep(sleep_sec)
 
-    async def run_replay(self, window_start: datetime, window_end: datetime, source_code: str = "polymarket") -> dict[str, float]:
+    async def run_replay(
+        self,
+        window_start: datetime,
+        window_end: datetime,
+        source_code: str = "polymarket",
+        fast: bool = True,
+    ) -> dict[str, float]:
         replay_run_id = str(uuid4())
         await self.db.execute(
             """
             insert into arb_replay_run(
                 replay_run_id, mode, status, window_start, window_end, metadata, started_at
-            ) values (%s, 'paper_replay', 'running', %s, %s, '{}'::jsonb, now())
+            ) values (%s, 'paper_replay', 'running', %s, %s, %s::jsonb, now())
             """,
-            (replay_run_id, window_start, window_end),
+            (replay_run_id, window_start, window_end, json.dumps({"fast_mode": fast}, ensure_ascii=True)),
         )
 
         per_strategy: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
         buckets = await self._load_replay_buckets(window_start, window_end)
         for bucket_rows in buckets.values():
             snapshots = list(bucket_rows)
+            by_token = {item.token_id: item for item in snapshots}
             signals = self._scan_all(RunMode.PAPER_REPLAY, source_code, snapshots)
             for signal in signals:
-                await self._record_signal(signal, SignalStatus.NEW)
                 plan = self._build_plan(signal)
-                result = await self.order_router.execute(plan, {item.token_id: item for item in snapshots})
+                if fast:
+                    result = await self.order_router.simulate_paper(plan, by_token)
+                else:
+                    await self._record_signal(signal, SignalStatus.NEW)
+                    result = await self.order_router.execute(plan, by_token)
                 strategy = signal.strategy_code.value
                 per_strategy[strategy]["signals"] += 1
                 if result.status == "filled":

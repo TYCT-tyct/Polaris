@@ -16,7 +16,11 @@
   `python -m polaris.cli arb-run --mode live`
 
 ## 3. 回放验证
-`python -m polaris.cli arb-replay --start 2026-02-10T00:00:00+00:00 --end 2026-02-10T06:00:00+00:00`
+默认高速回放（推荐）：
+`python -m polaris.cli arb-replay --start 2026-02-10T00:00:00+00:00 --end 2026-02-10T06:00:00+00:00 --fast`
+
+完整审计回放（会写入明细信号/订单/成交，速度更慢）：
+`python -m polaris.cli arb-replay --start 2026-02-10T00:00:00+00:00 --end 2026-02-10T06:00:00+00:00 --full`
 
 手动触发参数进化：
 `python -m polaris.cli arb-optimize`

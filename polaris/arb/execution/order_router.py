@@ -29,33 +29,44 @@ class OrderRouter:
         await self._record_intents(plan)
 
         if signal.mode in {RunMode.SHADOW, RunMode.PAPER_LIVE, RunMode.PAPER_REPLAY}:
-            result = await self._execute_paper(plan, snapshots)
+            result = await self._execute_paper(plan, snapshots, persist=True)
         else:
             result = await self._execute_live(plan, snapshots)
 
         await self._record_trade_result(result, starts_at)
         return result
 
-    async def _execute_paper(self, plan: ExecutionPlan, snapshots: dict[str, TokenSnapshot]) -> TradeResult:
+    async def simulate_paper(self, plan: ExecutionPlan, snapshots: dict[str, TokenSnapshot]) -> TradeResult:
+        return await self._execute_paper(plan, snapshots, persist=False)
+
+    async def _execute_paper(
+        self,
+        plan: ExecutionPlan,
+        snapshots: dict[str, TokenSnapshot],
+        persist: bool,
+    ) -> TradeResult:
         fills: list[FillEvent] = []
         total_notional = 0.0
         for intent in plan.intents:
             snap = snapshots.get(intent.token_id)
             if snap is None:
-                await self._record_order_event(intent.intent_id, "reject", 404, "missing_snapshot", {})
+                if persist:
+                    await self._record_order_event(intent.intent_id, "reject", 404, "missing_snapshot", {})
                 continue
             fill = _simulate_intent_fill(intent.limit_price, intent.shares, intent.notional_usd, intent.side, snap)
             if fill is None:
-                await self._record_order_event(intent.intent_id, "reject", 422, "insufficient_liquidity", {})
+                if persist:
+                    await self._record_order_event(intent.intent_id, "reject", 422, "insufficient_liquidity", {})
                 continue
             fills.append(fill)
             total_notional += fill.fill_notional_usd
-            await self._record_order_event(intent.intent_id, "fill", 200, "paper_fill", {
-                "price": fill.fill_price,
-                "size": fill.fill_size,
-                "notional": fill.fill_notional_usd,
-            })
-            await self._record_fill(intent.intent_id, fill)
+            if persist:
+                await self._record_order_event(intent.intent_id, "fill", 200, "paper_fill", {
+                    "price": fill.fill_price,
+                    "size": fill.fill_size,
+                    "notional": fill.fill_notional_usd,
+                })
+                await self._record_fill(intent.intent_id, fill)
 
         gross, fees, slip = _estimate_trade_pnl(plan.signal.features, fills)
         return TradeResult(

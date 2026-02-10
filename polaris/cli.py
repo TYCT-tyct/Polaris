@@ -479,6 +479,10 @@ def arb_run(
 def arb_replay(
     start: Annotated[str, typer.Option("--start", help="ISO datetime")] = "",
     end: Annotated[str, typer.Option("--end", help="ISO datetime")] = "",
+    fast: Annotated[
+        bool,
+        typer.Option("--fast/--full", help="Fast replay skips detailed signal/order/fill writes"),
+    ] = True,
 ) -> None:
     """Run historical replay with real captured market data."""
     if not start or not end:
@@ -494,7 +498,7 @@ def arb_replay(
     async def _run() -> None:
         ctx = await create_arb_runtime(settings)
         try:
-            stats = await ctx.orchestrator.run_replay(start_ts, end_ts)
+            stats = await ctx.orchestrator.run_replay(start_ts, end_ts, fast=fast)
             typer.echo(f"arb-replay completed: {stats}")
         finally:
             await close_arb_runtime(ctx)

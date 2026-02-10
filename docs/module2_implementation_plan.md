@@ -23,7 +23,8 @@
 ## 运行命令
 - `python -m polaris.cli arb-run --mode paper_live`
 - `python -m polaris.cli arb-run --mode shadow --once`
-- `python -m polaris.cli arb-replay --start 2026-02-10T00:00:00+00:00 --end 2026-02-10T06:00:00+00:00`
+- `python -m polaris.cli arb-replay --start 2026-02-10T00:00:00+00:00 --end 2026-02-10T06:00:00+00:00 --fast`
+- `python -m polaris.cli arb-replay --start 2026-02-10T00:00:00+00:00 --end 2026-02-10T06:00:00+00:00 --full`
 - `python -m polaris.cli arb-report --group-by strategy,mode,source`
 - `python -m polaris.cli arb-export --table arb_trade_result --format csv --since-hours 24`
 
