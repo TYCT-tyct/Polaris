@@ -23,10 +23,16 @@ Set `POLARIS_DATABASE_URL` to your production Postgres DSN.
 ## 3. Migrate and Validate
 ```bash
 source .venv/bin/activate
+set -a
+source .env
+set +a
 python -m polaris.cli migrate
 python -m polaris.cli doctor --handle elonmusk
 python -m polaris.cli harvest-once --handle elonmusk
 ```
+
+Why `source .env`: current CLI settings read process env vars directly. Without this,
+manual commands may fall back to default DSN.
 
 ## 4. systemd Service
 Create `/etc/systemd/system/polaris-harvest.service`:

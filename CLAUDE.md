@@ -11,7 +11,8 @@
 ├─ docs/
 │  ├─ module1_dataharvester_design.md
 │  ├─ data_dictionary.md
-│  └─ aws_ubuntu_runbook.md
+│  ├─ aws_ubuntu_runbook.md
+│  └─ module1_operations_guide.md
 ├─ polaris/
 │  ├─ __init__.py
 │  ├─ config.py
@@ -67,7 +68,7 @@
 - `polaris/sources/*`：对外部 API 的稳定封装，隐藏上游形态波动。
 - `polaris/harvest/*`：Module 1 采集逻辑与编排，专注数据而非策略。
 - `polaris/ops/*`：健康聚合与补采流程。
-- `docs/*`：设计、字典、部署手册。
+- `docs/*`：设计、字典、部署与运维手册。
 
 ## 依赖边界
 - 依赖单向流：`cli -> runner -> collectors -> clients/db`。
@@ -86,4 +87,4 @@
 - 2026-02-10：从零重建 `Polaris` 基础设施与 Module 1。
 - 2026-02-10：启用正文增量采集（hash + last_post_id 双门控）。
 - 2026-02-10：补齐在线来源测试与端到端 `harvest-once` 测试。
-
+- 2026-02-10：新增 Module 1 运维指南并修正 runbook 手工命令流程。
