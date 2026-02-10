@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import logging
+
 from polaris.db.pool import Database
 from polaris.sources.clob_client import ClobClient
+
+logger = logging.getLogger(__name__)
 
 
 class QuoteCollector:
@@ -40,11 +44,37 @@ class QuoteCollector:
         return l2
 
     async def _fetch_books(self, token_rows: list[dict]) -> list[tuple[dict, object]]:
-        books: list[tuple[dict, object]] = []
+        token_ids: list[str] = []
+        seen: set[str] = set()
         for token in token_rows:
-            book = await self.clob_client.get_book(token["token_id"])
-            books.append((token, book))
-        return books
+            token_id = token.get("token_id")
+            if not token_id or token_id in seen:
+                continue
+            token_ids.append(token_id)
+            seen.add(token_id)
+        if not token_ids:
+            return []
+
+        books = await self.clob_client.get_books(token_ids)
+        by_token_id = {book.asset_id: book for book in books if book.asset_id}
+        rows_with_books: list[tuple[dict, object]] = []
+        missing = 0
+        for token in token_rows:
+            token_id = token.get("token_id")
+            if not token_id:
+                continue
+            book = by_token_id.get(token_id)
+            if book is None:
+                missing += 1
+                continue
+            rows_with_books.append((token, book))
+
+        if missing:
+            logger.info(
+                "quote collector skipped tokens without orderbook",
+                extra={"requested": len(token_ids), "missing": missing},
+            )
+        return rows_with_books
 
     async def _persist_from_books(
         self,

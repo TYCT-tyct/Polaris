@@ -55,6 +55,8 @@ class TokenSnapshot:
     tick_size: float | None
     best_bid: float | None
     best_ask: float | None
+    is_other_outcome: bool = False
+    is_placeholder_outcome: bool = False
     bids: tuple[PriceLevel, ...] = ()
     asks: tuple[PriceLevel, ...] = ()
     captured_at: datetime = field(default_factory=lambda: datetime.now(tz=UTC))
