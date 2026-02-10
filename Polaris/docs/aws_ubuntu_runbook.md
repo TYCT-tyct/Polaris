@@ -1,0 +1,65 @@
+# Polaris AWS Ubuntu 24.04 Runbook
+
+## 1. Host Preparation
+```bash
+sudo apt update
+sudo apt install -y python3.12 python3.12-venv python3-pip postgresql-client
+```
+
+## 2. App Setup
+```bash
+cd /opt
+git clone <your-repo-url> polaris
+cd polaris/Polaris
+python3.12 -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip
+pip install -e .[dev]
+cp .env.example .env
+```
+
+Set `POLARIS_DATABASE_URL` to your production Postgres DSN.
+
+## 3. Migrate and Validate
+```bash
+source .venv/bin/activate
+python -m polaris.cli migrate
+python -m polaris.cli doctor --handle elonmusk
+python -m polaris.cli harvest-once --handle elonmusk
+```
+
+## 4. systemd Service
+Create `/etc/systemd/system/polaris-harvest.service`:
+
+```ini
+[Unit]
+Description=Polaris Data Harvester
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/polaris/Polaris
+EnvironmentFile=/opt/polaris/Polaris/.env
+ExecStart=/opt/polaris/Polaris/.venv/bin/python -m polaris.cli run --handle elonmusk
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Enable:
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable polaris-harvest
+sudo systemctl start polaris-harvest
+sudo systemctl status polaris-harvest
+```
+
+## 5. Operational Checks
+- Check logs: `journalctl -u polaris-harvest -f`
+- Check database growth and ingestion:
+  - `select count(*) from ops_collector_run where started_at >= now() - interval '1 hour';`
+  - `select count(*) from fact_quote_top_raw where captured_at >= now() - interval '1 hour';`
+  - `select count(*) from fact_tweet_post;`
