@@ -99,6 +99,25 @@ class MarketCollector:
                 resolution_source = excluded.resolution_source,
                 updated_from_source_at = excluded.updated_from_source_at,
                 captured_at = excluded.captured_at
+            where dim_market.gamma_market_id is distinct from excluded.gamma_market_id
+               or dim_market.condition_id is distinct from excluded.condition_id
+               or dim_market.question is distinct from excluded.question
+               or dim_market.slug is distinct from excluded.slug
+               or dim_market.event_slug is distinct from excluded.event_slug
+               or dim_market.category is distinct from excluded.category
+               or dim_market.end_date is distinct from excluded.end_date
+               or dim_market.start_date is distinct from excluded.start_date
+               or dim_market.neg_risk is distinct from excluded.neg_risk
+               or dim_market.active is distinct from excluded.active
+               or dim_market.closed is distinct from excluded.closed
+               or dim_market.archived is distinct from excluded.archived
+               or dim_market.spread is distinct from excluded.spread
+               or dim_market.liquidity is distinct from excluded.liquidity
+               or dim_market.volume is distinct from excluded.volume
+               or dim_market.event_id is distinct from excluded.event_id
+               or dim_market.neg_risk_augmented is distinct from excluded.neg_risk_augmented
+               or dim_market.resolution_source is distinct from excluded.resolution_source
+               or dim_market.updated_from_source_at is distinct from excluded.updated_from_source_at
             """,
             rows,
         )
@@ -139,6 +158,15 @@ class MarketCollector:
                 start_date = excluded.start_date,
                 end_date = excluded.end_date,
                 captured_at = excluded.captured_at
+            where dim_event.event_slug is distinct from excluded.event_slug
+               or dim_event.event_ticker is distinct from excluded.event_ticker
+               or dim_event.title is distinct from excluded.title
+               or dim_event.category is distinct from excluded.category
+               or dim_event.active is distinct from excluded.active
+               or dim_event.closed is distinct from excluded.closed
+               or dim_event.archived is distinct from excluded.archived
+               or dim_event.start_date is distinct from excluded.start_date
+               or dim_event.end_date is distinct from excluded.end_date
             """,
             rows,
         )
@@ -177,6 +205,14 @@ class MarketCollector:
                 is_other_outcome = excluded.is_other_outcome,
                 is_placeholder_outcome = excluded.is_placeholder_outcome,
                 captured_at = now()
+            where dim_token.market_id is distinct from excluded.market_id
+               or dim_token.outcome_label is distinct from excluded.outcome_label
+               or dim_token.outcome_side is distinct from excluded.outcome_side
+               or dim_token.tick_size is distinct from excluded.tick_size
+               or dim_token.min_order_size is distinct from excluded.min_order_size
+               or dim_token.outcome_index is distinct from excluded.outcome_index
+               or dim_token.is_other_outcome is distinct from excluded.is_other_outcome
+               or dim_token.is_placeholder_outcome is distinct from excluded.is_placeholder_outcome
             """,
             rows,
         )
