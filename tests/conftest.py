@@ -48,7 +48,10 @@ def postgres_dsn() -> Generator[str, None, None]:
         f"{port}:5432",
         "postgres:16-alpine",
     ]
-    container_id = subprocess.check_output(cmd, text=True).strip()
+    try:
+        container_id = subprocess.check_output(cmd, text=True).strip()
+    except Exception:
+        pytest.skip("docker unavailable and POLARIS_TEST_DATABASE_URL not set")
     dsn = f"postgresql://postgres:postgres@127.0.0.1:{port}/polaris"
     try:
         deadline = time.time() + 45
