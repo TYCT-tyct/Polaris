@@ -28,10 +28,24 @@
 ## 4. 报表与导出
 - 聚合报表：
   `python -m polaris.cli arb-report --group-by strategy,mode,source`
+- 隔夜策略总结（推荐早晨查看）：
+  `python -m polaris.cli arb-summary --since-hours 12 --mode paper_live --source polymarket`
+- 导出隔夜总结到文件：
+  `python -m polaris.cli arb-summary --since-hours 12 --mode paper_live --source polymarket --output exports/overnight_summary.json`
 - 导出：
   `python -m polaris.cli arb-export --table arb_trade_result --format csv --since-hours 24`
 - 基准压测（延迟 p50/p95）：
   `python -m polaris.cli arb-benchmark --mode paper_live --rounds 30 --warmup 3`
+
+`arb-summary` 输出重点：
+- `totals.signals_found`：发现机会总数。
+- `totals.signals_executed`：实际执行信号总数。
+- `totals.trades`：完成交易总数。
+- `totals.net_pnl_usd`：净盈亏。
+- `totals.turnover_usd`：资金周转量。
+- `totals.execution_rate`：执行率（执行信号/发现信号）。
+- `totals.trade_conversion_rate`：交易转化率（交易数/执行信号）。
+- `by_strategy[*]`：按策略拆分的同维度统计，含 `win_rate`、`avg_detection_to_event_ms`、`p95_detection_to_event_ms`。
 
 ## 5. 常见排查
 - 无信号：先检查 `dim_market` 和 `dim_token` 是否有 active 市场。

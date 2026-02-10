@@ -550,6 +550,49 @@ def arb_report(
     asyncio.run(_run())
 
 
+@app.command("arb-summary")
+def arb_summary(
+    since_hours: Annotated[int, typer.Option("--since-hours", min=1, max=24 * 30)] = 12,
+    mode: Annotated[str, typer.Option("--mode", help="all|shadow|paper_live|paper_replay|live")] = "paper_live",
+    source_code: Annotated[str, typer.Option("--source", help="source code, or all")] = "polymarket",
+    output: Annotated[str, typer.Option("--output", help="Optional JSON output path")] = "",
+) -> None:
+    """Show strategy-level overnight summary for Module2."""
+    refresh_process_env_from_file()
+    load_settings.cache_clear()
+    settings = load_settings()
+    setup_logging(settings.log_level)
+    _ensure_windows_selector_loop()
+
+    allowed_modes = {"all", "shadow", "paper_live", "paper_replay", "live"}
+    mode_normalized = mode.strip().lower()
+    if mode_normalized not in allowed_modes:
+        raise typer.BadParameter("mode must be one of: all, shadow, paper_live, paper_replay, live")
+    source_normalized = source_code.strip().lower()
+    mode_filter = None if mode_normalized == "all" else mode_normalized
+    source_filter = None if source_normalized == "all" else source_normalized
+
+    async def _run() -> None:
+        ctx = await create_arb_runtime(settings)
+        try:
+            result = await ctx.reporter.summary(
+                since_hours=since_hours,
+                mode=mode_filter,
+                source_code=source_filter,
+            )
+            text = json.dumps(result, ensure_ascii=False, indent=2, default=str)
+            if output:
+                out_path = Path(output).expanduser()
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                out_path.write_text(text, encoding="utf-8")
+                typer.echo(f"arb-summary saved: {out_path}")
+            typer.echo(text)
+        finally:
+            await close_arb_runtime(ctx)
+
+    asyncio.run(_run())
+
+
 @app.command("arb-export")
 def arb_export(
     table: Annotated[str, typer.Option("--table", help="arb table or view name")] = "arb_trade_result",
