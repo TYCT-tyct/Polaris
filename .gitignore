@@ -19,6 +19,8 @@ build/
 # local database or temp dumps
 *.sqlite
 *.db
+backups/
+exports/
 
 # local notes / legacy artifacts
 analysis_final/
