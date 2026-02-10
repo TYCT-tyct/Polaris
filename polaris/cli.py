@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import signal
 import subprocess
 import sys
@@ -12,6 +13,11 @@ from typing import Annotated
 
 import typer
 
+from polaris.arb.ai.gate import AiGate
+from polaris.arb.cli import parse_iso_datetime, parse_run_mode
+from polaris.arb.config import arb_config_from_settings
+from polaris.arb.orchestrator import ArbOrchestrator
+from polaris.arb.reporting import ArbReporter
 from polaris.config import PolarisSettings, load_settings, refresh_process_env_from_file
 from polaris.db.pool import Database
 from polaris.harvest.collector_markets import MarketCollector
@@ -60,6 +66,15 @@ class RuntimeContext:
     runner: HarvestRunner
 
 
+@dataclass
+class ArbRuntimeContext:
+    settings: PolarisSettings
+    db: Database
+    clob: ClobClient
+    orchestrator: ArbOrchestrator
+    reporter: ArbReporter
+
+
 async def create_runtime(settings: PolarisSettings) -> RuntimeContext:
     db = Database(settings.database_url)
     await db.open()
@@ -75,7 +90,7 @@ async def create_runtime(settings: PolarisSettings) -> RuntimeContext:
         limiter=AsyncTokenBucket(settings.clob_rate, settings.clob_burst),
         retry=settings.retry,
     )
-    market_collector = MarketCollector(db, gamma)
+    market_collector = MarketCollector(db, gamma, market_scope=settings.market_discovery_scope)
     tweet_collector = TweetCollector(db, xtracker)
     quote_collector = QuoteCollector(db, clob, enable_l2=settings.enable_l2)
     mapper = MarketTrackingMapper(db)
@@ -104,9 +119,28 @@ async def create_runtime(settings: PolarisSettings) -> RuntimeContext:
     )
 
 
+async def create_arb_runtime(settings: PolarisSettings) -> ArbRuntimeContext:
+    db = Database(settings.database_url)
+    await db.open()
+    clob = ClobClient(
+        limiter=AsyncTokenBucket(settings.clob_rate, settings.clob_burst),
+        retry=settings.retry,
+    )
+    arb_config = arb_config_from_settings(settings)
+    ai_gate = AiGate.from_settings(settings, arb_config)
+    orchestrator = ArbOrchestrator(db=db, clob_client=clob, config=arb_config, ai_gate=ai_gate)
+    reporter = ArbReporter(db)
+    return ArbRuntimeContext(settings=settings, db=db, clob=clob, orchestrator=orchestrator, reporter=reporter)
+
+
 async def close_runtime(ctx: RuntimeContext) -> None:
     await ctx.xtracker.close()
     await ctx.gamma.close()
+    await ctx.clob.close()
+    await ctx.db.close()
+
+
+async def close_arb_runtime(ctx: ArbRuntimeContext) -> None:
     await ctx.clob.close()
     await ctx.db.close()
 
@@ -412,6 +446,123 @@ def backup(
     typer.echo(f"backup completed: {backup_dir}")
     typer.echo(f"artifacts={len(artifacts)} keep_last={keep_last} pruned={len(pruned)}")
     typer.echo(f"manifest={manifest_file}")
+
+
+@app.command("arb-run")
+def arb_run(
+    mode: Annotated[str, typer.Option("--mode", help="shadow|paper_live|live")] = "paper_live",
+    once: Annotated[bool, typer.Option("--once/--loop", help="Run one scan cycle or keep running")] = False,
+) -> None:
+    """Run Module2 arbitrage engine."""
+    refresh_process_env_from_file()
+    load_settings.cache_clear()
+    settings = load_settings()
+    setup_logging(settings.log_level)
+    _ensure_windows_selector_loop()
+    run_mode = parse_run_mode(mode)
+
+    async def _run() -> None:
+        ctx = await create_arb_runtime(settings)
+        try:
+            if once:
+                stats = await ctx.orchestrator.run_once(run_mode)
+                typer.echo(f"arb-run once completed: {stats}")
+            else:
+                await ctx.orchestrator.run_forever(run_mode)
+        finally:
+            await close_arb_runtime(ctx)
+
+    asyncio.run(_run())
+
+
+@app.command("arb-replay")
+def arb_replay(
+    start: Annotated[str, typer.Option("--start", help="ISO datetime")] = "",
+    end: Annotated[str, typer.Option("--end", help="ISO datetime")] = "",
+) -> None:
+    """Run historical replay with real captured market data."""
+    if not start or not end:
+        raise typer.BadParameter("start and end are required")
+    refresh_process_env_from_file()
+    load_settings.cache_clear()
+    settings = load_settings()
+    setup_logging(settings.log_level)
+    _ensure_windows_selector_loop()
+    start_ts = parse_iso_datetime(start)
+    end_ts = parse_iso_datetime(end)
+
+    async def _run() -> None:
+        ctx = await create_arb_runtime(settings)
+        try:
+            stats = await ctx.orchestrator.run_replay(start_ts, end_ts)
+            typer.echo(f"arb-replay completed: {stats}")
+        finally:
+            await close_arb_runtime(ctx)
+
+    asyncio.run(_run())
+
+
+@app.command("arb-report")
+def arb_report(
+    group_by: Annotated[str, typer.Option("--group-by", help="strategy,mode,source,day")] = "strategy,mode,source",
+) -> None:
+    """Show aggregated performance report for Module2."""
+    refresh_process_env_from_file()
+    load_settings.cache_clear()
+    settings = load_settings()
+    setup_logging(settings.log_level)
+    _ensure_windows_selector_loop()
+
+    async def _run() -> None:
+        ctx = await create_arb_runtime(settings)
+        try:
+            rows = await ctx.reporter.report(group_by=group_by)
+            typer.echo(json.dumps(rows, ensure_ascii=False, indent=2, default=str))
+        finally:
+            await close_arb_runtime(ctx)
+
+    asyncio.run(_run())
+
+
+@app.command("arb-export")
+def arb_export(
+    table: Annotated[str, typer.Option("--table", help="arb table or view name")] = "arb_trade_result",
+    export_format: Annotated[str, typer.Option("--format", help="csv or json")] = "csv",
+    output: Annotated[str, typer.Option("--output", help="Target file path")] = "",
+    limit: Annotated[int, typer.Option("--limit", min=1, max=1_000_000)] = 10000,
+    since_hours: Annotated[int, typer.Option("--since-hours", min=0)] = 24,
+) -> None:
+    """Export Module2 tables and views."""
+    refresh_process_env_from_file()
+    load_settings.cache_clear()
+    settings = load_settings()
+    setup_logging(settings.log_level)
+    _ensure_windows_selector_loop()
+
+    fmt = export_format.strip().lower()
+    if fmt not in ("csv", "json"):
+        raise typer.BadParameter("format must be csv or json")
+    fmt_typed: ExportFormat = "csv" if fmt == "csv" else "json"
+    out_path = Path(output).expanduser() if output else _default_export_path(table, fmt_typed)
+
+    async def _run() -> None:
+        ctx = await create_arb_runtime(settings)
+        try:
+            result = await ctx.reporter.export_table(
+                table=table,
+                export_format=fmt_typed,
+                output_path=out_path,
+                since_hours=since_hours if since_hours > 0 else None,
+                limit=limit,
+            )
+            typer.echo(
+                f"arb-export completed: table={result['table']} rows={result['rows']} "
+                f"format={result['export_format']} file={result['output_path']}"
+            )
+        finally:
+            await close_arb_runtime(ctx)
+
+    asyncio.run(_run())
 
 
 async def _watch_env_file(
