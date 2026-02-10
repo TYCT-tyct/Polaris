@@ -82,6 +82,10 @@ python -m polaris.cli doctor --handle elonmusk
 python -m polaris.cli harvest-once --handle elonmusk
 ```
 
+市场范围由 `POLARIS_MARKET_DISCOVERY_SCOPE` 控制：
+- `all`：全市场（默认）
+- `elon_tweet`：仅 Elon 推文相关市场
+
 ## 6. 判断“是否在持续采集”
 进入数据库后看最近数据是否增长：
 

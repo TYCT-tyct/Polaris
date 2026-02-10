@@ -1,7 +1,7 @@
 # Polaris Module 1 DataHarvester Design
 
 ## Goal
-Provide a production-grade data ingestion layer for Elon tweet prediction markets on Polymarket. Module 1 is deliberately strategy-free; it only collects, normalizes, and stores truth data.
+Provide a production-grade data ingestion layer for Polymarket markets and tracked X accounts. Module 1 is deliberately strategy-free; it only collects, normalizes, and stores truth data.
 
 ## Data Sources
 - XTracker:
@@ -15,7 +15,7 @@ Provide a production-grade data ingestion layer for Elon tweet prediction market
   - `/book?token_id=...`
 
 ## Core Pipeline
-1. Discover target markets from Gamma and upsert market/token dimensions.
+1. Discover markets from Gamma with configurable scope (`all` or `elon_tweet`) and upsert market/token dimensions.
 2. Sync X account and tracking windows.
 3. Pull daily metrics for each active tracking window.
 4. Pull post content from XTracker and apply incremental insertion:
@@ -53,4 +53,3 @@ Provide a production-grade data ingestion layer for Elon tweet prediction market
 - `python -m polaris.cli run --handle elonmusk`
 - `python -m polaris.cli backfill --handle elonmusk --start YYYY-MM-DD --end YYYY-MM-DD`
 - `python -m polaris.cli doctor`
-

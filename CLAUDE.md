@@ -10,9 +10,11 @@
 ├─ CLAUDE.md
 ├─ docs/
 │  ├─ module1_dataharvester_design.md
+│  ├─ module1_operations_guide.md
+│  ├─ module2_implementation_plan.md
+│  ├─ module2_operations_guide.md
 │  ├─ data_dictionary.md
-│  ├─ aws_ubuntu_runbook.md
-│  └─ module1_operations_guide.md
+│  └─ aws_ubuntu_runbook.md
 ├─ polaris/
 │  ├─ __init__.py
 │  ├─ config.py
@@ -23,7 +25,9 @@
 │  │  ├─ pool.py
 │  │  └─ migrations/
 │  │     ├─ 0001_init.sql
-│  │     └─ 0002_partitions_indexes.sql
+│  │     ├─ 0002_partitions_indexes.sql
+│  │     ├─ 0003_module2_core.sql
+│  │     └─ 0004_module2_views.sql
 │  ├─ infra/
 │  │  ├─ __init__.py
 │  │  ├─ rate_limiter.py
@@ -43,6 +47,35 @@
 │  │  ├─ collector_quotes.py
 │  │  ├─ mapper_market_tracking.py
 │  │  └─ runner.py
+│  ├─ arb/
+│  │  ├─ __init__.py
+│  │  ├─ contracts.py
+│  │  ├─ config.py
+│  │  ├─ orchestrator.py
+│  │  ├─ cli.py
+│  │  ├─ reporting.py
+│  │  ├─ strategies/
+│  │  │  ├─ __init__.py
+│  │  │  ├─ common.py
+│  │  │  ├─ strategy_a.py
+│  │  │  ├─ strategy_b.py
+│  │  │  ├─ strategy_c.py
+│  │  │  ├─ strategy_f.py
+│  │  │  └─ strategy_g.py
+│  │  ├─ execution/
+│  │  │  ├─ __init__.py
+│  │  │  ├─ fill_simulator.py
+│  │  │  ├─ sizer.py
+│  │  │  ├─ risk_gate.py
+│  │  │  └─ order_router.py
+│  │  └─ ai/
+│  │     ├─ __init__.py
+│  │     ├─ gate.py
+│  │     ├─ provider_google.py
+│  │     ├─ provider_anthropic.py
+│  │     ├─ provider_openai.py
+│  │     ├─ provider_minimax.py
+│  │     └─ provider_zhipu.py
 │  └─ ops/
 │     ├─ __init__.py
 │     ├─ backup.py
@@ -62,38 +95,35 @@
    ├─ test_upsert_idempotency.py
    ├─ test_scheduler.py
    ├─ test_live_sources.py
-   └─ test_live_harvest_once.py
+   ├─ test_live_harvest_once.py
+   ├─ test_arb_live_scan.py
+   └─ test_arb_replay_real.py
 ```
 
 ## 模块职责
-- `polaris/config.py`：所有运行参数的唯一入口，避免分散常量。
-- `polaris/cli.py`：运维入口，负责组装运行时依赖并触发命令。
-- `polaris/db/pool.py`：数据库连接池、迁移执行、通用读写。
-- `polaris/infra/*`：限流、重试、调度三件基础设施。
-- `polaris/sources/*`：对外部 API 的稳定封装，隐藏上游形态波动。
-- `polaris/harvest/*`：Module 1 采集逻辑与编排，专注数据而非策略。
-- `polaris/ops/*`：健康聚合与补采流程。
-- `polaris/ops/exporter.py`：按表导出 CSV/JSON，支持按小时窗口过滤。
-- `docs/*`：设计、字典、部署与运维手册。
+- `polaris/config.py`：集中管理 Module1 + Module2 的运行参数与开关。
+- `polaris/harvest/*`：Module1 采集层，负责事实数据落库。
+- `polaris/arb/*`：Module2 套利引擎，统一编排扫描、风控、执行、回放、参数进化。
+- `polaris/arb/strategies/*`：策略检测器（A/B/C/F/G）。
+- `polaris/arb/execution/*`：执行路由、成交模拟、仓位与风险控制。
+- `polaris/arb/ai/*`：G 策略可选 AI 复核层（google/claude/gpt/minimax/zhipu）。
+- `polaris/ops/exporter.py`：统一导出 Module1/2 关键表与视图。
 
 ## 依赖边界
-- 依赖单向流：`cli -> runner -> collectors -> clients/db`。
-- `sources` 只做数据获取与解析，不做业务决策。
-- `harvest` 只做规则与入库，不承担执行策略。
-- `ops` 只做可观测与运维，不修改核心采集逻辑。
+- 采集链路：`cli -> harvest.runner -> collectors -> sources/db`。
+- 套利链路：`cli -> arb.orchestrator -> strategies -> risk_gate -> order_router -> db`。
+- `sources` 仅做外部接口封装，不承载策略决策。
+- `arb` 与 `harvest` 通过数据库事实表耦合，不直接跨模块调用业务逻辑。
 
 ## 关键设计决策
-- 官方付费 X API 被明确排除，正文默认来自 XTracker `posts` 接口。
-- 高频事实表分区 + BRIN 时间索引，保证采集与查询同时可扩展。
-- 原始高频 14 天保留，分钟聚合长期保留，成本与回放能力平衡。
-- 所有写库路径都使用幂等 upsert，重复采集不产生脏数据。
-- 每个采集任务都落 `ops_collector_run`，故障可追溯。
+- 市场发现从硬编码 Elon 迁移为 `scope=all|elon_tweet`，默认全市场。
+- Module2 全链路统一记录：信号、订单、成交、风险、PnL、参数版本、回放指标。
+- C 策略完整实现但默认禁止实盘，符合小资金风险边界。
+- G 策略支持规则锁定 + 可选 AI 复核，AI 不可用时自动退化为纯规则。
+- 参数进化基于“历史回放 + 最近 24h paper”双评分，所有版本可追溯。
 
 ## 变更日志
-- 2026-02-10：从零重建 `Polaris` 基础设施与 Module 1。
-- 2026-02-10：启用正文增量采集（hash + last_post_id 双门控）。
-- 2026-02-10：补齐在线来源测试与端到端 `harvest-once` 测试。
-- 2026-02-10：新增 Module 1 运维指南并修正 runbook 手工命令流程。
-- 2026-02-10：新增导出命令与热更新运行模式（.env 变更/SIGHUP 触发重载）。
-- 2026-02-10：修复热更新取消竞态，新增 scheduler 取消回收回归测试。
-- 2026-02-10：新增一键备份命令（pg_dump + 关键导出 + manifest + 保留清理）。
+- 2026-02-10：新增 Module2 迁移 `0003/0004` 与 `arb_*` 数据模型。
+- 2026-02-10：新增 Module2 核心包 `polaris/arb`（ABFG 实盘路径，C 默认禁实盘）。
+- 2026-02-10：新增回放引擎、报表导出、参数进化与 AI 复核接口。
+- 2026-02-10：市场发现支持全市场范围并保持 `elon_tweet` 兼容模式。

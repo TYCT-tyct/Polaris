@@ -76,6 +76,32 @@ sudo systemctl reload polaris-harvest
   - `select count(*) from fact_quote_top_raw where captured_at >= now() - interval '1 hour';`
   - `select count(*) from fact_tweet_post;`
 
+## 5.1 Module2 Commands
+Run one arbitrage scan in shadow mode:
+```bash
+cd /home/ubuntu/polaris
+source .venv/bin/activate
+set -a; source .env; set +a
+python -m polaris.cli arb-run --mode shadow --once
+```
+
+Run paper engine:
+```bash
+python -m polaris.cli arb-run --mode paper_live
+```
+
+Run replay:
+```bash
+python -m polaris.cli arb-replay \
+  --start 2026-02-10T00:00:00+00:00 \
+  --end 2026-02-10T06:00:00+00:00
+```
+
+View report:
+```bash
+python -m polaris.cli arb-report --group-by strategy,mode,source
+```
+
 ## 6. Backup and Restore
 Install backup binary:
 ```bash
