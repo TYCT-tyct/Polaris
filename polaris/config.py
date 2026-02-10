@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import os
 from functools import lru_cache
+from pathlib import Path
 from typing import Iterable
 
+from dotenv import dotenv_values
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -33,7 +36,12 @@ class PollIntervals(BaseModel):
 
 
 class PolarisSettings(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix="POLARIS_", case_sensitive=False)
+    model_config = SettingsConfigDict(
+        env_prefix="POLARIS_",
+        case_sensitive=False,
+        env_file=".env",
+        env_file_encoding="utf-8",
+    )
 
     database_url: str = Field(default="postgresql://postgres:postgres@localhost:55432/polaris")
     log_level: str = Field(default="INFO")
@@ -107,3 +115,17 @@ class PolarisSettings(BaseSettings):
 def load_settings() -> PolarisSettings:
     return PolarisSettings()
 
+
+def refresh_process_env_from_file(path: str | Path = ".env", prefix: str = "POLARIS_") -> bool:
+    env_path = Path(path)
+    if not env_path.exists():
+        return False
+    changed = False
+    values = dotenv_values(env_path)
+    for key, value in values.items():
+        if value is None or not key.startswith(prefix):
+            continue
+        if os.environ.get(key) != value:
+            os.environ[key] = value
+            changed = True
+    return changed

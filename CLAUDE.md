@@ -45,6 +45,7 @@
 │  │  └─ runner.py
 │  └─ ops/
 │     ├─ __init__.py
+│     ├─ exporter.py
 │     ├─ health.py
 │     └─ backfill.py
 └─ tests/
@@ -55,6 +56,7 @@
    ├─ test_rate_limiter.py
    ├─ test_retry.py
    ├─ test_mapping_score.py
+   ├─ test_exporter.py
    ├─ test_upsert_idempotency.py
    ├─ test_live_sources.py
    └─ test_live_harvest_once.py
@@ -68,6 +70,7 @@
 - `polaris/sources/*`：对外部 API 的稳定封装，隐藏上游形态波动。
 - `polaris/harvest/*`：Module 1 采集逻辑与编排，专注数据而非策略。
 - `polaris/ops/*`：健康聚合与补采流程。
+- `polaris/ops/exporter.py`：按表导出 CSV/JSON，支持按小时窗口过滤。
 - `docs/*`：设计、字典、部署与运维手册。
 
 ## 依赖边界
@@ -88,3 +91,4 @@
 - 2026-02-10：启用正文增量采集（hash + last_post_id 双门控）。
 - 2026-02-10：补齐在线来源测试与端到端 `harvest-once` 测试。
 - 2026-02-10：新增 Module 1 运维指南并修正 runbook 手工命令流程。
+- 2026-02-10：新增导出命令与热更新运行模式（.env 变更/SIGHUP 触发重载）。

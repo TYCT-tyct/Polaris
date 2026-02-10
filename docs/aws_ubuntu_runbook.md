@@ -48,6 +48,7 @@ User=ubuntu
 WorkingDirectory=/home/ubuntu/polaris
 EnvironmentFile=/home/ubuntu/polaris/.env
 ExecStart=/home/ubuntu/polaris/.venv/bin/python -m polaris.cli run --handle elonmusk
+ExecReload=/bin/kill -HUP $MAINPID
 Restart=always
 RestartSec=5
 
@@ -61,6 +62,11 @@ sudo systemctl daemon-reload
 sudo systemctl enable polaris-harvest
 sudo systemctl start polaris-harvest
 sudo systemctl status polaris-harvest
+```
+
+Hot reload after `.env` changes:
+```bash
+sudo systemctl reload polaris-harvest
 ```
 
 ## 5. Operational Checks

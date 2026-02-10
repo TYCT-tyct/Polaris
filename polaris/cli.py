@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import signal
 import sys
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Annotated
 
 import typer
 
-from polaris.config import PolarisSettings, load_settings
+from polaris.config import PolarisSettings, load_settings, refresh_process_env_from_file
 from polaris.db.pool import Database
 from polaris.harvest.collector_markets import MarketCollector
 from polaris.harvest.collector_quotes import QuoteCollector
@@ -18,6 +21,7 @@ from polaris.harvest.runner import HarvestRunner
 from polaris.infra.rate_limiter import AsyncTokenBucket
 from polaris.logging import setup_logging
 from polaris.ops.backfill import BackfillService
+from polaris.ops.exporter import ExportFormat, export_table, list_exportable_tables
 from polaris.ops.health import HealthAggregator
 from polaris.sources.clob_client import ClobClient
 from polaris.sources.gamma_client import GammaClient
@@ -139,19 +143,74 @@ def harvest_once(
 @app.command("run")
 def run(
     handle: Annotated[str, typer.Option("--handle", help="Comma separated handles")] = "elonmusk",
+    hot_reload: Annotated[
+        bool,
+        typer.Option("--hot-reload/--no-hot-reload", help="Reload runtime when .env changes or SIGHUP arrives"),
+    ] = True,
+    reload_poll_sec: Annotated[int, typer.Option("--reload-poll-sec", min=1, max=60)] = 2,
 ) -> None:
     """Run continuous scheduler."""
+    refresh_process_env_from_file()
+    load_settings.cache_clear()
     settings = load_settings()
     setup_logging(settings.log_level)
     _ensure_windows_selector_loop()
-    handles = settings.with_handles(handle.split(","))
+    requested_handles = handle.split(",")
 
     async def _run() -> None:
-        ctx = await create_runtime(settings)
+        stop_event = asyncio.Event()
+        reload_event = asyncio.Event()
+        _install_signal_handlers(stop_event, reload_event if hot_reload else None)
+        watch_task = (
+            asyncio.create_task(_watch_env_file(Path(".env"), reload_event, stop_event, reload_poll_sec))
+            if hot_reload
+            else None
+        )
         try:
-            await ctx.runner.run_forever(handles)
+            while not stop_event.is_set():
+                refresh_process_env_from_file()
+                load_settings.cache_clear()
+                current_settings = load_settings()
+                setup_logging(current_settings.log_level)
+                current_handles = current_settings.with_handles(requested_handles)
+                ctx = await create_runtime(current_settings)
+                runner_task = asyncio.create_task(ctx.runner.run_forever(current_handles))
+                stop_wait = asyncio.create_task(stop_event.wait())
+                reload_wait = asyncio.create_task(reload_event.wait())
+                done, pending = await asyncio.wait(
+                    [runner_task, stop_wait, reload_wait],
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for task in pending:
+                    task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+
+                if stop_wait in done:
+                    runner_task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await runner_task
+                    await close_runtime(ctx)
+                    break
+
+                if hot_reload and reload_wait in done:
+                    reload_event.clear()
+                    runner_task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await runner_task
+                    await close_runtime(ctx)
+                    typer.echo("hot reload applied")
+                    continue
+
+                if runner_task in done:
+                    exc = runner_task.exception()
+                    await close_runtime(ctx)
+                    if exc:
+                        raise exc
+                    break
         finally:
-            await close_runtime(ctx)
+            if watch_task:
+                watch_task.cancel()
+                await asyncio.gather(watch_task, return_exceptions=True)
 
     asyncio.run(_run())
 
@@ -223,6 +282,91 @@ def doctor(
             await close_runtime(ctx)
 
     asyncio.run(_run())
+
+
+@app.command("export-tables")
+def export_tables() -> None:
+    """List exportable tables/views."""
+    for name in list_exportable_tables():
+        typer.echo(name)
+
+
+@app.command("export")
+def export_data(
+    table: Annotated[str, typer.Option("--table", help="Table/view name to export")] = "fact_quote_top_raw",
+    export_format: Annotated[str, typer.Option("--format", help="csv or json")] = "csv",
+    output: Annotated[str, typer.Option("--output", help="Target file path")] = "",
+    limit: Annotated[int, typer.Option("--limit", min=1, max=1_000_000)] = 10000,
+    since_hours: Annotated[int, typer.Option("--since-hours", min=0)] = 0,
+) -> None:
+    """Export one table/view to CSV or JSON."""
+    refresh_process_env_from_file()
+    load_settings.cache_clear()
+    settings = load_settings()
+    setup_logging(settings.log_level)
+    _ensure_windows_selector_loop()
+
+    fmt = export_format.strip().lower()
+    if fmt not in ("csv", "json"):
+        raise typer.BadParameter("format must be csv or json")
+    fmt_typed: ExportFormat = "csv" if fmt == "csv" else "json"
+    out_path = Path(output).expanduser() if output else _default_export_path(table, fmt_typed)
+
+    async def _run() -> None:
+        db = Database(settings.database_url)
+        await db.open()
+        try:
+            result = await export_table(
+                db=db,
+                table=table,
+                export_format=fmt_typed,
+                output_path=out_path,
+                limit=limit,
+                since_hours=since_hours or None,
+            )
+            typer.echo(
+                f"export completed: table={result.table} rows={result.rows} "
+                f"format={result.export_format} file={result.output_path}"
+            )
+        finally:
+            await db.close()
+
+    asyncio.run(_run())
+
+
+async def _watch_env_file(
+    path: Path,
+    reload_event: asyncio.Event,
+    stop_event: asyncio.Event,
+    poll_sec: int,
+) -> None:
+    try:
+        last_mtime = path.stat().st_mtime if path.exists() else None
+        while not stop_event.is_set():
+            await asyncio.sleep(poll_sec)
+            mtime = path.stat().st_mtime if path.exists() else None
+            if mtime != last_mtime:
+                last_mtime = mtime
+                reload_event.set()
+    except asyncio.CancelledError:
+        raise
+
+
+def _install_signal_handlers(stop_event: asyncio.Event, reload_event: asyncio.Event | None) -> None:
+    try:
+        loop = asyncio.get_running_loop()
+        loop.add_signal_handler(signal.SIGINT, stop_event.set)
+        loop.add_signal_handler(signal.SIGTERM, stop_event.set)
+        if reload_event and hasattr(signal, "SIGHUP"):
+            loop.add_signal_handler(signal.SIGHUP, reload_event.set)
+    except NotImplementedError:
+        return
+
+
+def _default_export_path(table: str, export_format: ExportFormat) -> Path:
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    suffix = "csv" if export_format == "csv" else "json"
+    return Path("exports") / f"{table.strip().lower()}_{stamp}.{suffix}"
 
 
 if __name__ == "__main__":

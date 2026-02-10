@@ -8,6 +8,27 @@
   - 分钟聚合与健康统计
 - 目标是为后续 Module2~4 提供稳定、可回放、可审计的数据。
 
+## 1.1 采集数据总表
+| 表/视图 | 类型 | 核心字段 | 来源 | 频率/触发 | 主要用途 |
+|---|---|---|---|---|---|
+| `dim_account` | 维表 | `account_id`, `handle`, `post_count`, `last_sync` | XTracker users | `tracking_sync` / `post_sync` | 账号主数据 |
+| `dim_tracking_window` | 维表 | `tracking_id`, `account_id`, `start_date`, `end_date` | XTracker trackings | `tracking_sync` | 市场窗口对齐 |
+| `fact_tweet_metric_daily` | 事实表 | `metric_date`, `tweet_count`, `cumulative_count` | XTracker metrics | `metric_sync` | 日级计数曲线 |
+| `fact_tweet_post` | 事实表 | `platform_post_id`, `content`, `posted_at`, `is_reply` | XTracker posts | `post_sync` | 正文与语义特征 |
+| `dim_market` | 维表 | `market_id`, `condition_id`, `question`, `active` | Gamma markets | `markets_discovery` | 市场元数据 |
+| `dim_token` | 维表 | `token_id`, `market_id`, `outcome_label` | Gamma outcomes | `markets_discovery` | token 映射 |
+| `bridge_market_tracking` | 关系表 | `market_id`, `tracking_id`, `match_score` | 内部映射 | `mapping_sync` | 市场-窗口关联 |
+| `fact_market_state_snapshot` | 事实表 | `active`, `closed`, `spread`, `liquidity` | Gamma markets | `markets_discovery` | 市场状态时序 |
+| `fact_quote_top_raw` | 高频事实 | `best_bid`, `best_ask`, `mid`, `spread` | CLOB book | `quote_top_sync` | 顶层盘口序列 |
+| `fact_quote_depth_raw` | 高频事实 | `bid_depth_*`, `ask_depth_*`, `imbalance` | CLOB book | `quote_depth_sync` | 深度与失衡 |
+| `fact_orderbook_l2_raw` | 高频事实 | `side`, `price`, `size`, `level_index` | CLOB book | `orderbook_l2_sync` | L2 回放 |
+| `fact_quote_1m` | 聚合事实 | `open/high/low/close`, `sample_count` | 原始行情聚合 | `agg_1m` | 分钟级策略输入 |
+| `fact_settlement` | 事实表 | `winning_outcome`, `winning_token_id`, `settled_at` | 结算补录 | 结算后写入 | 训练与复盘 |
+| `ops_collector_run` | 运维事实 | `job_name`, `status`, `latency_ms` | 内部 | 每次任务执行 | 运行审计 |
+| `ops_api_health_minute` | 运维聚合 | `runs`, `error_runs`, `p95_latency_ms` | `ops_collector_run` 聚合 | `health_agg` | 稳定性监控 |
+| `ops_cursor` | 游标 | `cursor_key`, `cursor_value`, `updated_at` | 内部 | 增量写入时 | 去重与断点续采 |
+| `view_quote_latest` | 视图 | 每 token 最新 bid/ask/mid | `fact_quote_top_raw` | 实时查询 | 低延迟读取 |
+
 ## 2. `systemd` 的作用
 - 让服务以守护进程方式长期运行（无需保持终端会话）。
 - 开机自动启动（`enabled`）。
@@ -41,6 +62,9 @@ sudo journalctl -u polaris-harvest -f
 
 # 重启服务（改完配置后使用）
 sudo systemctl restart polaris-harvest
+
+# 热更新（尽量不断服务，触发进程内重载）
+sudo systemctl reload polaris-harvest
 ```
 
 ## 5. 手工执行 CLI（一次性任务）
@@ -111,6 +135,56 @@ pip install -e .
 set -a; source .env; set +a
 python -m polaris.cli migrate
 sudo systemctl restart polaris-harvest
+```
+
+## 8.1 热更新配置（不改代码）
+适用：你只改 `.env`（采样频率、限流、是否启用 L2 等）。
+
+```bash
+cd /home/ubuntu/polaris
+vim .env
+sudo systemctl reload polaris-harvest
+```
+
+说明：
+- 当前 `run` 默认开启 `--hot-reload`。
+- 触发 `reload` 后，进程会平滑重建运行时并加载新配置。
+- 若遇到异常，退回 `sudo systemctl restart polaris-harvest`。
+
+## 8.2 导出数据（下载查看）
+### 查看支持导出的表
+```bash
+cd /home/ubuntu/polaris
+source .venv/bin/activate
+set -a; source .env; set +a
+python -m polaris.cli export-tables
+```
+
+### 导出为 CSV
+```bash
+python -m polaris.cli export \
+  --table fact_quote_1m \
+  --format csv \
+  --since-hours 24 \
+  --limit 50000 \
+  --output exports/fact_quote_1m_24h.csv
+```
+
+### 导出为 JSON
+```bash
+python -m polaris.cli export \
+  --table fact_tweet_post \
+  --format json \
+  --since-hours 48 \
+  --limit 10000 \
+  --output exports/fact_tweet_post_48h.json
+```
+
+### 从服务器下载到本地
+```bash
+scp -i "C:\Users\Shini\Documents\terauss.pem" \
+  ubuntu@108.130.51.215:/home/ubuntu/polaris/exports/fact_quote_1m_24h.csv \
+  .
 ```
 
 ## 9. 常见故障与处理
