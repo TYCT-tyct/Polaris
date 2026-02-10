@@ -46,6 +46,7 @@ class PolarisSettings(BaseSettings):
     database_url: str = Field(default="postgresql://postgres:postgres@localhost:55432/polaris")
     log_level: str = Field(default="INFO")
     default_handles: str = Field(default="elonmusk")
+    market_discovery_scope: str = Field(default="all")
 
     xtracker_rate: float = Field(default=1.0)
     xtracker_burst: int = Field(default=2)
@@ -70,6 +71,61 @@ class PolarisSettings(BaseSettings):
     post_fail_backoff_interval: int = Field(default=300)
     raw_retention_days: int = Field(default=14)
     enable_l2: bool = Field(default=True)
+
+    # module2: global mode and cadence
+    arb_default_mode: str = Field(default="paper_live")
+    arb_scan_interval_sec: int = Field(default=20)
+    arb_optimize_interval_sec: int = Field(default=86400)
+    arb_optimize_replay_days: int = Field(default=14)
+    arb_optimize_paper_hours: int = Field(default=24)
+
+    # module2: risk and sizing
+    arb_min_order_notional_usd: float = Field(default=1.0)
+    arb_single_risk_usd: float = Field(default=2.0)
+    arb_max_exposure_usd: float = Field(default=6.0)
+    arb_daily_stop_loss_usd: float = Field(default=0.5)
+    arb_consecutive_fail_limit: int = Field(default=2)
+    arb_partial_fill_timeout_sec: int = Field(default=30)
+    arb_patch_fill_threshold: float = Field(default=0.8)
+    arb_unwind_fill_threshold: float = Field(default=0.5)
+    arb_slippage_bps: int = Field(default=40)
+
+    # module2: strategy switches
+    arb_enable_strategy_a: bool = Field(default=True)
+    arb_enable_strategy_b: bool = Field(default=True)
+    arb_enable_strategy_c: bool = Field(default=True)
+    arb_enable_strategy_f: bool = Field(default=True)
+    arb_enable_strategy_g: bool = Field(default=True)
+    arb_c_live_enabled: bool = Field(default=False)
+    arb_strategy_priority: str = Field(default="A,G,F,B")
+
+    # module2: strategy thresholds
+    arb_a_min_edge_pct: float = Field(default=0.015)
+    arb_b_min_edge_pct: float = Field(default=0.012)
+    arb_c_min_edge_pct: float = Field(default=0.015)
+    arb_f_min_prob: float = Field(default=0.94)
+    arb_f_max_hours_to_resolve: float = Field(default=12.0)
+    arb_f_min_annualized_return: float = Field(default=0.08)
+    arb_g_max_hours_to_resolve: float = Field(default=4.0)
+    arb_g_min_confidence: float = Field(default=0.90)
+    arb_g_min_expected_edge_pct: float = Field(default=0.02)
+
+    # module2: ai gate
+    arb_ai_mode: str = Field(default="cascade_quorum")
+    arb_ai_quorum: int = Field(default=2)
+    arb_ai_provider_order: str = Field(default="google,anthropic,openai,minimax,zhipu")
+    arb_ai_enabled: bool = Field(default=False)
+    arb_ai_single_model: str = Field(default="openai")
+    arb_openai_api_key: str | None = Field(default=None)
+    arb_anthropic_api_key: str | None = Field(default=None)
+    arb_google_api_key: str | None = Field(default=None)
+    arb_minimax_api_key: str | None = Field(default=None)
+    arb_zhipu_api_key: str | None = Field(default=None)
+    arb_openai_model: str = Field(default="gpt-5-mini")
+    arb_anthropic_model: str = Field(default="claude-3-7-sonnet-latest")
+    arb_google_model: str = Field(default="gemini-2.0-flash")
+    arb_minimax_model: str = Field(default="MiniMax-Text-01")
+    arb_zhipu_model: str = Field(default="glm-4-flash")
 
     @property
     def handles(self) -> list[str]:
@@ -109,6 +165,14 @@ class PolarisSettings(BaseSettings):
             if cleaned:
                 return cleaned
         return self.handles
+
+    @property
+    def arb_priority(self) -> list[str]:
+        return [s.strip().upper() for s in self.arb_strategy_priority.split(",") if s.strip()]
+
+    @property
+    def ai_provider_order(self) -> list[str]:
+        return [s.strip().lower() for s in self.arb_ai_provider_order.split(",") if s.strip()]
 
 
 @lru_cache(maxsize=1)
