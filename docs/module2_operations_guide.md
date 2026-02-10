@@ -18,6 +18,9 @@
 ## 3. 回放验证
 `python -m polaris.cli arb-replay --start 2026-02-10T00:00:00+00:00 --end 2026-02-10T06:00:00+00:00`
 
+手动触发参数进化：
+`python -m polaris.cli arb-optimize`
+
 ## 4. 报表与导出
 - 聚合报表：
   `python -m polaris.cli arb-report --group-by strategy,mode,source`

@@ -502,6 +502,26 @@ def arb_replay(
     asyncio.run(_run())
 
 
+@app.command("arb-optimize")
+def arb_optimize() -> None:
+    """Run one parameter evolution cycle for Module2."""
+    refresh_process_env_from_file()
+    load_settings.cache_clear()
+    settings = load_settings()
+    setup_logging(settings.log_level)
+    _ensure_windows_selector_loop()
+
+    async def _run() -> None:
+        ctx = await create_arb_runtime(settings)
+        try:
+            await ctx.orchestrator.optimize_parameters()
+            typer.echo("arb-optimize completed")
+        finally:
+            await close_arb_runtime(ctx)
+
+    asyncio.run(_run())
+
+
 @app.command("arb-report")
 def arb_report(
     group_by: Annotated[str, typer.Option("--group-by", help="strategy,mode,source,day")] = "strategy,mode,source",
