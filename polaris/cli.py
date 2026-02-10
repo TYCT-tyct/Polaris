@@ -17,6 +17,7 @@ import typer
 from polaris.arb.ai.gate import AiGate
 from polaris.arb.cli import parse_iso_datetime, parse_run_mode
 from polaris.arb.config import arb_config_from_settings
+from polaris.arb.contracts import RunMode
 from polaris.arb.orchestrator import ArbOrchestrator
 from polaris.arb.reporting import ArbReporter
 from polaris.config import PolarisSettings, load_settings, refresh_process_env_from_file
@@ -609,6 +610,9 @@ def arb_benchmark(
     async def _run() -> None:
         ctx = await create_arb_runtime(settings)
         try:
+            if run_mode == RunMode.PAPER_LIVE:
+                # 基准只评估扫描与执行链路，不把每日参数进化耗时混进结果。
+                ctx.orchestrator._last_optimize_at = datetime.now()
             for _ in range(warmup):
                 await ctx.orchestrator.run_once(run_mode)
 
