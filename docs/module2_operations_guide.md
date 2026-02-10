@@ -47,3 +47,5 @@
 - `POLARIS_ARB_UNIVERSE_MAX_HOURS=72`：只扫描 72 小时内到期市场，提高周转效率。
 - `POLARIS_ARB_UNIVERSE_TOKEN_LIMIT=2000`：限制每轮 token 上限，控制请求体积。
 - `POLARIS_ARB_C_MAX_CANDIDATES_PER_EVENT=1`：策略 C 每个事件只执行最优候选，减少重复腿。
+- `POLARIS_ARB_CLOB_BOOKS_BATCH_SIZE=500`：`/books` 批量大小，过大可能触发 400。
+- `POLARIS_ARB_CLOB_BOOKS_MAX_CONCURRENCY=4`：并发批次上限，过高会放大网络抖动。

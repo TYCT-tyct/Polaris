@@ -81,6 +81,8 @@ class PolarisSettings(BaseSettings):
     arb_max_signals_per_cycle: int = Field(default=48)
     arb_universe_max_hours: float = Field(default=72.0)
     arb_universe_token_limit: int = Field(default=2000)
+    arb_clob_books_batch_size: int = Field(default=500)
+    arb_clob_books_max_concurrency: int = Field(default=4)
 
     # module2: risk and sizing
     arb_min_order_notional_usd: float = Field(default=1.0)

@@ -15,6 +15,8 @@ class ArbConfig:
     max_signals_per_cycle: int
     universe_max_hours: float
     universe_token_limit: int
+    clob_books_batch_size: int
+    clob_books_max_concurrency: int
 
     min_order_notional_usd: float
     single_risk_usd: float
@@ -64,6 +66,8 @@ def arb_config_from_settings(settings: PolarisSettings) -> ArbConfig:
         max_signals_per_cycle=settings.arb_max_signals_per_cycle,
         universe_max_hours=settings.arb_universe_max_hours,
         universe_token_limit=settings.arb_universe_token_limit,
+        clob_books_batch_size=settings.arb_clob_books_batch_size,
+        clob_books_max_concurrency=settings.arb_clob_books_max_concurrency,
         min_order_notional_usd=settings.arb_min_order_notional_usd,
         single_risk_usd=settings.arb_single_risk_usd,
         max_exposure_usd=settings.arb_max_exposure_usd,

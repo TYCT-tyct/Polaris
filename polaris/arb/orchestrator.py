@@ -278,7 +278,11 @@ class ArbOrchestrator:
         if not token_ids:
             return []
 
-        books = await self.clob_client.get_books(token_ids)
+        books = await self.clob_client.get_books(
+            token_ids,
+            batch_size=self.config.clob_books_batch_size,
+            max_concurrency=self.config.clob_books_max_concurrency,
+        )
         by_token = {book.asset_id: book for book in books if book.asset_id}
         returned = set(by_token.keys())
         for token_id in token_ids:
