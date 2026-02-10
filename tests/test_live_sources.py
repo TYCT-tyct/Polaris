@@ -41,6 +41,9 @@ async def test_live_gamma_and_clob_endpoints() -> None:
         sample_ids = [token.token_id for token in tokens[:100]]
         books = await clob.get_books(sample_ids)
         assert books, "no active orderbooks returned for sampled tokens"
+        invalid_token = "0" * 78
+        books_with_invalid = await clob.get_books(sample_ids[:20] + [invalid_token])
+        assert books_with_invalid, "fallback returned no books when batch contains invalid token"
     finally:
         await gamma.close()
         await clob.close()

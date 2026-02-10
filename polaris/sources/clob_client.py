@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import datetime, timezone
 from typing import Any
 
@@ -10,6 +11,8 @@ from polaris.config import RetryConfig
 from polaris.infra.rate_limiter import AsyncTokenBucket
 from polaris.infra.retry import with_retry
 from polaris.sources.models import ClobBook
+
+logger = logging.getLogger(__name__)
 
 
 class ClobClient:
@@ -31,15 +34,13 @@ class ClobClient:
         await self._client.aclose()
 
     async def get_book(self, token_id: str) -> ClobBook:
-        async def _do() -> ClobBook:
-            await self._limiter.acquire()
-            response = await self._client.get("/book", params={"token_id": token_id})
-            response.raise_for_status()
-            payload = response.json()
-            payload["asset_id"] = payload.get("asset_id") or token_id
-            return ClobBook.model_validate(payload)
+        book = await self._fetch_book(token_id, allow_missing=False)
+        if book is None:
+            raise RuntimeError(f"unexpected empty orderbook response for token={token_id}")
+        return book
 
-        return await with_retry(_do, self._retry)
+    async def get_book_optional(self, token_id: str) -> ClobBook | None:
+        return await self._fetch_book(token_id, allow_missing=True)
 
     async def get_books(self, token_ids: list[str], batch_size: int = 500, max_concurrency: int = 4) -> list[ClobBook]:
         if not token_ids:
@@ -49,7 +50,16 @@ class ClobClient:
 
         async def _run(batch: list[str]) -> list[ClobBook]:
             async with semaphore:
-                return await self._get_books_batch(batch)
+                try:
+                    return await self._get_books_batch(batch)
+                except httpx.HTTPStatusError as exc:
+                    if exc.response.status_code != 404:
+                        raise
+                    logger.info(
+                        "clob /books returned 404, fallback to per-token lookup",
+                        extra={"batch_size": len(batch)},
+                    )
+                    return await self._get_books_batch_fallback(batch)
 
         results = await asyncio.gather(*[_run(batch) for batch in batches])
         books: list[ClobBook] = []
@@ -68,11 +78,36 @@ class ClobClient:
             response.raise_for_status()
             rows = response.json()
             result: list[ClobBook] = []
-            for row in rows:
-                asset_id = row.get("asset_id")
+            for idx, row in enumerate(rows):
+                asset_id = row.get("asset_id") or row.get("token_id")
+                if not asset_id and idx < len(token_ids):
+                    asset_id = token_ids[idx]
                 row["asset_id"] = asset_id or ""
                 result.append(ClobBook.model_validate(row))
             return result
+
+        return await with_retry(_do, self._retry)
+
+    async def _get_books_batch_fallback(self, token_ids: list[str], max_concurrency: int = 16) -> list[ClobBook]:
+        semaphore = asyncio.Semaphore(max(1, max_concurrency))
+
+        async def _run(token_id: str) -> ClobBook | None:
+            async with semaphore:
+                return await self.get_book_optional(token_id)
+
+        rows = await asyncio.gather(*[_run(token_id) for token_id in token_ids])
+        return [row for row in rows if row is not None]
+
+    async def _fetch_book(self, token_id: str, allow_missing: bool) -> ClobBook | None:
+        async def _do() -> ClobBook | None:
+            await self._limiter.acquire()
+            response = await self._client.get("/book", params={"token_id": token_id})
+            if allow_missing and response.status_code == 404:
+                return None
+            response.raise_for_status()
+            payload = response.json()
+            payload["asset_id"] = payload.get("asset_id") or token_id
+            return ClobBook.model_validate(payload)
 
         return await with_retry(_do, self._retry)
 
