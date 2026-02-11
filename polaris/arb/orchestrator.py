@@ -22,7 +22,7 @@ from polaris.arb.contracts import (
     TokenSnapshot,
 )
 from polaris.arb.execution.order_router import OrderRouter
-from polaris.arb.execution.risk_gate import RiskGate
+from polaris.arb.execution.risk_gate import RiskGate, RiskRuntimeState
 from polaris.arb.execution.sizer import capped_notional
 from polaris.arb.strategies.strategy_a import StrategyA
 from polaris.arb.strategies.strategy_b import StrategyB
@@ -93,11 +93,11 @@ class ArbOrchestrator:
         process_started = perf_counter()
         executed = 0
         snapshot_map = {item.token_id: item for item in snapshots}
-        risk_state = await self.risk_gate.load_state(mode, source_code)
-        cash_balance = await self._load_latest_cash_balance(mode, source_code)
+        risk_states: dict[str, RiskRuntimeState] = {}
+        cash_balances: dict[str, float] = {}
         rejected: list[tuple[ArbSignal, SignalStatus, str | None]] = []
         expired: list[tuple[ArbSignal, SignalStatus, str | None]] = []
-        approved: list[tuple[ArbSignal, float, ExecutionPlan]] = []
+        approved: list[tuple[ArbSignal, float, ExecutionPlan, str]] = []
         for signal in ordered:
             if signal.is_expired():
                 expired.append((signal, SignalStatus.EXPIRED, None))
@@ -108,6 +108,21 @@ class ArbOrchestrator:
                     rejected.append((signal, SignalStatus.REJECTED, f"ai_reject:{ai_decision.reason}"))
                     continue
 
+            scope_key = self._state_scope_key(signal)
+            risk_state = risk_states.get(scope_key)
+            if risk_state is None:
+                risk_state = await self.risk_gate.load_state(
+                    signal.mode,
+                    signal.source_code,
+                    strategy_code=signal.strategy_code if self._paper_strategy_split(signal.mode) else None,
+                )
+                risk_states[scope_key] = risk_state
+                cash_balances[scope_key] = await self._load_latest_cash_balance(
+                    signal.mode,
+                    signal.source_code,
+                    signal.strategy_code if self._paper_strategy_split(signal.mode) else None,
+                )
+
             notional = _estimate_capital(signal)
             decision = await self.risk_gate.assess(signal, notional, state=risk_state)
             if not decision.allowed:
@@ -116,7 +131,7 @@ class ArbOrchestrator:
                 continue
 
             self.risk_gate.reserve_exposure(risk_state, notional)
-            approved.append((signal, notional, self._build_plan(signal)))
+            approved.append((signal, notional, self._build_plan(signal), scope_key))
 
         if expired:
             await self._record_signals(expired)
@@ -127,7 +142,7 @@ class ArbOrchestrator:
         cash_rows: list[tuple[str, str, str, str, float, float, float, str, str]] = []
         lot_rows: list[tuple[str, str, str, str, str, str, float, float, float, float, float]] = []
         if approved:
-            await self._record_signals([(signal, SignalStatus.NEW, None) for signal, _, _ in approved])
+            await self._record_signals([(signal, SignalStatus.NEW, None) for signal, _, _, _ in approved])
             concurrency = max(1, self.config.execution_concurrency)
             semaphore = asyncio.Semaphore(concurrency)
 
@@ -135,9 +150,10 @@ class ArbOrchestrator:
                 async with semaphore:
                     return await self.order_router.execute(plan, snapshot_map)
 
-            tasks = [asyncio.create_task(_execute_plan(plan)) for _, _, plan in approved]
+            tasks = [asyncio.create_task(_execute_plan(plan)) for _, _, plan, _ in approved]
             results = await asyncio.gather(*tasks, return_exceptions=True)
-            for (signal, notional, _plan), result in zip(approved, results, strict=False):
+            for (signal, notional, _plan, scope_key), result in zip(approved, results, strict=False):
+                risk_state = risk_states[scope_key]
                 if isinstance(result, Exception):
                     logger.exception("signal execution failed", extra={"signal_id": str(signal.signal_id)})
                     self.risk_gate.settle_execution(
@@ -161,9 +177,9 @@ class ArbOrchestrator:
                     continue
 
                 executed += 1
-                before = cash_balance
+                before = cash_balances[scope_key]
                 after = before + result.net_pnl_usd
-                cash_balance = after
+                cash_balances[scope_key] = after
                 cash_rows.append(
                     (
                         signal.mode.value,
@@ -553,18 +569,47 @@ class ArbOrchestrator:
             rows,
         )
 
-    async def _load_latest_cash_balance(self, mode: RunMode, source_code: str) -> float:
-        row = await self.db.fetch_one(
-            """
-            select balance_after_usd
-            from arb_cash_ledger
-            where mode = %s and source_code = %s
-            order by created_at desc
-            limit 1
-            """,
-            (mode.value, source_code),
-        )
-        return float(row["balance_after_usd"]) if row else 0.0
+    def _paper_strategy_split(self, mode: RunMode) -> bool:
+        return mode in {RunMode.PAPER_LIVE, RunMode.PAPER_REPLAY} and self.config.paper_split_by_strategy
+
+    def _state_scope_key(self, signal: ArbSignal) -> str:
+        if self._paper_strategy_split(signal.mode):
+            return f"{signal.mode.value}:{signal.source_code}:{signal.strategy_code.value}"
+        return f"{signal.mode.value}:{signal.source_code}:shared"
+
+    async def _load_latest_cash_balance(
+        self,
+        mode: RunMode,
+        source_code: str,
+        strategy_code: StrategyCode | None = None,
+    ) -> float:
+        if strategy_code is None:
+            row = await self.db.fetch_one(
+                """
+                select balance_after_usd
+                from arb_cash_ledger
+                where mode = %s and source_code = %s
+                order by created_at desc
+                limit 1
+                """,
+                (mode.value, source_code),
+            )
+        else:
+            row = await self.db.fetch_one(
+                """
+                select balance_after_usd
+                from arb_cash_ledger
+                where mode = %s and source_code = %s and strategy_code = %s
+                order by created_at desc
+                limit 1
+                """,
+                (mode.value, source_code, strategy_code.value),
+            )
+        if row:
+            return float(row["balance_after_usd"])
+        if mode in {RunMode.PAPER_LIVE, RunMode.PAPER_REPLAY}:
+            return float(self.config.paper_initial_bankroll_usd)
+        return 0.0
 
     async def _record_cash_ledger(self, result, balance_before: float) -> float:
         signal = result.signal

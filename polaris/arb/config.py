@@ -31,6 +31,9 @@ class ArbConfig:
     unwind_fill_threshold: float
     slippage_bps: int
     live_order_type: str
+    paper_initial_bankroll_usd: float
+    paper_split_by_strategy: bool
+    paper_enforce_bankroll: bool
 
     enable_strategy_a: bool
     enable_strategy_b: bool
@@ -84,6 +87,9 @@ def arb_config_from_settings(settings: PolarisSettings) -> ArbConfig:
         unwind_fill_threshold=settings.arb_unwind_fill_threshold,
         slippage_bps=settings.arb_slippage_bps,
         live_order_type=settings.arb_live_order_type.strip().upper(),
+        paper_initial_bankroll_usd=settings.arb_paper_initial_bankroll_usd,
+        paper_split_by_strategy=settings.arb_paper_split_by_strategy,
+        paper_enforce_bankroll=settings.arb_paper_enforce_bankroll,
         enable_strategy_a=settings.arb_enable_strategy_a,
         enable_strategy_b=settings.arb_enable_strategy_b,
         enable_strategy_c=settings.arb_enable_strategy_c,

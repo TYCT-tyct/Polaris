@@ -9,11 +9,23 @@
 
 ## 2. 启动方式
 - 影子模式：
-  `python -m polaris.cli arb-run --mode shadow`
+  `python -m polaris.cli arb-run --mode shadow --source polymarket_shadow`
 - 实时 paper：
-  `python -m polaris.cli arb-run --mode paper_live`
+  `python -m polaris.cli arb-run --mode paper_live --source polymarket_shared10 --paper-capital-scope shared`
 - 实盘：
-  `python -m polaris.cli arb-run --mode live`
+  `python -m polaris.cli arb-run --mode live --source polymarket_live`
+
+独立资金池（每个策略独立 10 美元）：
+`python -m polaris.cli arb-run --mode paper_live --source polymarket_isolated10 --paper-capital-scope strategy`
+
+共享资金池（所有策略共享 10 美元）：
+`python -m polaris.cli arb-run --mode paper_live --source polymarket_shared10 --paper-capital-scope shared`
+
+一键同时启动“独立+共享”两套后台 paper：
+`python -m polaris.cli arb-paper-matrix-start --duration-hours 8 --bankroll-usd 10 --source-prefix polymarket`
+
+停止一键启动的两套后台 paper：
+`python -m polaris.cli arb-paper-matrix-stop`
 
 ## 3. 回放验证
 默认高速回放（推荐）：
@@ -29,9 +41,10 @@
 - 聚合报表：
   `python -m polaris.cli arb-report --group-by strategy,mode,source`
 - 隔夜策略总结（推荐早晨查看）：
-  `python -m polaris.cli arb-summary --since-hours 12 --mode paper_live --source polymarket`
+  `python -m polaris.cli arb-summary --since-hours 12 --mode paper_live --source polymarket_shared10`
 - 导出隔夜总结到文件：
-  `python -m polaris.cli arb-summary --since-hours 12 --mode paper_live --source polymarket --output exports/overnight_summary.json`
+  `python -m polaris.cli arb-summary --since-hours 12 --mode paper_live --source polymarket_shared10 --output exports/overnight_summary_shared.json`
+  `python -m polaris.cli arb-summary --since-hours 12 --mode paper_live --source polymarket_isolated10 --output exports/overnight_summary_isolated.json`
 - 导出：
   `python -m polaris.cli arb-export --table arb_trade_result --format csv --since-hours 24`
 - 基准压测（延迟 p50/p95）：

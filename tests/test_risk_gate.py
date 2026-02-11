@@ -86,3 +86,43 @@ async def test_risk_gate_uses_in_memory_state_after_reserve(db) -> None:
     decision = await gate.assess(_signal(), 0.6, state=state)
     assert not decision.allowed
     assert decision.reason == "max_exposure_exceeded"
+
+
+@pytest.mark.asyncio
+async def test_risk_gate_blocks_when_capital_exceeds_bankroll(db) -> None:
+    settings = PolarisSettings(
+        database_url="postgresql://postgres:postgres@localhost:55432/polaris",
+        arb_paper_initial_bankroll_usd=10.0,
+        arb_single_risk_usd=20.0,
+        arb_paper_enforce_bankroll=True,
+    )
+    gate = RiskGate(db, arb_config_from_settings(settings))
+    state = await gate.load_state(RunMode.PAPER_LIVE, "paper-bankroll")
+    decision = await gate.assess(_signal(), 10.5, state=state)
+    assert not decision.allowed
+    assert decision.reason == "insufficient_bankroll"
+
+
+@pytest.mark.asyncio
+async def test_risk_gate_strategy_scope_uses_strategy_balance(db) -> None:
+    settings = PolarisSettings(
+        database_url="postgresql://postgres:postgres@localhost:55432/polaris",
+        arb_paper_initial_bankroll_usd=10.0,
+    )
+    gate = RiskGate(db, arb_config_from_settings(settings))
+    await db.execute(
+        """
+        insert into arb_cash_ledger(
+            mode, strategy_code, source_code, entry_type, amount_usd,
+            balance_before_usd, balance_after_usd, ref_signal_id, payload, created_at
+        ) values
+        ('paper_live', 'A', 'scope-test', 'seed', 0, 10, 7, null, '{}'::jsonb, now()),
+        ('paper_live', 'G', 'scope-test', 'seed', 0, 10, 9, null, '{}'::jsonb, now() + interval '1 second')
+        """
+    )
+    a_state = await gate.load_state(RunMode.PAPER_LIVE, "scope-test", strategy_code=StrategyCode.A)
+    g_state = await gate.load_state(RunMode.PAPER_LIVE, "scope-test", strategy_code=StrategyCode.G)
+    shared_state = await gate.load_state(RunMode.PAPER_LIVE, "scope-test")
+    assert a_state.cash_balance_usd == pytest.approx(7.0)
+    assert g_state.cash_balance_usd == pytest.approx(9.0)
+    assert shared_state.cash_balance_usd == pytest.approx(9.0)

@@ -5,6 +5,7 @@ import json
 import signal
 import subprocess
 import sys
+import os
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -457,28 +458,133 @@ def backup(
 @app.command("arb-run")
 def arb_run(
     mode: Annotated[str, typer.Option("--mode", help="shadow|paper_live|live")] = "paper_live",
+    source: Annotated[str, typer.Option("--source", help="Portfolio source tag")] = "polymarket",
+    paper_capital_scope: Annotated[
+        str,
+        typer.Option("--paper-capital-scope", help="shared|strategy (paper mode only)"),
+    ] = "shared",
     once: Annotated[bool, typer.Option("--once/--loop", help="Run one scan cycle or keep running")] = False,
 ) -> None:
     """Run Module2 arbitrage engine."""
     refresh_process_env_from_file()
     load_settings.cache_clear()
     settings = load_settings()
+    scope = paper_capital_scope.strip().lower()
+    if scope not in {"shared", "strategy"}:
+        raise typer.BadParameter("paper-capital-scope must be shared or strategy")
+    settings = settings.model_copy(update={"arb_paper_split_by_strategy": scope == "strategy"})
     setup_logging(settings.log_level)
     _ensure_windows_selector_loop()
     run_mode = parse_run_mode(mode)
+    source_code = source.strip().lower() or "polymarket"
 
     async def _run() -> None:
         ctx = await create_arb_runtime(settings)
         try:
             if once:
-                stats = await ctx.orchestrator.run_once(run_mode)
+                stats = await ctx.orchestrator.run_once(run_mode, source_code=source_code)
                 typer.echo(f"arb-run once completed: {stats}")
             else:
-                await ctx.orchestrator.run_forever(run_mode)
+                await ctx.orchestrator.run_forever(run_mode, source_code=source_code)
         finally:
             await close_arb_runtime(ctx)
 
     asyncio.run(_run())
+
+
+@app.command("arb-paper-matrix-start")
+def arb_paper_matrix_start(
+    duration_hours: Annotated[int, typer.Option("--duration-hours", min=1, max=72)] = 8,
+    source_prefix: Annotated[str, typer.Option("--source-prefix")] = "polymarket",
+    bankroll_usd: Annotated[float, typer.Option("--bankroll-usd", min=1.0)] = 10.0,
+    include_c: Annotated[bool, typer.Option("--include-c/--no-include-c")] = True,
+) -> None:
+    """Start two background paper runs:
+    1) shared capital pool (all strategies share one bankroll)
+    2) isolated capital pool (each strategy has its own bankroll)
+    """
+    refresh_process_env_from_file()
+    load_settings.cache_clear()
+    settings = load_settings()
+    setup_logging(settings.log_level)
+
+    strategies = ["A", "B", "F", "G"] + (["C"] if include_c else [])
+    timestamp = datetime.now(tz=UTC).strftime("%Y%m%d_%H%M%S")
+    logs_dir = Path("logs")
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    run_dir = Path("run")
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    def _spawn(scope: str) -> tuple[int, Path, str]:
+        source = f"{source_prefix}_{scope}10".lower()
+        log_path = logs_dir / f"arb_paper_{scope}_{timestamp}.log"
+        env = os.environ.copy()
+        env["POLARIS_ARB_PAPER_INITIAL_BANKROLL_USD"] = f"{bankroll_usd:.4f}"
+        env["POLARIS_ARB_PAPER_SPLIT_BY_STRATEGY"] = "true" if scope == "isolated" else "false"
+        env["POLARIS_ARB_ENABLE_STRATEGY_A"] = "true" if "A" in strategies else "false"
+        env["POLARIS_ARB_ENABLE_STRATEGY_B"] = "true" if "B" in strategies else "false"
+        env["POLARIS_ARB_ENABLE_STRATEGY_C"] = "true" if "C" in strategies else "false"
+        env["POLARIS_ARB_ENABLE_STRATEGY_F"] = "true" if "F" in strategies else "false"
+        env["POLARIS_ARB_ENABLE_STRATEGY_G"] = "true" if "G" in strategies else "false"
+
+        cmd: list[str] = [
+            sys.executable,
+            "-m",
+            "polaris.cli",
+            "arb-run",
+            "--mode",
+            "paper_live",
+            "--source",
+            source,
+            "--paper-capital-scope",
+            "strategy" if scope == "isolated" else "shared",
+        ]
+        if not sys.platform.startswith("win"):
+            cmd = ["timeout", f"{duration_hours}h"] + cmd
+
+        log_handle = log_path.open("a", encoding="utf-8")
+        proc = subprocess.Popen(
+            cmd,
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+            env=env,
+            cwd=str(Path.cwd()),
+            start_new_session=True,
+        )
+        log_handle.close()
+        (run_dir / f"arb_paper_{scope}.pid").write_text(str(proc.pid), encoding="utf-8")
+        return proc.pid, log_path, source
+
+    shared_pid, shared_log, shared_source = _spawn("shared")
+    isolated_pid, isolated_log, isolated_source = _spawn("isolated")
+
+    typer.echo("arb-paper-matrix started")
+    typer.echo(f"shared:   pid={shared_pid} source={shared_source} log={shared_log}")
+    typer.echo(f"isolated: pid={isolated_pid} source={isolated_source} log={isolated_log}")
+
+
+@app.command("arb-paper-matrix-stop")
+def arb_paper_matrix_stop() -> None:
+    """Stop background matrix paper runs if pid files exist."""
+    run_dir = Path("run")
+    stopped = 0
+    for scope in ("shared", "isolated"):
+        pid_file = run_dir / f"arb_paper_{scope}.pid"
+        if not pid_file.exists():
+            continue
+        try:
+            pid = int(pid_file.read_text(encoding="utf-8").strip())
+        except Exception:
+            pid_file.unlink(missing_ok=True)
+            continue
+        with suppress(ProcessLookupError):
+            if sys.platform.startswith("win"):
+                subprocess.run(["taskkill", "/PID", str(pid), "/F"], check=False, capture_output=True, text=True)
+            else:
+                os.kill(pid, signal.SIGTERM)
+            stopped += 1
+        pid_file.unlink(missing_ok=True)
+    typer.echo(f"arb-paper-matrix stopped processes={stopped}")
 
 
 @app.command("arb-replay")
