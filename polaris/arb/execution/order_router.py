@@ -11,7 +11,7 @@ from typing import Any
 from polaris.arb.config import ArbConfig
 from polaris.arb.contracts import ExecutionPlan, FillEvent, RunMode, TokenSnapshot, TradeResult
 from polaris.arb.execution.fill_simulator import simulate_buy_fill, simulate_sell_fill
-from polaris.arb.execution.rust_bridge import simulate_paper_with_rust
+from polaris.arb.execution.rust_bridge import RustBridgeClient
 from polaris.db.pool import Database
 from polaris.sources.clob_client import ClobClient
 
@@ -23,6 +23,18 @@ class OrderRouter:
         self.config = config
         self.clob_client = clob_client
         self._live_client: Any = None
+        self._rust_bridge: RustBridgeClient | None = None
+        if self.config.rust_bridge_enabled:
+            mode = self.config.rust_bridge_mode if self.config.rust_bridge_mode in {"daemon", "subprocess"} else "daemon"
+            self._rust_bridge = RustBridgeClient(
+                binary=self.config.rust_bridge_bin,
+                timeout_sec=self.config.rust_bridge_timeout_sec,
+                mode=mode,
+            )
+
+    async def close(self) -> None:
+        if self._rust_bridge is not None:
+            await self._rust_bridge.close()
 
     async def execute(self, plan: ExecutionPlan, snapshots: dict[str, TokenSnapshot]) -> TradeResult:
         signal = plan.signal
@@ -52,12 +64,10 @@ class OrderRouter:
         fill_rows: list[tuple[str, str, str, str, float, float, float, float]] = []
 
         rust_result = None
-        if self.config.rust_bridge_enabled:
-            rust_result = await simulate_paper_with_rust(
+        if self._rust_bridge is not None:
+            rust_result = await self._rust_bridge.simulate(
                 plan,
                 snapshots,
-                binary=self.config.rust_bridge_bin,
-                timeout_sec=self.config.rust_bridge_timeout_sec,
                 slippage_bps=self.config.slippage_bps,
             )
         if rust_result is not None:

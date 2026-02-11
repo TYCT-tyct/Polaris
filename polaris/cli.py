@@ -153,6 +153,7 @@ async def close_runtime(ctx: RuntimeContext) -> None:
 
 
 async def close_arb_runtime(ctx: ArbRuntimeContext) -> None:
+    await ctx.orchestrator.close()
     await ctx.clob.close()
     await ctx.db.close()
 

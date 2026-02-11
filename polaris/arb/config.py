@@ -21,6 +21,7 @@ class ArbConfig:
     live_preflight_max_age_ms: int
     live_preflight_force_refresh: bool
     rust_bridge_enabled: bool
+    rust_bridge_mode: str
     rust_bridge_bin: str
     rust_bridge_timeout_sec: int
     signal_dedupe_ttl_sec: int
@@ -93,6 +94,7 @@ def arb_config_from_settings(settings: PolarisSettings) -> ArbConfig:
         live_preflight_max_age_ms=settings.arb_live_preflight_max_age_ms,
         live_preflight_force_refresh=settings.arb_live_preflight_force_refresh,
         rust_bridge_enabled=settings.arb_rust_bridge_enabled,
+        rust_bridge_mode=settings.arb_rust_bridge_mode.strip().lower(),
         rust_bridge_bin=settings.arb_rust_bridge_bin,
         rust_bridge_timeout_sec=settings.arb_rust_bridge_timeout_sec,
         signal_dedupe_ttl_sec=settings.arb_signal_dedupe_ttl_sec,

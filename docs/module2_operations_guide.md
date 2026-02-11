@@ -34,9 +34,20 @@
    `cd rust/polaris_book_sim && cargo build --release`
 2. 配置 `.env`：
    `POLARIS_ARB_RUST_BRIDGE_ENABLED=true`
+   `POLARIS_ARB_RUST_BRIDGE_MODE=daemon`
    `POLARIS_ARB_RUST_BRIDGE_BIN=/home/ubuntu/polaris/rust/polaris_book_sim/target/release/polaris-book-sim`
    `POLARIS_ARB_RUST_BRIDGE_TIMEOUT_SEC=5`
 3. 重启 `arb-run` 进程并观察日志是否出现 rust bridge 启动记录。
+
+### Python / Rust 切换
+- 纯 Python 路径（默认，最稳）：
+  `POLARIS_ARB_RUST_BRIDGE_ENABLED=false`
+- Rust 常驻服务路径（推荐）：
+  `POLARIS_ARB_RUST_BRIDGE_ENABLED=true`
+  `POLARIS_ARB_RUST_BRIDGE_MODE=daemon`
+- Rust 单次子进程路径（仅兼容调试，不推荐）：
+  `POLARIS_ARB_RUST_BRIDGE_ENABLED=true`
+  `POLARIS_ARB_RUST_BRIDGE_MODE=subprocess`
 
 ## 3. 回放验证
 默认高速回放（推荐）：

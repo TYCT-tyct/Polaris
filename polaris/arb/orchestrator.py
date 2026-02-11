@@ -271,6 +271,9 @@ class ArbOrchestrator:
             sleep_sec = max(1.0, self.config.scan_interval_sec - elapsed)
             await _sleep(sleep_sec)
 
+    async def close(self) -> None:
+        await self.order_router.close()
+
     async def run_replay(
         self,
         window_start: datetime,

@@ -93,6 +93,7 @@ class PolarisSettings(BaseSettings):
     arb_live_preflight_max_age_ms: int = Field(default=2000)
     arb_live_preflight_force_refresh: bool = Field(default=False)
     arb_rust_bridge_enabled: bool = Field(default=False)
+    arb_rust_bridge_mode: str = Field(default="daemon")
     arb_rust_bridge_bin: str = Field(default="polaris-book-sim")
     arb_rust_bridge_timeout_sec: int = Field(default=5)
     arb_signal_dedupe_ttl_sec: int = Field(default=30)

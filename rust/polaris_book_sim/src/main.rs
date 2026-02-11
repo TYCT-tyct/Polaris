@@ -1,13 +1,19 @@
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::HashMap;
-use std::io::{self, Read};
+use std::io::{self, BufRead, BufWriter, Read, Write};
 
 #[derive(Debug, Deserialize)]
 struct InputPayload {
     slippage_bps: u32,
     intents: Vec<IntentIn>,
     snapshots: HashMap<String, SnapshotIn>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RequestEnvelope {
+    id: String,
+    payload: InputPayload,
 }
 
 #[derive(Debug, Deserialize)]
@@ -66,6 +72,14 @@ struct EventOut {
     payload: serde_json::Value,
 }
 
+#[derive(Debug, Serialize)]
+struct ResponseEnvelope {
+    id: String,
+    ok: bool,
+    result: Option<OutputPayload>,
+    error: Option<String>,
+}
+
 #[derive(Debug)]
 struct SimFill {
     avg_price: f64,
@@ -76,11 +90,17 @@ struct SimFill {
 fn main() {
     let mut args = std::env::args().skip(1);
     let command = args.next().unwrap_or_default();
-    if command != "simulate-paper" {
-        eprintln!("unsupported command: {}", command);
-        std::process::exit(2);
+    match command.as_str() {
+        "simulate-paper" => run_once(),
+        "daemon" => run_daemon(),
+        _ => {
+            eprintln!("unsupported command: {}", command);
+            std::process::exit(2);
+        }
     }
+}
 
+fn run_once() {
     let mut raw = String::new();
     if io::stdin().read_to_string(&mut raw).is_err() {
         eprintln!("failed to read stdin");
@@ -102,6 +122,65 @@ fn main() {
             std::process::exit(2);
         }
     }
+}
+
+fn run_daemon() {
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    let mut writer = BufWriter::new(stdout.lock());
+
+    for raw in stdin.lock().lines() {
+        let line = match raw {
+            Ok(v) => v,
+            Err(err) => {
+                eprintln!("failed to read request line: {}", err);
+                break;
+            }
+        };
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let req: RequestEnvelope = match serde_json::from_str(trimmed) {
+            Ok(v) => v,
+            Err(err) => {
+                let _ = write_response(
+                    &mut writer,
+                    ResponseEnvelope {
+                        id: "unknown".to_string(),
+                        ok: false,
+                        result: None,
+                        error: Some(format!("invalid_request: {}", err)),
+                    },
+                );
+                continue;
+            }
+        };
+
+        let output = simulate(req.payload);
+        if write_response(
+            &mut writer,
+            ResponseEnvelope {
+                id: req.id,
+                ok: true,
+                result: Some(output),
+                error: None,
+            },
+        )
+        .is_err()
+        {
+            break;
+        }
+    }
+}
+
+fn write_response(writer: &mut BufWriter<io::StdoutLock<'_>>, envelope: ResponseEnvelope) -> io::Result<()> {
+    let text = serde_json::to_string(&envelope)
+        .unwrap_or_else(|_| "{\"id\":\"unknown\",\"ok\":false,\"result\":null,\"error\":\"encode_failed\"}".to_string());
+    writer.write_all(text.as_bytes())?;
+    writer.write_all(b"\n")?;
+    writer.flush()
 }
 
 fn simulate(payload: InputPayload) -> OutputPayload {
@@ -271,7 +350,7 @@ fn normalize_order(price: f64, shares: f64, side: &str, snap: &SnapshotIn) -> Op
         return None;
     }
     let min_size = snap.min_order_size.unwrap_or(0.0).max(0.0);
-    let mut normalized_shares = shares.max(min_size);
+    let normalized_shares = shares.max(min_size);
     if normalized_shares <= 0.0 {
         return None;
     }
@@ -279,11 +358,7 @@ fn normalize_order(price: f64, shares: f64, side: &str, snap: &SnapshotIn) -> Op
     if let Some(tick) = snap.tick_size {
         if tick > 0.0 {
             let ratio = price / tick;
-            let steps = if side == "BUY" {
-                ratio.ceil()
-            } else {
-                ratio.floor()
-            };
+            let steps = if side == "BUY" { ratio.ceil() } else { ratio.floor() };
             normalized_price = (steps * tick).max(tick);
         }
     }
