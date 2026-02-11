@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, time
 from decimal import Decimal
 from pathlib import Path
+from uuid import UUID
 from typing import Any, Literal
 
 from polaris.db.pool import Database
@@ -181,6 +182,8 @@ def _to_csv_cell(value: Any) -> str:
 def _to_jsonable(value: Any) -> Any:
     if value is None:
         return None
+    if isinstance(value, UUID):
+        return str(value)
     if isinstance(value, (datetime, date, time)):
         return value.isoformat()
     if isinstance(value, Decimal):
