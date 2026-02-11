@@ -717,6 +717,87 @@ def arb_summary(
     asyncio.run(_run())
 
 
+@app.command("arb-go-live-check")
+def arb_go_live_check(
+    since_hours: Annotated[int, typer.Option("--since-hours", min=1, max=24 * 30)] = 24,
+    source_code: Annotated[str, typer.Option("--source", help="source code, or all")] = "all",
+    min_trades: Annotated[int, typer.Option("--min-trades", min=1)] = 20,
+    min_net_pnl_usd: Annotated[float, typer.Option("--min-net-pnl-usd")] = 0.0,
+    min_win_rate: Annotated[float, typer.Option("--min-win-rate", min=0.0, max=1.0)] = 0.45,
+    max_negative_strategies: Annotated[int, typer.Option("--max-negative-strategies", min=0)] = 0,
+    strategy_min_trades: Annotated[int, typer.Option("--strategy-min-trades", min=1)] = 8,
+) -> None:
+    """Evaluate whether paper results are healthy enough before live funds."""
+    refresh_process_env_from_file()
+    load_settings.cache_clear()
+    settings = load_settings()
+    setup_logging(settings.log_level)
+    _ensure_windows_selector_loop()
+
+    source_normalized = source_code.strip().lower()
+    source_filter = None if source_normalized == "all" else source_normalized
+
+    async def _run() -> int:
+        ctx = await create_arb_runtime(settings)
+        try:
+            summary = await ctx.reporter.summary(
+                since_hours=since_hours,
+                mode="paper_live",
+                source_code=source_filter,
+            )
+        finally:
+            await close_arb_runtime(ctx)
+
+        totals = summary.get("totals", {}) or {}
+        by_strategy = summary.get("by_strategy", []) or []
+        reasons: list[str] = []
+
+        trades = int(totals.get("trades", 0) or 0)
+        net_pnl = float(totals.get("net_pnl_usd", 0.0) or 0.0)
+        win_rate = float(totals.get("win_rate", 0.0) or 0.0)
+
+        if trades < min_trades:
+            reasons.append(f"trades<{min_trades} (actual={trades})")
+        if net_pnl < min_net_pnl_usd:
+            reasons.append(f"net_pnl_usd<{min_net_pnl_usd} (actual={net_pnl:.6f})")
+        if win_rate < min_win_rate:
+            reasons.append(f"win_rate<{min_win_rate:.3f} (actual={win_rate:.3f})")
+
+        negative_strategies: list[str] = []
+        for row in by_strategy:
+            s_code = str(row.get("strategy_code", ""))
+            s_trades = int(row.get("trades", 0) or 0)
+            s_net = float(row.get("net_pnl_usd", 0.0) or 0.0)
+            if s_trades >= strategy_min_trades and s_net < 0:
+                negative_strategies.append(f"{s_code}:{s_net:.6f}")
+        if len(negative_strategies) > max_negative_strategies:
+            reasons.append(
+                f"negative_strategies>{max_negative_strategies} "
+                f"(actual={len(negative_strategies)}; {', '.join(negative_strategies)})"
+            )
+
+        result = {
+            "passed": len(reasons) == 0,
+            "window_hours": since_hours,
+            "source": source_filter or "all",
+            "thresholds": {
+                "min_trades": min_trades,
+                "min_net_pnl_usd": min_net_pnl_usd,
+                "min_win_rate": min_win_rate,
+                "max_negative_strategies": max_negative_strategies,
+                "strategy_min_trades": strategy_min_trades,
+            },
+            "totals": totals,
+            "negative_strategies": negative_strategies,
+            "reasons": reasons,
+        }
+        typer.echo(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+        return 0 if result["passed"] else 2
+
+    code = asyncio.run(_run())
+    raise typer.Exit(code=code)
+
+
 @app.command("arb-export")
 def arb_export(
     table: Annotated[str, typer.Option("--table", help="arb table or view name")] = "arb_trade_result",
