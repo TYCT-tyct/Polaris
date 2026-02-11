@@ -38,12 +38,14 @@ class RiskGate:
             f"""
             select
                 coalesce((
-                    select sum(open_notional_usd)
-                    from arb_position_lot
+                    select sum(capital_used_usd)
+                    from arb_trade_result
                     where mode = %s
                       and source_code = %s
                       { "and strategy_code = %s" if strategy_filter else "" }
-                      and status = 'open'
+                      and status in ('filled', 'submitted')
+                      and coalesce(hold_minutes, 0) > 1
+                      and created_at + (coalesce(hold_minutes, 0)::text || ' minutes')::interval > now()
                 ), 0) as exposure,
                 coalesce((
                     select sum(net_pnl_usd)
@@ -67,7 +69,10 @@ class RiskGate:
         )
         exposure = float(row["exposure"]) if row else 0.0
         day_pnl = float(row["day_pnl"]) if row else 0.0
-        cash_balance = _resolve_cash_balance(mode, row["cash_balance"] if row else None, self.config.paper_initial_bankroll_usd)
+        base_cash_balance = _resolve_cash_balance(mode, row["cash_balance"] if row else None, self.config.paper_initial_bankroll_usd)
+        cash_balance = base_cash_balance
+        if self.config.paper_enforce_bankroll and mode in {RunMode.PAPER_LIVE, RunMode.PAPER_REPLAY}:
+            cash_balance = max(0.0, base_cash_balance - exposure)
         return RiskRuntimeState(
             mode=mode,
             source_code=source_code,
@@ -168,11 +173,13 @@ class RiskGate:
     async def current_exposure_usd(self, mode: RunMode, source_code: str) -> float:
         row = await self.db.fetch_one(
             """
-            select coalesce(sum(open_notional_usd), 0) as exposure
-            from arb_position_lot
+            select coalesce(sum(capital_used_usd), 0) as exposure
+            from arb_trade_result
             where mode = %s
               and source_code = %s
-              and status = 'open'
+              and status in ('filled', 'submitted')
+              and coalesce(hold_minutes, 0) > 1
+              and created_at + (coalesce(hold_minutes, 0)::text || ' minutes')::interval > now()
             """,
             (mode.value, source_code),
         )
@@ -189,10 +196,12 @@ class RiskGate:
         success: bool,
         capital_required_usd: float,
         realized_pnl_usd: float = 0.0,
+        release_exposure: bool = True,
     ) -> None:
-        state.exposure_usd = max(0.0, state.exposure_usd - max(0.0, capital_required_usd))
-        if self.config.paper_enforce_bankroll and state.mode in {RunMode.PAPER_LIVE, RunMode.PAPER_REPLAY}:
-            state.cash_balance_usd += max(0.0, capital_required_usd)
+        if release_exposure:
+            state.exposure_usd = max(0.0, state.exposure_usd - max(0.0, capital_required_usd))
+            if self.config.paper_enforce_bankroll and state.mode in {RunMode.PAPER_LIVE, RunMode.PAPER_REPLAY}:
+                state.cash_balance_usd += max(0.0, capital_required_usd)
         if success:
             state.day_pnl_usd += realized_pnl_usd
             if self.config.paper_enforce_bankroll and state.mode in {RunMode.PAPER_LIVE, RunMode.PAPER_REPLAY}:

@@ -172,16 +172,20 @@ class ArbOrchestrator:
                         success=False,
                         capital_required_usd=notional,
                         realized_pnl_usd=0.0,
+                        release_exposure=True,
                     )
                     status_updates.append((SignalStatus.REJECTED.value, str(signal.signal_id)))
                     continue
 
                 success = result.status == "filled"
+                hold_minutes = float(result.hold_minutes or 0.0)
+                should_release_exposure = (not success) or hold_minutes <= 1.0
                 self.risk_gate.settle_execution(
                     state=risk_state,
                     success=success,
                     capital_required_usd=notional,
                     realized_pnl_usd=result.net_pnl_usd if success else 0.0,
+                    release_exposure=should_release_exposure,
                 )
                 if not success:
                     status_updates.append((SignalStatus.REJECTED.value, str(signal.signal_id)))
