@@ -10,13 +10,31 @@ from polaris.sources.models import TokenDescriptor
 
 
 class MarketCollector:
-    def __init__(self, db: Database, gamma_client: GammaClient, market_scope: str = "all") -> None:
+    def __init__(
+        self,
+        db: Database,
+        gamma_client: GammaClient,
+        market_scope: str = "all",
+        market_state: str = "open",
+        gamma_page_size: int = 500,
+        gamma_max_pages: int = 0,
+    ) -> None:
         self.db = db
         self.gamma_client = gamma_client
         self.market_scope = market_scope
+        self.market_state = market_state
+        self.gamma_page_size = max(1, gamma_page_size)
+        self.gamma_max_pages = gamma_max_pages
 
     async def run_once(self) -> tuple[int, int]:
-        raw_markets = await discover_target_markets(self.gamma_client, scope=self.market_scope)
+        max_pages = self.gamma_max_pages if self.gamma_max_pages > 0 else None
+        raw_markets = await discover_target_markets(
+            self.gamma_client,
+            scope=self.market_scope,
+            state=self.market_state,
+            page_size=self.gamma_page_size,
+            max_pages=max_pages,
+        )
         markets = [self.gamma_client.market_record(row) for row in raw_markets]
         events = []
         for row in raw_markets:

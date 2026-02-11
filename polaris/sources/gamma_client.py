@@ -39,9 +39,12 @@ class GammaClient:
         }
         return await self._get_json("/markets", params=params)
 
-    async def iter_markets(self, page_size: int = 500, max_pages: int = 20) -> list[dict[str, Any]]:
+    async def iter_markets(self, page_size: int = 500, max_pages: int | None = None) -> list[dict[str, Any]]:
         all_rows: list[dict[str, Any]] = []
-        for page in range(max_pages):
+        page = 0
+        while True:
+            if max_pages is not None and max_pages > 0 and page >= max_pages:
+                break
             offset = page * page_size
             rows = await self.fetch_markets_page(page_size, offset)
             if not rows:
@@ -49,6 +52,7 @@ class GammaClient:
             all_rows.extend(rows)
             if len(rows) < page_size:
                 break
+            page += 1
         return all_rows
 
     @staticmethod

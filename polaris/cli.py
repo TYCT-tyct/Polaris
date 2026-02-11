@@ -94,7 +94,14 @@ async def create_runtime(settings: PolarisSettings) -> RuntimeContext:
         limiter=AsyncTokenBucket(settings.clob_rate, settings.clob_burst),
         retry=settings.retry,
     )
-    market_collector = MarketCollector(db, gamma, market_scope=settings.market_discovery_scope)
+    market_collector = MarketCollector(
+        db,
+        gamma,
+        market_scope=settings.market_discovery_scope,
+        market_state=settings.market_discovery_state,
+        gamma_page_size=settings.gamma_page_size,
+        gamma_max_pages=settings.gamma_max_pages,
+    )
     tweet_collector = TweetCollector(db, xtracker)
     quote_collector = QuoteCollector(db, clob, enable_l2=settings.enable_l2)
     mapper = MarketTrackingMapper(db)
@@ -316,7 +323,13 @@ def doctor(
             checks.append(f"xtracker_posts:ok count={len(posts)} hash={posts_hash[:8]}")
 
             # doctor 只做只读探活，避免与在线采集进程并发写库导致锁竞争。
-            rows = await discover_target_markets(ctx.gamma, scope=settings.market_discovery_scope)
+            rows = await discover_target_markets(
+                ctx.gamma,
+                scope="all",
+                state="open",
+                page_size=200,
+                max_pages=1,
+            )
             checks.append(f"gamma_markets:ok count={len(rows)}")
 
             tokens = []

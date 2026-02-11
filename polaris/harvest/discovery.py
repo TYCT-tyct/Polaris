@@ -24,13 +24,26 @@ def is_open_market(row: dict[str, Any]) -> bool:
     return bool(row.get("active")) and not bool(row.get("closed")) and not bool(row.get("archived"))
 
 
-async def discover_target_markets(client: GammaClient, scope: str = "all") -> list[dict[str, Any]]:
-    rows = await client.iter_markets()
+def is_market_in_state(row: dict[str, Any], state: str) -> bool:
+    normalized = state.strip().lower()
+    if normalized == "all":
+        return True
+    return is_open_market(row)
+
+
+async def discover_target_markets(
+    client: GammaClient,
+    scope: str = "all",
+    state: str = "open",
+    page_size: int = 500,
+    max_pages: int | None = None,
+) -> list[dict[str, Any]]:
+    rows = await client.iter_markets(page_size=page_size, max_pages=max_pages)
     normalized_scope = scope.strip().lower()
     if normalized_scope == "elon_tweet":
         return [
             row
             for row in rows
-            if is_open_market(row) and is_elon_tweet_market(row.get("question", ""), row.get("slug", ""))
+            if is_market_in_state(row, state) and is_elon_tweet_market(row.get("question", ""), row.get("slug", ""))
         ]
-    return [row for row in rows if is_open_market(row)]
+    return [row for row in rows if is_market_in_state(row, state)]

@@ -47,6 +47,9 @@ class PolarisSettings(BaseSettings):
     log_level: str = Field(default="INFO")
     default_handles: str = Field(default="elonmusk")
     market_discovery_scope: str = Field(default="all")
+    market_discovery_state: str = Field(default="open")
+    gamma_page_size: int = Field(default=500)
+    gamma_max_pages: int = Field(default=0)
 
     xtracker_rate: float = Field(default=1.0)
     xtracker_burst: int = Field(default=2)
