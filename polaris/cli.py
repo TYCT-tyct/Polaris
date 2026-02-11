@@ -337,8 +337,16 @@ def doctor(
             for row in rows:
                 tokens.extend(ctx.gamma.token_descriptors(row))
             if tokens:
-                _ = await ctx.clob.get_book(tokens[0].token_id)
-                checks.append("clob_book:ok")
+                picked = None
+                for token_id in list(dict.fromkeys(t.token_id for t in tokens))[:20]:
+                    book = await ctx.clob.get_book_optional(token_id)
+                    if book is not None:
+                        picked = token_id
+                        break
+                if picked:
+                    checks.append(f"clob_book:ok token_id={picked}")
+                else:
+                    checks.append("clob_book:warn_no_available_token")
             else:
                 checks.append("clob_book:skip_no_tokens")
 
