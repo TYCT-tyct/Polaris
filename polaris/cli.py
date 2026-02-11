@@ -25,6 +25,7 @@ from polaris.db.pool import Database
 from polaris.harvest.collector_markets import MarketCollector
 from polaris.harvest.collector_quotes import QuoteCollector
 from polaris.harvest.collector_tweets import TweetCollector
+from polaris.harvest.discovery import discover_target_markets
 from polaris.harvest.mapper_market_tracking import MarketTrackingMapper
 from polaris.harvest.runner import HarvestRunner
 from polaris.infra.rate_limiter import AsyncTokenBucket
@@ -313,12 +314,15 @@ def doctor(
             posts_hash, posts, _ = await ctx.xtracker.get_posts(handle.lower())
             checks.append(f"xtracker_posts:ok count={len(posts)} hash={posts_hash[:8]}")
 
-            markets, _ = await ctx.market_collector.run_once()
-            checks.append(f"gamma_markets:ok count={markets}")
+            # doctor 只做只读探活，避免与在线采集进程并发写库导致锁竞争。
+            rows = await discover_target_markets(ctx.gamma, scope=settings.market_discovery_scope)
+            checks.append(f"gamma_markets:ok count={len(rows)}")
 
-            tokens = await ctx.market_collector.list_active_tokens()
+            tokens = []
+            for row in rows:
+                tokens.extend(ctx.gamma.token_descriptors(row))
             if tokens:
-                _ = await ctx.clob.get_book(tokens[0]["token_id"])
+                _ = await ctx.clob.get_book(tokens[0].token_id)
                 checks.append("clob_book:ok")
             else:
                 checks.append("clob_book:skip_no_tokens")
