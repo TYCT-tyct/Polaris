@@ -94,6 +94,12 @@ class PolarisSettings(BaseSettings):
     arb_live_preflight_force_refresh: bool = Field(default=False)
     arb_signal_dedupe_ttl_sec: int = Field(default=30)
     arb_scope_block_cooldown_sec: int = Field(default=300)
+    arb_strategy_health_gate_enabled: bool = Field(default=True)
+    arb_strategy_health_window_hours: int = Field(default=24)
+    arb_strategy_health_min_trades: int = Field(default=12)
+    arb_strategy_health_max_loss_usd: float = Field(default=0.8)
+    arb_strategy_health_min_win_rate: float = Field(default=0.35)
+    arb_strategy_health_min_avg_trade_pnl_usd: float = Field(default=0.0)
 
     # module2: risk and sizing
     arb_min_order_notional_usd: float = Field(default=1.0)

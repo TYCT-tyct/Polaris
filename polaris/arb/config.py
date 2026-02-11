@@ -22,6 +22,12 @@ class ArbConfig:
     live_preflight_force_refresh: bool
     signal_dedupe_ttl_sec: int
     scope_block_cooldown_sec: int
+    strategy_health_gate_enabled: bool
+    strategy_health_window_hours: int
+    strategy_health_min_trades: int
+    strategy_health_max_loss_usd: float
+    strategy_health_min_win_rate: float
+    strategy_health_min_avg_trade_pnl_usd: float
 
     min_order_notional_usd: float
     single_risk_usd: float
@@ -84,6 +90,12 @@ def arb_config_from_settings(settings: PolarisSettings) -> ArbConfig:
         live_preflight_force_refresh=settings.arb_live_preflight_force_refresh,
         signal_dedupe_ttl_sec=settings.arb_signal_dedupe_ttl_sec,
         scope_block_cooldown_sec=settings.arb_scope_block_cooldown_sec,
+        strategy_health_gate_enabled=settings.arb_strategy_health_gate_enabled,
+        strategy_health_window_hours=settings.arb_strategy_health_window_hours,
+        strategy_health_min_trades=settings.arb_strategy_health_min_trades,
+        strategy_health_max_loss_usd=settings.arb_strategy_health_max_loss_usd,
+        strategy_health_min_win_rate=settings.arb_strategy_health_min_win_rate,
+        strategy_health_min_avg_trade_pnl_usd=settings.arb_strategy_health_min_avg_trade_pnl_usd,
         min_order_notional_usd=settings.arb_min_order_notional_usd,
         single_risk_usd=settings.arb_single_risk_usd,
         max_exposure_usd=settings.arb_max_exposure_usd,

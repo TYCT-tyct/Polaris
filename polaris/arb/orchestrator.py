@@ -16,6 +16,8 @@ from polaris.arb.contracts import (
     FillEvent,
     OrderIntent,
     PriceLevel,
+    RiskDecision,
+    RiskLevel,
     RunMode,
     SignalStatus,
     StrategyCode,
@@ -97,6 +99,7 @@ class ArbOrchestrator:
         executed = 0
         snapshot_map = {item.token_id: item for item in snapshots}
         risk_states: dict[str, RiskRuntimeState] = {}
+        health_decisions: dict[str, tuple[bool, dict[str, float]]] = {}
         cash_balances: dict[str, float] = {}
         rejected: list[tuple[ArbSignal, SignalStatus, str | None]] = []
         expired: list[tuple[ArbSignal, SignalStatus, str | None]] = []
@@ -114,6 +117,29 @@ class ArbOrchestrator:
 
             scope_key = self._state_scope_key(signal)
             if self._is_scope_blocked(scope_key):
+                continue
+            health_key = f"{signal.mode.value}:{signal.source_code}:{signal.strategy_code.value}"
+            health_ok, health_payload = health_decisions.get(health_key, (True, {}))
+            if health_key not in health_decisions:
+                health_ok, health_payload = await self._strategy_health_decision(signal)
+                health_decisions[health_key] = (health_ok, health_payload)
+            if not health_ok:
+                self._block_scope(scope_key)
+                if scope_key in blocked_this_cycle:
+                    continue
+                blocked_this_cycle.add(scope_key)
+                rejected.append((signal, SignalStatus.REJECTED, "strategy_health_blocked"))
+                await self.risk_gate.record_risk_event(
+                    signal.mode,
+                    signal.strategy_code,
+                    signal.source_code,
+                    RiskDecision(
+                        allowed=False,
+                        level=RiskLevel.HARD_STOP,
+                        reason="strategy_health_blocked",
+                        payload=health_payload,
+                    ),
+                )
                 continue
             risk_state = risk_states.get(scope_key)
             if risk_state is None:
@@ -819,6 +845,50 @@ class ArbOrchestrator:
                 (best_version,),
             )
 
+    async def _strategy_health_decision(self, signal: ArbSignal) -> tuple[bool, dict[str, float]]:
+        if not self.config.strategy_health_gate_enabled:
+            return True, {}
+        row = await self.db.fetch_one(
+            """
+            select
+                count(*) as trades,
+                coalesce(sum(net_pnl_usd), 0) as net_pnl_usd,
+                coalesce(avg(net_pnl_usd), 0) as avg_trade_pnl_usd,
+                coalesce(avg((net_pnl_usd > 0)::int), 0) as win_rate
+            from arb_trade_result
+            where mode = %s
+              and source_code = %s
+              and strategy_code = %s
+              and created_at >= now() - (%s || ' hours')::interval
+            """,
+            (
+                signal.mode.value,
+                signal.source_code,
+                signal.strategy_code.value,
+                self.config.strategy_health_window_hours,
+            ),
+        )
+        if not row:
+            return True, {}
+        trades = int(row["trades"] or 0)
+        net_pnl = float(row["net_pnl_usd"] or 0.0)
+        avg_trade_pnl = float(row["avg_trade_pnl_usd"] or 0.0)
+        win_rate = float(row["win_rate"] or 0.0)
+        payload = {
+            "window_hours": float(self.config.strategy_health_window_hours),
+            "trades": float(trades),
+            "net_pnl_usd": net_pnl,
+            "avg_trade_pnl_usd": avg_trade_pnl,
+            "win_rate": win_rate,
+        }
+        if trades < self.config.strategy_health_min_trades:
+            return True, payload
+        if net_pnl <= -abs(self.config.strategy_health_max_loss_usd):
+            return False, payload
+        if win_rate < self.config.strategy_health_min_win_rate and avg_trade_pnl <= self.config.strategy_health_min_avg_trade_pnl_usd:
+            return False, payload
+        return True, payload
+
 
 
 def _estimate_capital(signal: ArbSignal) -> float:
@@ -877,6 +947,7 @@ _SCOPE_BLOCK_REASONS = {
     "daily_stop_loss_triggered",
     "consecutive_fail_limit_triggered",
     "insufficient_bankroll",
+    "strategy_health_blocked",
 }
 
 
