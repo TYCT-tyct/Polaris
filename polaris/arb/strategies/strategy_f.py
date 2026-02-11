@@ -13,13 +13,16 @@ class StrategyF:
         if not self.config.enable_strategy_f:
             return []
 
-        signals: list[ArbSignal] = []
+        candidates: list[tuple[float, float, ArbSignal]] = []
         for token in snapshots:
             if token.outcome_side != "YES":
                 continue
-            if token.best_ask is None:
+            if token.best_ask is None or token.best_bid is None:
                 continue
             price = float(token.best_ask)
+            spread = max(0.0, price - float(token.best_bid))
+            if spread > self.config.f_max_spread:
+                continue
             if price < self.config.f_min_prob or price > 0.995:
                 continue
             hours_left = resolve_hours_left(token.market_end)
@@ -37,34 +40,40 @@ class StrategyF:
             notional = shares * price
             if notional > self.config.single_risk_usd:
                 continue
-            signals.append(
-                ArbSignal(
-                    strategy_code=StrategyCode.F,
-                    mode=mode,
-                    source_code=source_code,
-                    event_id=token.event_id,
-                    market_ids=[token.market_id],
-                    token_ids=[token.token_id],
-                    edge_pct=edge_pct,
-                    expected_pnl_usd=notional * edge_pct,
-                    ttl_ms=30000,
-                    features={
-                        "legs": [
-                            {
-                                "market_id": token.market_id,
-                                "token_id": token.token_id,
-                                "side": "BUY",
-                                "price": price,
-                                "shares": shares,
-                                "notional_usd": notional,
-                            }
-                        ],
-                        "hours_left": hours_left,
-                        "annualized_return": annualized,
-                        "expected_edge_pct": edge_pct,
-                        "expected_hold_minutes": int(hours_left * 60),
-                    },
-                    decision_note="high_prob_short_bond",
-                )
+            if token.bids and float(token.bids[0].size) < shares:
+                continue
+            signal = ArbSignal(
+                strategy_code=StrategyCode.F,
+                mode=mode,
+                source_code=source_code,
+                event_id=token.event_id,
+                market_ids=[token.market_id],
+                token_ids=[token.token_id],
+                edge_pct=edge_pct,
+                expected_pnl_usd=notional * edge_pct,
+                ttl_ms=30000,
+                features={
+                    "legs": [
+                        {
+                            "market_id": token.market_id,
+                            "token_id": token.token_id,
+                            "side": "BUY",
+                            "price": price,
+                            "shares": shares,
+                            "notional_usd": notional,
+                        }
+                    ],
+                    "hours_left": hours_left,
+                    "annualized_return": annualized,
+                    "spread": spread,
+                    "expected_edge_pct": edge_pct,
+                    "expected_hold_minutes": int(hours_left * 60),
+                },
+                decision_note="high_prob_short_bond",
             )
-        return signals
+            candidates.append((annualized, spread, signal))
+        candidates.sort(key=lambda item: (-item[0], item[1], -item[2].edge_pct))
+        cap = max(0, self.config.f_max_signals_per_cycle)
+        if cap > 0:
+            candidates = candidates[:cap]
+        return [signal for _, _, signal in candidates]

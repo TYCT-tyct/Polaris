@@ -111,7 +111,15 @@ class OrderRouter:
             await self._record_order_events(event_rows)
             await self._record_fills(fill_rows)
 
-        gross, fees, slip, expected_gross = _estimate_trade_pnl(plan.signal.features, fills, snapshots)
+        mark_to_book, fees, slip, expected_gross = _estimate_trade_pnl(plan.signal.features, fills, snapshots)
+        hold_minutes = float(plan.signal.features.get("expected_hold_minutes", 0) or 0)
+        if hold_minutes > 1:
+            # 持有型策略在开仓时不确认浮盈亏，避免把未实现波动误记成已实现盈亏。
+            gross = 0.0
+            pnl_model = "entry_only"
+        else:
+            gross = mark_to_book
+            pnl_model = "mark_to_book"
         return TradeResult(
             signal=plan.signal,
             status="filled" if fills else "rejected",
@@ -120,14 +128,15 @@ class OrderRouter:
             slippage_usd=slip,
             net_pnl_usd=gross - fees - slip,
             capital_used_usd=total_notional,
-            hold_minutes=float(plan.signal.features.get("expected_hold_minutes", 0) or 0),
+            hold_minutes=hold_minutes,
             fills=fills,
             metadata={
                 "mode": plan.signal.mode.value,
                 "intent_count": len(plan.intents),
-                "pnl_model": "mark_to_book",
+                "pnl_model": pnl_model,
                 "expected_gross_pnl_usd": expected_gross,
-                "mark_to_book_gross_pnl_usd": gross,
+                "mark_to_book_gross_pnl_usd": mark_to_book,
+                "entry_gross_pnl_usd": gross,
             },
         )
 

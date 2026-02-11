@@ -92,6 +92,8 @@ class PolarisSettings(BaseSettings):
     arb_execution_concurrency: int = Field(default=3)
     arb_live_preflight_max_age_ms: int = Field(default=2000)
     arb_live_preflight_force_refresh: bool = Field(default=False)
+    arb_signal_dedupe_ttl_sec: int = Field(default=30)
+    arb_scope_block_cooldown_sec: int = Field(default=300)
 
     # module2: risk and sizing
     arb_min_order_notional_usd: float = Field(default=1.0)
@@ -125,6 +127,8 @@ class PolarisSettings(BaseSettings):
     arb_f_min_prob: float = Field(default=0.94)
     arb_f_max_hours_to_resolve: float = Field(default=12.0)
     arb_f_min_annualized_return: float = Field(default=0.08)
+    arb_f_max_spread: float = Field(default=0.03)
+    arb_f_max_signals_per_cycle: int = Field(default=20)
     arb_g_max_hours_to_resolve: float = Field(default=4.0)
     arb_g_min_confidence: float = Field(default=0.90)
     arb_g_min_expected_edge_pct: float = Field(default=0.02)

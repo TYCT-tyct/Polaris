@@ -20,6 +20,8 @@ class ArbConfig:
     execution_concurrency: int
     live_preflight_max_age_ms: int
     live_preflight_force_refresh: bool
+    signal_dedupe_ttl_sec: int
+    scope_block_cooldown_sec: int
 
     min_order_notional_usd: float
     single_risk_usd: float
@@ -50,6 +52,8 @@ class ArbConfig:
     f_min_prob: float
     f_max_hours_to_resolve: float
     f_min_annualized_return: float
+    f_max_spread: float
+    f_max_signals_per_cycle: int
     g_max_hours_to_resolve: float
     g_min_confidence: float
     g_min_expected_edge_pct: float
@@ -77,6 +81,8 @@ def arb_config_from_settings(settings: PolarisSettings) -> ArbConfig:
         execution_concurrency=settings.arb_execution_concurrency,
         live_preflight_max_age_ms=settings.arb_live_preflight_max_age_ms,
         live_preflight_force_refresh=settings.arb_live_preflight_force_refresh,
+        signal_dedupe_ttl_sec=settings.arb_signal_dedupe_ttl_sec,
+        scope_block_cooldown_sec=settings.arb_scope_block_cooldown_sec,
         min_order_notional_usd=settings.arb_min_order_notional_usd,
         single_risk_usd=settings.arb_single_risk_usd,
         max_exposure_usd=settings.arb_max_exposure_usd,
@@ -104,6 +110,8 @@ def arb_config_from_settings(settings: PolarisSettings) -> ArbConfig:
         f_min_prob=settings.arb_f_min_prob,
         f_max_hours_to_resolve=settings.arb_f_max_hours_to_resolve,
         f_min_annualized_return=settings.arb_f_min_annualized_return,
+        f_max_spread=settings.arb_f_max_spread,
+        f_max_signals_per_cycle=settings.arb_f_max_signals_per_cycle,
         g_max_hours_to_resolve=settings.arb_g_max_hours_to_resolve,
         g_min_confidence=settings.arb_g_min_confidence,
         g_min_expected_edge_pct=settings.arb_g_min_expected_edge_pct,

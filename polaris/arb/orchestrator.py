@@ -51,6 +51,8 @@ class ArbOrchestrator:
         self.risk_gate = RiskGate(db, config)
         self._last_optimize_at: datetime | None = None
         self._missing_token_resume_at: dict[str, datetime] = {}
+        self._signal_dedupe_until: dict[str, datetime] = {}
+        self._scope_block_until: dict[str, datetime] = {}
 
         self.strategy_a = StrategyA(config)
         self.strategy_b = StrategyB(config)
@@ -78,6 +80,7 @@ class ArbOrchestrator:
         scan_started = perf_counter()
         all_signals = self._scan_all(mode, source_code, snapshots)
         ordered = self._order_signals(all_signals)
+        ordered = self._dedupe_signals(ordered)
         scan_ms = int((perf_counter() - scan_started) * 1000)
         if self.config.max_signals_per_cycle > 0 and len(ordered) > self.config.max_signals_per_cycle:
             logger.info(
@@ -98,6 +101,7 @@ class ArbOrchestrator:
         rejected: list[tuple[ArbSignal, SignalStatus, str | None]] = []
         expired: list[tuple[ArbSignal, SignalStatus, str | None]] = []
         approved: list[tuple[ArbSignal, float, ExecutionPlan, str]] = []
+        blocked_this_cycle: set[str] = set()
         for signal in ordered:
             if signal.is_expired():
                 expired.append((signal, SignalStatus.EXPIRED, None))
@@ -109,6 +113,8 @@ class ArbOrchestrator:
                     continue
 
             scope_key = self._state_scope_key(signal)
+            if self._is_scope_blocked(scope_key):
+                continue
             risk_state = risk_states.get(scope_key)
             if risk_state is None:
                 risk_state = await self.risk_gate.load_state(
@@ -126,6 +132,11 @@ class ArbOrchestrator:
             notional = _estimate_capital(signal)
             decision = await self.risk_gate.assess(signal, notional, state=risk_state)
             if not decision.allowed:
+                if decision.reason in _SCOPE_BLOCK_REASONS:
+                    self._block_scope(scope_key)
+                    if scope_key in blocked_this_cycle:
+                        continue
+                    blocked_this_cycle.add(scope_key)
                 rejected.append((signal, SignalStatus.REJECTED, decision.reason))
                 await self.risk_gate.record_risk_event(signal.mode, signal.strategy_code, signal.source_code, decision)
                 continue
@@ -469,6 +480,37 @@ class ArbOrchestrator:
                 )
             )
         return grouped
+
+    def _dedupe_signals(self, signals: list[ArbSignal]) -> list[ArbSignal]:
+        if not signals:
+            return signals
+        now = datetime.now(tz=UTC)
+        self._signal_dedupe_until = {k: v for k, v in self._signal_dedupe_until.items() if v > now}
+        deduped: list[ArbSignal] = []
+        for signal in signals:
+            fingerprint = _signal_fingerprint(signal)
+            blocked_until = self._signal_dedupe_until.get(fingerprint)
+            if blocked_until and now < blocked_until:
+                continue
+            ttl_sec = max(1, (signal.ttl_ms + 999) // 1000)
+            ttl_sec = min(ttl_sec, max(1, self.config.signal_dedupe_ttl_sec))
+            self._signal_dedupe_until[fingerprint] = now + timedelta(seconds=ttl_sec)
+            deduped.append(signal)
+        return deduped
+
+    def _is_scope_blocked(self, scope_key: str) -> bool:
+        now = datetime.now(tz=UTC)
+        until = self._scope_block_until.get(scope_key)
+        if until is None:
+            return False
+        if now >= until:
+            del self._scope_block_until[scope_key]
+            return False
+        return True
+
+    def _block_scope(self, scope_key: str) -> None:
+        cooldown_sec = max(1, self.config.scope_block_cooldown_sec)
+        self._scope_block_until[scope_key] = datetime.now(tz=UTC) + timedelta(seconds=cooldown_sec)
 
     def _scan_all(self, mode: RunMode, source_code: str, snapshots: list[TokenSnapshot]) -> list[ArbSignal]:
         signals: list[ArbSignal] = []
@@ -825,3 +867,39 @@ def _position_rows(
 
 async def _sleep(seconds: float) -> None:
     await asyncio.sleep(seconds)
+
+
+_SCOPE_BLOCK_REASONS = {
+    "daily_stop_loss_triggered",
+    "consecutive_fail_limit_triggered",
+    "insufficient_bankroll",
+}
+
+
+def _signal_fingerprint(signal: ArbSignal) -> str:
+    legs = []
+    for leg in signal.features.get("legs", []):
+        legs.append(
+            (
+                str(leg.get("market_id", "")),
+                str(leg.get("token_id", "")),
+                str(leg.get("side", "")).upper(),
+                round(float(leg.get("price") or 0.0), 6),
+                round(float(leg.get("shares") or 0.0), 6),
+                round(float(leg.get("notional_usd") or 0.0), 6),
+            )
+        )
+    legs.sort()
+    fingerprint = (
+        signal.mode.value,
+        signal.source_code,
+        signal.strategy_code.value,
+        signal.event_id or "",
+        tuple(sorted(signal.market_ids)),
+        tuple(sorted(signal.token_ids)),
+        round(signal.edge_pct, 6),
+        round(signal.expected_pnl_usd, 6),
+        tuple(legs),
+        signal.decision_note,
+    )
+    return json.dumps(fingerprint, ensure_ascii=True, separators=(",", ":"))
