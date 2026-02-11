@@ -111,7 +111,12 @@ class OrderRouter:
             await self._record_order_events(event_rows)
             await self._record_fills(fill_rows)
 
-        mark_to_book, fees, slip, expected_gross = _estimate_trade_pnl(plan.signal.features, fills, snapshots)
+        mark_to_book, fees, slip, expected_gross = _estimate_trade_pnl(
+            plan.signal.features,
+            fills,
+            snapshots,
+            self.config.fee_bps,
+        )
         hold_minutes = float(plan.signal.features.get("expected_hold_minutes", 0) or 0)
         if hold_minutes > 1:
             # 持有型策略在开仓时不确认浮盈亏，避免把未实现波动误记成已实现盈亏。
@@ -373,7 +378,12 @@ class OrderRouter:
         await self._record_fills(fill_rows)
 
         snapshot_for_pnl = live_books if live_books else snapshots
-        gross, fees, slip, expected_gross = _estimate_trade_pnl(plan.signal.features, fills, snapshot_for_pnl)
+        gross, fees, slip, expected_gross = _estimate_trade_pnl(
+            plan.signal.features,
+            fills,
+            snapshot_for_pnl,
+            self.config.fee_bps,
+        )
         return TradeResult(
             signal=plan.signal,
             status="filled" if fills else ("submitted" if submitted > 0 else "error"),
@@ -637,6 +647,7 @@ def _estimate_trade_pnl(
     features: dict[str, Any],
     fills: list[FillEvent],
     snapshots: dict[str, TokenSnapshot],
+    fee_bps: int,
 ) -> tuple[float, float, float, float]:
     if not fills:
         return 0.0, 0.0, 0.0, 0.0
@@ -657,7 +668,7 @@ def _estimate_trade_pnl(
             unwind_notional = unwind.notional if unwind is not None else fill.fill_notional_usd
             mark_to_book += fill.fill_notional_usd - unwind_notional
     gross = mark_to_book
-    fees = notional * 0.001
+    fees = notional * max(0, fee_bps) / 10_000.0
     slippage = float(features.get("expected_slippage_usd") or 0.0)
     return gross, fees, slippage, expected_gross
 

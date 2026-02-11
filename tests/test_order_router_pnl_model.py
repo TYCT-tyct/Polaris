@@ -50,6 +50,7 @@ def test_estimate_trade_pnl_uses_mark_to_book_for_buy_fill() -> None:
         {"expected_edge_pct": 0.10},
         fills,
         snapshots,
+        fee_bps=10,
     )
     assert gross == pytest.approx(-0.02, abs=1e-9)
     assert fees == pytest.approx(0.001, abs=1e-9)
@@ -74,6 +75,7 @@ def test_estimate_trade_pnl_uses_mark_to_book_for_sell_fill() -> None:
         {"expected_edge_pct": 0.05},
         fills,
         snapshots,
+        fee_bps=10,
     )
     assert gross == pytest.approx(-0.02, abs=1e-9)
     assert fees == pytest.approx(0.0012, abs=1e-9)
@@ -97,6 +99,7 @@ def test_estimate_trade_pnl_missing_snapshot_keeps_expected_only() -> None:
         {"expected_edge_pct": 0.08},
         fills,
         {},
+        fee_bps=10,
     )
     assert gross == 0.0
     assert fees == pytest.approx(0.001, abs=1e-9)
@@ -118,6 +121,7 @@ async def test_simulate_paper_uses_entry_only_for_holding_signals() -> None:
         database_url="postgresql://postgres:postgres@localhost:55432/polaris",
         arb_single_risk_usd=5.0,
         arb_min_order_notional_usd=1.0,
+        arb_fee_bps=10,
     )
     router = OrderRouter(
         db=_NoopDb(),

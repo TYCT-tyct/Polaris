@@ -32,6 +32,7 @@ class ArbConfig:
     patch_fill_threshold: float
     unwind_fill_threshold: float
     slippage_bps: int
+    fee_bps: int
     live_order_type: str
     paper_initial_bankroll_usd: float
     paper_split_by_strategy: bool
@@ -92,6 +93,7 @@ def arb_config_from_settings(settings: PolarisSettings) -> ArbConfig:
         patch_fill_threshold=settings.arb_patch_fill_threshold,
         unwind_fill_threshold=settings.arb_unwind_fill_threshold,
         slippage_bps=settings.arb_slippage_bps,
+        fee_bps=settings.arb_fee_bps,
         live_order_type=settings.arb_live_order_type.strip().upper(),
         paper_initial_bankroll_usd=settings.arb_paper_initial_bankroll_usd,
         paper_split_by_strategy=settings.arb_paper_split_by_strategy,
