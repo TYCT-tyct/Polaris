@@ -48,6 +48,9 @@ class PolarisSettings(BaseSettings):
     default_handles: str = Field(default="elonmusk")
     market_discovery_scope: str = Field(default="all")
     market_discovery_state: str = Field(default="open")
+    market_discovery_tweet_targets: str = Field(
+        default="elon musk,andrew tate,donald j trump,donald trump"
+    )
     gamma_page_size: int = Field(default=500)
     gamma_max_pages: int = Field(default=0)
 
@@ -181,6 +184,10 @@ class PolarisSettings(BaseSettings):
             if cleaned:
                 return cleaned
         return self.handles
+
+    @property
+    def market_tweet_targets(self) -> list[str]:
+        return [s.strip().lower() for s in self.market_discovery_tweet_targets.split(",") if s.strip()]
 
     @property
     def arb_priority(self) -> list[str]:

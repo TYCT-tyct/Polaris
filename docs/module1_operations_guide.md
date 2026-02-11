@@ -86,9 +86,14 @@ python -m polaris.cli harvest-once --handle elonmusk
 - `POLARIS_MARKET_DISCOVERY_SCOPE`
   - `all`：全主题市场
   - `elon_tweet`：仅 Elon 推文相关市场
+  - `watchlist_tweet`：仅白名单人物的 tweet/post 市场（推荐）
 - `POLARIS_MARKET_DISCOVERY_STATE`
   - `open`：仅开盘市场
   - `all`：开盘 + 已收盘 + 已归档（用于全量覆盖）
+- `POLARIS_MARKET_DISCOVERY_TWEET_TARGETS`
+  - 逗号分隔的人物别名白名单，例如：
+  - `elon musk,andrew tate,donald j trump,donald trump`
+  - 仅在 `watchlist_tweet` 模式生效
 
 分页覆盖参数：
 - `POLARIS_GAMMA_PAGE_SIZE`：每页拉取条数（默认 500）

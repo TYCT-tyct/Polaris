@@ -16,6 +16,7 @@ class MarketCollector:
         gamma_client: GammaClient,
         market_scope: str = "all",
         market_state: str = "open",
+        market_tweet_targets: list[str] | None = None,
         gamma_page_size: int = 500,
         gamma_max_pages: int = 0,
     ) -> None:
@@ -23,6 +24,7 @@ class MarketCollector:
         self.gamma_client = gamma_client
         self.market_scope = market_scope
         self.market_state = market_state
+        self.market_tweet_targets = market_tweet_targets or []
         self.gamma_page_size = max(1, gamma_page_size)
         self.gamma_max_pages = gamma_max_pages
 
@@ -34,6 +36,7 @@ class MarketCollector:
             state=self.market_state,
             page_size=self.gamma_page_size,
             max_pages=max_pages,
+            tweet_targets=self.market_tweet_targets,
         )
         markets = [self.gamma_client.market_record(row) for row in raw_markets]
         events = []

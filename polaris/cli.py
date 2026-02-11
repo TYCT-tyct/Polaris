@@ -99,6 +99,7 @@ async def create_runtime(settings: PolarisSettings) -> RuntimeContext:
         gamma,
         market_scope=settings.market_discovery_scope,
         market_state=settings.market_discovery_state,
+        market_tweet_targets=settings.market_tweet_targets,
         gamma_page_size=settings.gamma_page_size,
         gamma_max_pages=settings.gamma_max_pages,
     )

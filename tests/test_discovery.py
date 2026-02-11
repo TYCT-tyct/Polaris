@@ -1,6 +1,12 @@
 import pytest
 
-from polaris.harvest.discovery import discover_target_markets, is_elon_tweet_market, is_market_in_state, is_open_market
+from polaris.harvest.discovery import (
+    discover_target_markets,
+    is_elon_tweet_market,
+    is_market_in_state,
+    is_open_market,
+    is_person_tweet_market,
+)
 
 
 def test_market_filter_accepts_target() -> None:
@@ -14,6 +20,25 @@ def test_market_filter_rejects_non_target() -> None:
     assert not is_elon_tweet_market(
         "Will BTC be above 120k by Friday?",
         "btc-above-120k-by-friday",
+    )
+
+
+def test_watchlist_person_tweet_filter() -> None:
+    aliases = ("elon musk", "andrew tate", "donald j trump", "donald trump")
+    assert is_person_tweet_market(
+        "How many tweets will Donald J. Trump post this week?",
+        "donald-j-trump-tweets-this-week",
+        aliases=aliases,
+    )
+    assert is_person_tweet_market(
+        "Will Andrew Tate post 20+ tweets in March?",
+        "andrew-tate-post-count-march",
+        aliases=aliases,
+    )
+    assert not is_person_tweet_market(
+        "Will Trump deport less than 250,000 people?",
+        "will-trump-deport-less-than-250000",
+        aliases=aliases,
     )
 
 
@@ -63,6 +88,27 @@ async def test_discover_target_markets_scope_and_state() -> None:
             "closed": False,
             "archived": False,
         },
+        {
+            "question": "How many tweets will Donald J. Trump post this week?",
+            "slug": "donald-j-trump-tweets-this-week",
+            "active": True,
+            "closed": False,
+            "archived": False,
+        },
+        {
+            "question": "Will Andrew Tate post 20+ tweets in March?",
+            "slug": "andrew-tate-post-count-march",
+            "active": True,
+            "closed": False,
+            "archived": False,
+        },
+        {
+            "question": "Will Trump deport less than 250,000 people?",
+            "slug": "will-trump-deport-less-than-250000",
+            "active": True,
+            "closed": False,
+            "archived": False,
+        },
     ]
     client = _FakeGammaClient(rows)
 
@@ -79,6 +125,14 @@ async def test_discover_target_markets_scope_and_state() -> None:
     all_elon = await discover_target_markets(client, scope="elon_tweet", state="all")
     assert len(all_elon) == 2
 
+    watchlist = await discover_target_markets(
+        client,
+        scope="watchlist_tweet",
+        state="open",
+        tweet_targets=["elon musk", "andrew tate", "donald j trump", "donald trump"],
+    )
+    assert len(watchlist) == 3
+
     all_scope_all_state = await discover_target_markets(client, scope="all", state="all")
-    assert len(all_scope_all_state) == 3
+    assert len(all_scope_all_state) == 6
     assert client.calls[0] == (100, 10)
