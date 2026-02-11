@@ -87,10 +87,14 @@
 │     ├─ health.py
 │     └─ backfill.py
 ├─ rust/
-│  └─ polaris_book_sim/
+│  ├─ polaris_book_sim/
+│  │  ├─ Cargo.toml
+│  │  └─ src/
+│  │     └─ main.rs
+│  └─ polaris_pyo3/
 │     ├─ Cargo.toml
 │     └─ src/
-│        └─ main.rs
+│        └─ lib.rs
 └─ tests/
    ├─ conftest.py
    ├─ test_discovery.py
@@ -123,6 +127,7 @@
 - `polaris/arb/ai/*`：G 策略可选 AI 复核层（google/claude/gpt/minimax/zhipu）。
 - `polaris/ops/exporter.py`：统一导出 Module1/2 关键表与视图。
 - `rust/polaris_book_sim`：Rust 订单簿撮合模拟器，供 Module2 可选调用。
+- `rust/polaris_pyo3`：PyO3 同进程扩展模块，减少 IPC 开销并降低 T2T 抖动。
 
 ## 依赖边界
 - 采集链路：`cli -> harvest.runner -> collectors -> sources/db`。
@@ -138,7 +143,7 @@
 - 参数进化基于“历史回放 + 最近 24h paper”双评分，所有版本可追溯。
 - A/C 策略扫描范围收敛为 NegRisk 市场组，避免在普通二元市场产生伪机会。
 - 持有型策略在开仓时使用 `entry_only` 收益口径，避免把未实现浮盈亏误计为已实现亏损。
-- 引入 Rust 桥接可选路径，支持 `daemon/subprocess` 两种模式，默认关闭，稳定后按环境开关灰度开启。
+- 引入 Rust 桥接可选路径，支持 `daemon/subprocess/pyo3` 三种模式，默认关闭，稳定后按环境开关灰度开启。
 
 ## 变更日志
 - 2026-02-10：新增 Module2 迁移 `0003/0004` 与 `arb_*` 数据模型。
@@ -151,3 +156,4 @@
 - 2026-02-12：修复 `.env` 热更新覆盖语义、A/C NegRisk 分组过滤、持有型策略收益口径统一。
 - 2026-02-12：新增 `rust/polaris_book_sim` 与 `rust_bridge` 可选加速路径。
 - 2026-02-12：新增 `arb-benchmark-t2t` 与 Rust `bench-orderbook` 子命令，用于真实 tick 更新口径对比。
+- 2026-02-12：新增 `rust/polaris_pyo3` 与 `pyo3` 执行模式，支持同进程 Rust 基准与 paper 模拟。

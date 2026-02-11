@@ -25,7 +25,11 @@ class OrderRouter:
         self._live_client: Any = None
         self._rust_bridge: RustBridgeClient | None = None
         if self.config.rust_bridge_enabled:
-            mode = self.config.rust_bridge_mode if self.config.rust_bridge_mode in {"daemon", "subprocess"} else "daemon"
+            mode = (
+                self.config.rust_bridge_mode
+                if self.config.rust_bridge_mode in {"daemon", "subprocess", "pyo3"}
+                else "daemon"
+            )
             self._rust_bridge = RustBridgeClient(
                 binary=self.config.rust_bridge_bin,
                 timeout_sec=self.config.rust_bridge_timeout_sec,

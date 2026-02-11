@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
 import json
 import logging
 from dataclasses import dataclass
@@ -10,6 +11,7 @@ from uuid import uuid4
 from polaris.arb.contracts import ExecutionPlan, FillEvent, TokenSnapshot
 
 logger = logging.getLogger(__name__)
+_PYO3_MODULE: Any | bool | None = None
 
 
 @dataclass(slots=True)
@@ -109,6 +111,9 @@ class RustBridgeClient:
         slippage_bps: int,
     ) -> RustPaperResult | None:
         payload = _build_payload(plan, snapshots, slippage_bps=slippage_bps)
+        if self._mode == "pyo3":
+            data = _run_pyo3(payload)
+            return _parse_result(data) if data is not None else None
         if self._mode == "subprocess":
             data = await _run_subprocess(binary=self._binary, timeout_sec=self._timeout_sec, payload=payload)
             return _parse_result(data) if data is not None else None
@@ -275,4 +280,35 @@ async def _run_subprocess(
         return json.loads(stdout.decode("utf-8"))
     except json.JSONDecodeError:
         logger.warning("rust bridge returned invalid json", extra={"binary": binary})
+        return None
+
+
+def _load_pyo3_module() -> Any | None:
+    global _PYO3_MODULE
+    if _PYO3_MODULE is False:
+        return None
+    if _PYO3_MODULE is not None:
+        return _PYO3_MODULE
+    try:
+        _PYO3_MODULE = importlib.import_module("polaris_rs")
+    except Exception:
+        logger.info("pyo3 module not available: polaris_rs")
+        _PYO3_MODULE = False
+        return None
+    return _PYO3_MODULE
+
+
+def _run_pyo3(payload: dict[str, Any]) -> dict[str, Any] | None:
+    mod = _load_pyo3_module()
+    if mod is None:
+        return None
+    try:
+        raw = mod.simulate_paper(json.dumps(payload, ensure_ascii=True))
+    except Exception:
+        logger.exception("pyo3 simulate_paper failed")
+        return None
+    try:
+        return json.loads(raw)
+    except Exception:
+        logger.warning("pyo3 simulate_paper returned invalid json")
         return None

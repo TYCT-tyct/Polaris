@@ -48,6 +48,14 @@
 - Rust 单次子进程路径（仅兼容调试，不推荐）：
   `POLARIS_ARB_RUST_BRIDGE_ENABLED=true`
   `POLARIS_ARB_RUST_BRIDGE_MODE=subprocess`
+- Rust PyO3 同进程路径（推荐做低抖动基准对比）：
+  1. 安装构建工具：`pip install maturin`
+  2. 编译并安装扩展模块：`cd rust/polaris_pyo3 && maturin develop --release`
+  3. 启用模式：
+     `POLARIS_ARB_RUST_BRIDGE_ENABLED=true`
+     `POLARIS_ARB_RUST_BRIDGE_MODE=pyo3`
+
+说明：`pyo3` 避免了 subprocess 的 IPC 序列化开销，适合高频更新场景；若 `polaris_rs` 未安装，系统会自动回退到 Python 模拟路径，不会中断。
 
 ## 3. 回放验证
 默认高速回放（推荐）：
@@ -73,6 +81,7 @@
   `python -m polaris.cli arb-benchmark --mode paper_live --rounds 30 --warmup 3`
 - T2T/Jitter 基准（真实订单簿更新口径）：
   `python -m polaris.cli arb-benchmark-t2t --backend both --iterations 120 --updates 1000 --levels-per-side 250 --output benchmarks/t2t_compare.json`
+  `python -m polaris.cli arb-benchmark-t2t --backend all --iterations 120 --updates 1000 --levels-per-side 250 --output benchmarks/t2t_all_compare.json`
 
 `arb-summary` 输出重点：
 - `totals.signals_found`：发现机会总数。

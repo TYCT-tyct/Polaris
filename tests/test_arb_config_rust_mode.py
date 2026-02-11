@@ -19,3 +19,12 @@ def test_arb_config_rust_mode_defaults_to_daemon() -> None:
     )
     cfg = arb_config_from_settings(settings)
     assert cfg.rust_bridge_mode == "daemon"
+
+
+def test_arb_config_rust_mode_supports_pyo3() -> None:
+    settings = PolarisSettings(
+        database_url="postgresql://postgres:postgres@localhost:55432/polaris",
+        arb_rust_bridge_mode="PyO3",
+    )
+    cfg = arb_config_from_settings(settings)
+    assert cfg.rust_bridge_mode == "pyo3"

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
 import json
 import signal
 import subprocess
@@ -964,9 +965,33 @@ def _summarize_cycle_stats(rows: list[dict[str, int]]) -> dict[str, object]:
     return summary
 
 
+def _run_pyo3_t2t_benchmark(payload_json: str) -> dict[str, object]:
+    try:
+        module = importlib.import_module("polaris_rs")
+    except Exception:
+        return {"error": "pyo3_module_not_found", "module": "polaris_rs"}
+
+    try:
+        raw = module.bench_orderbook(payload_json)
+    except Exception as exc:
+        return {
+            "error": "pyo3_benchmark_failed",
+            "message": str(exc)[:400],
+        }
+
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return {"error": "pyo3_output_invalid_json"}
+
+    if not isinstance(parsed, dict):
+        return {"error": "pyo3_output_invalid_type"}
+    return parsed
+
+
 @app.command("arb-benchmark-t2t")
 def arb_benchmark_t2t(
-    backend: Annotated[str, typer.Option("--backend", help="python|rust|both")] = "both",
+    backend: Annotated[str, typer.Option("--backend", help="python|rust|pyo3|both|all")] = "both",
     input_path: Annotated[str, typer.Option("--input", help="Optional JSON payload path")] = "",
     output: Annotated[str, typer.Option("--output", help="Optional output json path")] = "",
     iterations: Annotated[int, typer.Option("--iterations", min=1, max=500)] = 120,
@@ -982,8 +1007,8 @@ def arb_benchmark_t2t(
     _ensure_windows_selector_loop()
 
     normalized = backend.strip().lower()
-    if normalized not in {"python", "rust", "both"}:
-        raise typer.BadParameter("backend must be python|rust|both")
+    if normalized not in {"python", "rust", "pyo3", "both", "all"}:
+        raise typer.BadParameter("backend must be python|rust|pyo3|both|all")
 
     if input_path:
         raw = Path(input_path).expanduser().read_text(encoding="utf-8")
@@ -1008,10 +1033,10 @@ def arb_benchmark_t2t(
         "results": {},
     }
 
-    if normalized in {"python", "both"}:
+    if normalized in {"python", "both", "all"}:
         report["results"]["python"] = run_python_t2t_benchmark(payload)
 
-    if normalized in {"rust", "both"}:
+    if normalized in {"rust", "both", "all"}:
         rust_bin = settings.arb_rust_bridge_bin
         try:
             completed = subprocess.run(
@@ -1041,6 +1066,9 @@ def arb_benchmark_t2t(
                         "binary": rust_bin,
                     }
 
+    if normalized in {"pyo3", "all"}:
+        report["results"]["pyo3"] = _run_pyo3_t2t_benchmark(payload_json)
+
     if "python" in report["results"] and "rust" in report["results"]:
         py = report["results"]["python"]
         ru = report["results"]["rust"]
@@ -1053,6 +1081,27 @@ def arb_benchmark_t2t(
                     "rust_avg_update_us": round(ru_avg, 6),
                     "rust_vs_python_speedup": round(py_avg / ru_avg, 6),
                 }
+
+    if "python" in report["results"] and "pyo3" in report["results"]:
+        py = report["results"]["python"]
+        pyo3 = report["results"]["pyo3"]
+        if isinstance(py, dict) and isinstance(pyo3, dict):
+            py_avg = float(py.get("avg_update_us", 0.0) or 0.0)
+            pyo3_avg = float(pyo3.get("avg_update_us", 0.0) or 0.0)
+            if py_avg > 0 and pyo3_avg > 0:
+                report.setdefault("comparison", {})
+                report["comparison"]["pyo3_avg_update_us"] = round(pyo3_avg, 6)
+                report["comparison"]["pyo3_vs_python_speedup"] = round(py_avg / pyo3_avg, 6)
+
+    if "rust" in report["results"] and "pyo3" in report["results"]:
+        ru = report["results"]["rust"]
+        pyo3 = report["results"]["pyo3"]
+        if isinstance(ru, dict) and isinstance(pyo3, dict):
+            ru_avg = float(ru.get("avg_update_us", 0.0) or 0.0)
+            pyo3_avg = float(pyo3.get("avg_update_us", 0.0) or 0.0)
+            if ru_avg > 0 and pyo3_avg > 0:
+                report.setdefault("comparison", {})
+                report["comparison"]["pyo3_vs_rust_speedup"] = round(ru_avg / pyo3_avg, 6)
 
     text = json.dumps(report, ensure_ascii=False, indent=2)
     typer.echo(text)
