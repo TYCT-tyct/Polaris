@@ -12,7 +12,12 @@ class SimFill:
     notional: float
 
 
-def simulate_buy_fill(levels: tuple[PriceLevel, ...], target_size: float) -> SimFill | None:
+def simulate_buy_fill(
+    levels: tuple[PriceLevel, ...],
+    target_size: float,
+    limit_price: float | None = None,
+    allow_partial: bool = True,
+) -> SimFill | None:
     if target_size <= 0:
         return None
     remaining = target_size
@@ -20,6 +25,8 @@ def simulate_buy_fill(levels: tuple[PriceLevel, ...], target_size: float) -> Sim
     cost = 0.0
     for level in sorted(levels, key=lambda item: item.price):
         if remaining <= 0:
+            break
+        if limit_price is not None and level.price > limit_price:
             break
         take = min(level.size, remaining)
         if take <= 0:
@@ -29,10 +36,17 @@ def simulate_buy_fill(levels: tuple[PriceLevel, ...], target_size: float) -> Sim
         remaining -= take
     if filled <= 0:
         return None
+    if not allow_partial and filled + 1e-12 < target_size:
+        return None
     return SimFill(avg_price=cost / filled, filled_size=filled, notional=cost)
 
 
-def simulate_sell_fill(levels: tuple[PriceLevel, ...], target_size: float) -> SimFill | None:
+def simulate_sell_fill(
+    levels: tuple[PriceLevel, ...],
+    target_size: float,
+    limit_price: float | None = None,
+    allow_partial: bool = True,
+) -> SimFill | None:
     if target_size <= 0:
         return None
     remaining = target_size
@@ -41,6 +55,8 @@ def simulate_sell_fill(levels: tuple[PriceLevel, ...], target_size: float) -> Si
     for level in sorted(levels, key=lambda item: item.price, reverse=True):
         if remaining <= 0:
             break
+        if limit_price is not None and level.price < limit_price:
+            break
         take = min(level.size, remaining)
         if take <= 0:
             continue
@@ -48,5 +64,7 @@ def simulate_sell_fill(levels: tuple[PriceLevel, ...], target_size: float) -> Si
         filled += take
         remaining -= take
     if filled <= 0:
+        return None
+    if not allow_partial and filled + 1e-12 < target_size:
         return None
     return SimFill(avg_price=proceeds / filled, filled_size=filled, notional=proceeds)

@@ -556,7 +556,7 @@ class ArbOrchestrator:
                     market_id=str(leg["market_id"]),
                     token_id=str(leg["token_id"]),
                     side=str(leg.get("side", "BUY")).upper(),
-                    order_type="IOC" if signal.mode == RunMode.LIVE else "PAPER",
+                    order_type=self.config.live_order_type,
                     limit_price=float(leg.get("price")) if leg.get("price") is not None else None,
                     shares=float(shares) if shares is not None else None,
                     notional_usd=float(notional) if notional is not None else None,

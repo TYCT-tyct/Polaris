@@ -63,7 +63,15 @@ class OrderRouter:
                         )
                     )
                 continue
-            fill = _simulate_intent_fill(intent.limit_price, intent.shares, intent.notional_usd, intent.side, snap)
+            fill, reject_reason, requested = _simulate_intent_fill(
+                intent.limit_price,
+                intent.shares,
+                intent.notional_usd,
+                intent.side,
+                snap,
+                order_type=intent.order_type,
+                slippage_bps=self.config.slippage_bps,
+            )
             if fill is None:
                 if persist:
                     event_rows.append(
@@ -71,7 +79,7 @@ class OrderRouter:
                             str(intent.intent_id),
                             "reject",
                             422,
-                            "insufficient_liquidity",
+                            reject_reason,
                             json.dumps({}, ensure_ascii=True),
                         )
                     )
@@ -79,16 +87,19 @@ class OrderRouter:
             fills.append(fill)
             total_notional += fill.fill_notional_usd
             if persist:
+                event_name = "partial_fill" if fill.fill_size + 1e-12 < requested else "fill"
+                message = "paper_partial_fill" if event_name == "partial_fill" else "paper_fill"
                 event_rows.append(
                     (
                         str(intent.intent_id),
-                        "fill",
+                        event_name,
                         200,
-                        "paper_fill",
+                        message,
                         json.dumps(
                             {
                                 "price": fill.fill_price,
                                 "size": fill.fill_size,
+                                "requested_size": requested,
                                 "notional": fill.fill_notional_usd,
                             },
                             ensure_ascii=True,
@@ -622,24 +633,51 @@ def _simulate_intent_fill(
     notional_usd: float | None,
     side: str,
     snap: TokenSnapshot,
-) -> FillEvent | None:
+    order_type: str,
+    slippage_bps: int,
+) -> tuple[FillEvent | None, str, float]:
     wanted = _resolve_shares(limit_price, shares, notional_usd, side, snap)
     if wanted <= 0:
-        return None
+        return None, "invalid_size", 0.0
+    price = _resolve_price(limit_price, side, snap)
+    if price <= 0:
+        return None, "invalid_price", wanted
+    normalized = _normalize_order_params(price, wanted, side, snap)
+    if normalized is None:
+        return None, "below_min_order_size", wanted
+    norm_price, norm_shares = normalized
+    if not _preflight_price_ok(side, norm_price, snap, slippage_bps):
+        return None, "preflight_price_drift", norm_shares
+    order_type = (order_type or "FAK").strip().upper()
+    allow_partial = order_type in {"FAK", "IOC", "PAPER"}
     if side.upper() == "BUY":
-        sim = simulate_buy_fill(snap.asks, wanted)
+        sim = simulate_buy_fill(
+            snap.asks,
+            norm_shares,
+            limit_price=norm_price,
+            allow_partial=allow_partial,
+        )
     else:
-        sim = simulate_sell_fill(snap.bids, wanted)
+        sim = simulate_sell_fill(
+            snap.bids,
+            norm_shares,
+            limit_price=norm_price,
+            allow_partial=allow_partial,
+        )
     if sim is None:
-        return None
-    return FillEvent(
-        token_id=snap.token_id,
-        market_id=snap.market_id,
-        side=side.upper(),
-        fill_price=sim.avg_price,
-        fill_size=sim.filled_size,
-        fill_notional_usd=sim.notional,
-        fee_usd=0.0,
+        return None, "insufficient_liquidity", norm_shares
+    return (
+        FillEvent(
+            token_id=snap.token_id,
+            market_id=snap.market_id,
+            side=side.upper(),
+            fill_price=sim.avg_price,
+            fill_size=sim.filled_size,
+            fill_notional_usd=sim.notional,
+            fee_usd=0.0,
+        ),
+        "ok",
+        norm_shares,
     )
 
 
