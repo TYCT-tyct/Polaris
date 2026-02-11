@@ -71,6 +71,8 @@
   `python -m polaris.cli arb-export --table arb_trade_result --format csv --since-hours 24`
 - 基准压测（延迟 p50/p95）：
   `python -m polaris.cli arb-benchmark --mode paper_live --rounds 30 --warmup 3`
+- T2T/Jitter 基准（真实订单簿更新口径）：
+  `python -m polaris.cli arb-benchmark-t2t --backend both --iterations 120 --updates 1000 --levels-per-side 250 --output benchmarks/t2t_compare.json`
 
 `arb-summary` 输出重点：
 - `totals.signals_found`：发现机会总数。
@@ -104,3 +106,10 @@
 - `POLARIS_ARB_LIVE_PREFLIGHT_FORCE_REFRESH=false`：是否强制每单二次拉盘口，默认关闭以减少延迟。
 - `POLARIS_ARB_RUST_BRIDGE_ENABLED=false`：默认关闭，稳定后再切到 `true`。
 - 说明：系统已内置 `/books` 的 400/413 自动拆分回退，不会因为单个大批次失败而整轮中断。
+
+## 8. T2T 基准解读
+- `avg_update_us`：每个 tick 的平均处理耗时（越低越好）。
+- `p95_update_us/p99_update_us`：延迟尾部与抖动（实盘更关注）。
+- `decode_ms`：JSON 解包成本。
+- `process_ms`：订单簿更新+spread/depth 计算成本。
+- `rust_vs_python_speedup`：`>1` 表示 Rust 更快，`<1` 表示 Python 更快。

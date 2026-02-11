@@ -15,6 +15,12 @@ from typing import Annotated
 
 import typer
 
+from polaris.arb.bench.t2t import (
+    dump_payload_json,
+    generate_t2t_payload,
+    load_payload_json,
+    run_python_t2t_benchmark,
+)
 from polaris.arb.ai.gate import AiGate
 from polaris.arb.cli import parse_iso_datetime, parse_run_mode
 from polaris.arb.config import arb_config_from_settings
@@ -956,6 +962,105 @@ def _summarize_cycle_stats(rows: list[dict[str, int]]) -> dict[str, object]:
             "max": round(max(values), 2) if values else 0.0,
         }
     return summary
+
+
+@app.command("arb-benchmark-t2t")
+def arb_benchmark_t2t(
+    backend: Annotated[str, typer.Option("--backend", help="python|rust|both")] = "both",
+    input_path: Annotated[str, typer.Option("--input", help="Optional JSON payload path")] = "",
+    output: Annotated[str, typer.Option("--output", help="Optional output json path")] = "",
+    iterations: Annotated[int, typer.Option("--iterations", min=1, max=500)] = 120,
+    updates: Annotated[int, typer.Option("--updates", min=100, max=5000)] = 1000,
+    levels_per_side: Annotated[int, typer.Option("--levels-per-side", min=50, max=2000)] = 250,
+    seed: Annotated[int, typer.Option("--seed")] = 42,
+) -> None:
+    """Benchmark tick-to-trade hot path: decode -> orderbook update -> spread/depth."""
+    refresh_process_env_from_file(preserve_existing=True)
+    load_settings.cache_clear()
+    settings = load_settings()
+    setup_logging(settings.log_level)
+    _ensure_windows_selector_loop()
+
+    normalized = backend.strip().lower()
+    if normalized not in {"python", "rust", "both"}:
+        raise typer.BadParameter("backend must be python|rust|both")
+
+    if input_path:
+        raw = Path(input_path).expanduser().read_text(encoding="utf-8")
+        payload = load_payload_json(raw)
+        payload["iterations"] = iterations
+    else:
+        payload = generate_t2t_payload(
+            levels_per_side=levels_per_side,
+            updates=updates,
+            iterations=iterations,
+            seed=seed,
+        )
+
+    payload_json = dump_payload_json(payload)
+    report: dict[str, object] = {
+        "generated_at": datetime.now(tz=UTC).isoformat(),
+        "payload": {
+            "iterations": int(payload.get("iterations", 0) or 0),
+            "updates": len(payload.get("updates", [])) if isinstance(payload.get("updates"), list) else 0,
+            "levels_per_side": len(payload.get("initial_bids", [])) if isinstance(payload.get("initial_bids"), list) else 0,
+        },
+        "results": {},
+    }
+
+    if normalized in {"python", "both"}:
+        report["results"]["python"] = run_python_t2t_benchmark(payload)
+
+    if normalized in {"rust", "both"}:
+        rust_bin = settings.arb_rust_bridge_bin
+        try:
+            completed = subprocess.run(
+                [rust_bin, "bench-orderbook"],
+                input=payload_json,
+                text=True,
+                check=False,
+                capture_output=True,
+                timeout=max(10, iterations * 2),
+            )
+        except FileNotFoundError:
+            report["results"]["rust"] = {"error": "rust_binary_not_found", "binary": rust_bin}
+        else:
+            if completed.returncode != 0:
+                report["results"]["rust"] = {
+                    "error": "rust_benchmark_failed",
+                    "binary": rust_bin,
+                    "returncode": completed.returncode,
+                    "stderr": completed.stderr.strip()[:400],
+                }
+            else:
+                try:
+                    report["results"]["rust"] = json.loads(completed.stdout)
+                except json.JSONDecodeError:
+                    report["results"]["rust"] = {
+                        "error": "rust_output_invalid_json",
+                        "binary": rust_bin,
+                    }
+
+    if "python" in report["results"] and "rust" in report["results"]:
+        py = report["results"]["python"]
+        ru = report["results"]["rust"]
+        if isinstance(py, dict) and isinstance(ru, dict):
+            py_avg = float(py.get("avg_update_us", 0.0) or 0.0)
+            ru_avg = float(ru.get("avg_update_us", 0.0) or 0.0)
+            if py_avg > 0 and ru_avg > 0:
+                report["comparison"] = {
+                    "python_avg_update_us": round(py_avg, 6),
+                    "rust_avg_update_us": round(ru_avg, 6),
+                    "rust_vs_python_speedup": round(py_avg / ru_avg, 6),
+                }
+
+    text = json.dumps(report, ensure_ascii=False, indent=2)
+    typer.echo(text)
+    if output:
+        out_path = Path(output).expanduser()
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(text, encoding="utf-8")
+        typer.echo(f"t2t benchmark report saved: {out_path}")
 
 
 if __name__ == "__main__":

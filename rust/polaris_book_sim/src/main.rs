@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{self, BufRead, BufWriter, Read, Write};
+use std::time::Instant;
 
 #[derive(Debug, Deserialize)]
 struct InputPayload {
@@ -87,12 +88,47 @@ struct SimFill {
     notional: f64,
 }
 
+#[derive(Debug, Deserialize)]
+struct BenchPayload {
+    iterations: Option<usize>,
+    depth_pct: Option<f64>,
+    initial_bids: Vec<Level>,
+    initial_asks: Vec<Level>,
+    updates: Vec<BenchUpdate>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BenchUpdate {
+    side: String,
+    price: f64,
+    size: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct BenchOutput {
+    iterations: usize,
+    updates_per_iteration: usize,
+    total_updates: usize,
+    decode_ms: f64,
+    process_ms: f64,
+    total_ms: f64,
+    avg_update_us: f64,
+    p50_update_us: f64,
+    p95_update_us: f64,
+    p99_update_us: f64,
+    max_update_us: f64,
+    spread_avg: f64,
+    bid_depth_1pct_avg: f64,
+    ask_depth_1pct_avg: f64,
+}
+
 fn main() {
     let mut args = std::env::args().skip(1);
     let command = args.next().unwrap_or_default();
     match command.as_str() {
         "simulate-paper" => run_once(),
         "daemon" => run_daemon(),
+        "bench-orderbook" => run_bench_orderbook(),
         _ => {
             eprintln!("unsupported command: {}", command);
             std::process::exit(2);
@@ -181,6 +217,193 @@ fn write_response(writer: &mut BufWriter<io::StdoutLock<'_>>, envelope: Response
     writer.write_all(text.as_bytes())?;
     writer.write_all(b"\n")?;
     writer.flush()
+}
+
+fn run_bench_orderbook() {
+    let total_started = Instant::now();
+    let mut raw = String::new();
+    if io::stdin().read_to_string(&mut raw).is_err() {
+        eprintln!("failed to read bench payload");
+        std::process::exit(2);
+    }
+
+    let decode_started = Instant::now();
+    let payload: BenchPayload = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(err) => {
+            eprintln!("invalid bench payload: {}", err);
+            std::process::exit(2);
+        }
+    };
+    let decode_ms = decode_started.elapsed().as_secs_f64() * 1000.0;
+    let output = run_bench(payload, decode_ms, total_started);
+    match serde_json::to_string(&output) {
+        Ok(text) => println!("{}", text),
+        Err(err) => {
+            eprintln!("failed to encode bench output: {}", err);
+            std::process::exit(2);
+        }
+    }
+}
+
+fn run_bench(payload: BenchPayload, decode_ms: f64, total_started: Instant) -> BenchOutput {
+    let iterations = payload.iterations.unwrap_or(100).max(1);
+    let depth_pct = payload.depth_pct.unwrap_or(1.0).max(0.01);
+    let updates_per_iteration = payload.updates.len();
+    if updates_per_iteration == 0 {
+        let total_ms = total_started.elapsed().as_secs_f64() * 1000.0;
+        return BenchOutput {
+            iterations,
+            updates_per_iteration: 0,
+            total_updates: 0,
+            decode_ms: round6(decode_ms),
+            process_ms: 0.0,
+            total_ms: round6(total_ms),
+            avg_update_us: 0.0,
+            p50_update_us: 0.0,
+            p95_update_us: 0.0,
+            p99_update_us: 0.0,
+            max_update_us: 0.0,
+            spread_avg: 0.0,
+            bid_depth_1pct_avg: 0.0,
+            ask_depth_1pct_avg: 0.0,
+        };
+    }
+
+    let seed_bids = to_book(&payload.initial_bids);
+    let seed_asks = to_book(&payload.initial_asks);
+
+    let mut update_latency_us: Vec<f64> = Vec::with_capacity(iterations * updates_per_iteration);
+    let mut spread_sum = 0.0;
+    let mut spread_count = 0usize;
+    let mut bid_depth_sum = 0.0;
+    let mut ask_depth_sum = 0.0;
+    let mut depth_count = 0usize;
+
+    let process_started = Instant::now();
+    for _ in 0..iterations {
+        let mut bids = seed_bids.clone();
+        let mut asks = seed_asks.clone();
+        for upd in &payload.updates {
+            let tick_started = Instant::now();
+            let side = upd.side.trim().to_ascii_uppercase();
+            let tick = to_tick(upd.price);
+            if tick > 0 {
+                if side == "BID" {
+                    apply_update(&mut bids, tick, upd.size);
+                } else if side == "ASK" {
+                    apply_update(&mut asks, tick, upd.size);
+                }
+            }
+
+            let best_bid_tick = bids.keys().next_back().copied().unwrap_or(0);
+            let best_ask_tick = asks.keys().next().copied().unwrap_or(0);
+            if best_bid_tick > 0 && best_ask_tick > 0 {
+                let best_bid = tick_to_price(best_bid_tick);
+                let best_ask = tick_to_price(best_ask_tick);
+                spread_sum += best_ask - best_bid;
+                spread_count += 1;
+                bid_depth_sum += depth_within_pct(&bids, best_bid_tick, depth_pct, true);
+                ask_depth_sum += depth_within_pct(&asks, best_ask_tick, depth_pct, false);
+                depth_count += 1;
+            }
+            update_latency_us.push(tick_started.elapsed().as_secs_f64() * 1_000_000.0);
+        }
+    }
+    let process_ms = process_started.elapsed().as_secs_f64() * 1000.0;
+    let total_ms = total_started.elapsed().as_secs_f64() * 1000.0;
+    let max_update = update_latency_us
+        .iter()
+        .copied()
+        .fold(0.0_f64, f64::max);
+
+    BenchOutput {
+        iterations,
+        updates_per_iteration,
+        total_updates: iterations * updates_per_iteration,
+        decode_ms: round6(decode_ms),
+        process_ms: round6(process_ms),
+        total_ms: round6(total_ms),
+        avg_update_us: round6(mean(&update_latency_us)),
+        p50_update_us: round6(percentile(&update_latency_us, 50.0)),
+        p95_update_us: round6(percentile(&update_latency_us, 95.0)),
+        p99_update_us: round6(percentile(&update_latency_us, 99.0)),
+        max_update_us: round6(max_update),
+        spread_avg: round6(if spread_count > 0 { spread_sum / spread_count as f64 } else { 0.0 }),
+        bid_depth_1pct_avg: round6(if depth_count > 0 { bid_depth_sum / depth_count as f64 } else { 0.0 }),
+        ask_depth_1pct_avg: round6(if depth_count > 0 { ask_depth_sum / depth_count as f64 } else { 0.0 }),
+    }
+}
+
+fn to_book(levels: &[Level]) -> BTreeMap<i64, f64> {
+    let mut out = BTreeMap::new();
+    for level in levels {
+        let tick = to_tick(level.price);
+        if tick <= 0 || level.size <= 0.0 {
+            continue;
+        }
+        out.insert(tick, level.size);
+    }
+    out
+}
+
+fn apply_update(book: &mut BTreeMap<i64, f64>, tick: i64, size: f64) {
+    if size <= 0.0 {
+        book.remove(&tick);
+    } else {
+        book.insert(tick, size);
+    }
+}
+
+fn depth_within_pct(book: &BTreeMap<i64, f64>, best_tick: i64, pct: f64, is_bid: bool) -> f64 {
+    if best_tick <= 0 {
+        return 0.0;
+    }
+    let best = tick_to_price(best_tick);
+    let mut total = 0.0;
+    for (tick, size) in book {
+        let price = tick_to_price(*tick);
+        let dist = if is_bid {
+            ((best - price) / best) * 100.0
+        } else {
+            ((price - best) / best) * 100.0
+        };
+        if dist <= pct {
+            total += *size;
+        }
+    }
+    total
+}
+
+fn to_tick(price: f64) -> i64 {
+    ((price * 1_000_000.0).round()) as i64
+}
+
+fn tick_to_price(tick: i64) -> f64 {
+    tick as f64 / 1_000_000.0
+}
+
+fn mean(values: &[f64]) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let sum: f64 = values.iter().sum();
+    sum / values.len() as f64
+}
+
+fn percentile(values: &[f64], p: f64) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
+    let pos = ((p / 100.0) * (sorted.len() as f64 - 1.0)).round();
+    let idx = pos.max(0.0).min(sorted.len() as f64 - 1.0) as usize;
+    sorted[idx]
+}
+
+fn round6(value: f64) -> f64 {
+    (value * 1_000_000.0).round() / 1_000_000.0
 }
 
 fn simulate(payload: InputPayload) -> OutputPayload {

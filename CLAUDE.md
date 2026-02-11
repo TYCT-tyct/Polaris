@@ -54,6 +54,9 @@
 │  │  ├─ orchestrator.py
 │  │  ├─ cli.py
 │  │  ├─ reporting.py
+│  │  ├─ bench/
+│  │  │  ├─ __init__.py
+│  │  │  └─ t2t.py
 │  │  ├─ strategies/
 │  │  │  ├─ __init__.py
 │  │  │  ├─ common.py
@@ -105,7 +108,8 @@
    ├─ test_arb_live_scan.py
    ├─ test_arb_replay_real.py
    ├─ test_arb_reporting.py
-   └─ test_order_router_preflight.py
+   ├─ test_order_router_preflight.py
+   └─ test_t2t_benchmark.py
 ```
 
 ## 模块职责
@@ -115,6 +119,7 @@
 - `polaris/arb/strategies/*`：策略检测器（A/B/C/F/G）。
 - `polaris/arb/execution/*`：执行路由、成交模拟、仓位与风险控制。
 - `polaris/arb/execution/rust_bridge.py`：可选 Rust 二进制桥接，承载低抖动 paper/replay 撮合热路径。
+- `polaris/arb/bench/t2t.py`：T2T/Jitter 基准，覆盖 JSON 解包、订单簿更新与深度计算。
 - `polaris/arb/ai/*`：G 策略可选 AI 复核层（google/claude/gpt/minimax/zhipu）。
 - `polaris/ops/exporter.py`：统一导出 Module1/2 关键表与视图。
 - `rust/polaris_book_sim`：Rust 订单簿撮合模拟器，供 Module2 可选调用。
@@ -145,3 +150,4 @@
 - 2026-02-11：优化 Module2 执行链路并发与 Live 预检复用，新增 `tests/test_order_router_preflight.py`。
 - 2026-02-12：修复 `.env` 热更新覆盖语义、A/C NegRisk 分组过滤、持有型策略收益口径统一。
 - 2026-02-12：新增 `rust/polaris_book_sim` 与 `rust_bridge` 可选加速路径。
+- 2026-02-12：新增 `arb-benchmark-t2t` 与 Rust `bench-orderbook` 子命令，用于真实 tick 更新口径对比。
