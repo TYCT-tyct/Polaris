@@ -111,7 +111,7 @@ class OrderRouter:
             await self._record_order_events(event_rows)
             await self._record_fills(fill_rows)
 
-        gross, fees, slip = _estimate_trade_pnl(plan.signal.features, fills)
+        gross, fees, slip, expected_gross = _estimate_trade_pnl(plan.signal.features, fills, snapshots)
         return TradeResult(
             signal=plan.signal,
             status="filled" if fills else "rejected",
@@ -122,7 +122,13 @@ class OrderRouter:
             capital_used_usd=total_notional,
             hold_minutes=float(plan.signal.features.get("expected_hold_minutes", 0) or 0),
             fills=fills,
-            metadata={"mode": plan.signal.mode.value, "intent_count": len(plan.intents)},
+            metadata={
+                "mode": plan.signal.mode.value,
+                "intent_count": len(plan.intents),
+                "pnl_model": "mark_to_book",
+                "expected_gross_pnl_usd": expected_gross,
+                "mark_to_book_gross_pnl_usd": gross,
+            },
         )
 
     async def _execute_live(self, plan: ExecutionPlan, snapshots: dict[str, TokenSnapshot]) -> TradeResult:
@@ -357,7 +363,8 @@ class OrderRouter:
         await self._record_order_events(event_rows)
         await self._record_fills(fill_rows)
 
-        gross, fees, slip = _estimate_trade_pnl(plan.signal.features, fills)
+        snapshot_for_pnl = live_books if live_books else snapshots
+        gross, fees, slip, expected_gross = _estimate_trade_pnl(plan.signal.features, fills, snapshot_for_pnl)
         return TradeResult(
             signal=plan.signal,
             status="filled" if fills else ("submitted" if submitted > 0 else "error"),
@@ -375,6 +382,9 @@ class OrderRouter:
                 "rejected": rejected,
                 "live_order_type": self.config.live_order_type,
                 "preflight_refresh": refresh_preflight,
+                "pnl_model": "mark_to_book",
+                "expected_gross_pnl_usd": expected_gross,
+                "mark_to_book_gross_pnl_usd": gross,
             },
         )
 
@@ -614,15 +624,33 @@ def _simulate_intent_fill(
     )
 
 
-def _estimate_trade_pnl(features: dict[str, Any], fills: list[FillEvent]) -> tuple[float, float, float]:
+def _estimate_trade_pnl(
+    features: dict[str, Any],
+    fills: list[FillEvent],
+    snapshots: dict[str, TokenSnapshot],
+) -> tuple[float, float, float, float]:
     if not fills:
-        return 0.0, 0.0, 0.0
+        return 0.0, 0.0, 0.0, 0.0
     expected_edge = float(features.get("expected_edge_pct") or 0.0)
     notional = sum(f.fill_notional_usd for f in fills)
-    gross = notional * expected_edge
-    fees = sum(f.fill_notional_usd for f in fills) * 0.001
+    expected_gross = notional * expected_edge
+    mark_to_book = 0.0
+    for fill in fills:
+        snap = snapshots.get(fill.token_id)
+        if snap is None:
+            continue
+        if fill.side == "BUY":
+            unwind = simulate_sell_fill(snap.bids, fill.fill_size)
+            unwind_notional = unwind.notional if unwind is not None else 0.0
+            mark_to_book += unwind_notional - fill.fill_notional_usd
+        else:
+            unwind = simulate_buy_fill(snap.asks, fill.fill_size)
+            unwind_notional = unwind.notional if unwind is not None else fill.fill_notional_usd
+            mark_to_book += fill.fill_notional_usd - unwind_notional
+    gross = mark_to_book
+    fees = notional * 0.001
     slippage = float(features.get("expected_slippage_usd") or 0.0)
-    return gross, fees, slippage
+    return gross, fees, slippage, expected_gross
 
 
 def _normalize_order_params(price: float, shares: float, side: str, snap: TokenSnapshot) -> tuple[float, float] | None:
