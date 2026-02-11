@@ -3,13 +3,14 @@ from __future__ import annotations
 import asyncio
 import importlib
 import json
+import re
 import signal
 import subprocess
 import sys
 import os
 from contextlib import suppress
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from statistics import fmean
 from typing import Annotated
@@ -163,6 +164,27 @@ async def close_arb_runtime(ctx: ArbRuntimeContext) -> None:
     await ctx.orchestrator.close()
     await ctx.clob.close()
     await ctx.db.close()
+
+
+_RUN_TAG_ALLOWED = re.compile(r"[^a-z0-9_.-]+")
+
+
+def _sanitize_run_tag(value: str) -> str:
+    normalized = value.strip().lower()
+    normalized = _RUN_TAG_ALLOWED.sub("-", normalized)
+    normalized = normalized.strip("-")
+    if not normalized:
+        raise typer.BadParameter("run-tag cannot be empty after normalization")
+    return normalized[:64]
+
+
+def _resolve_run_tag_filter(raw: str, current_tag: str) -> str | None:
+    value = (raw or "").strip().lower()
+    if not value or value == "current":
+        return current_tag
+    if value == "all":
+        return None
+    return _sanitize_run_tag(raw)
 
 
 @app.command("migrate")
@@ -489,6 +511,7 @@ def backup(
 def arb_run(
     mode: Annotated[str, typer.Option("--mode", help="shadow|paper_live|live")] = "paper_live",
     source: Annotated[str, typer.Option("--source", help="Portfolio source tag")] = "polymarket",
+    run_tag: Annotated[str, typer.Option("--run-tag", help="auto|current|custom")] = "auto",
     paper_capital_scope: Annotated[
         str,
         typer.Option("--paper-capital-scope", help="shared|strategy (paper mode only)"),
@@ -499,6 +522,11 @@ def arb_run(
     refresh_process_env_from_file(preserve_existing=True)
     load_settings.cache_clear()
     settings = load_settings()
+    run_tag_value = run_tag.strip().lower()
+    if run_tag_value and run_tag_value not in {"auto", "current"}:
+        settings = settings.model_copy(update={"arb_run_tag": _sanitize_run_tag(run_tag)})
+    elif run_tag_value == "current":
+        settings = settings.model_copy(update={"arb_run_tag": arb_config_from_settings(settings).run_tag})
     scope = paper_capital_scope.strip().lower()
     if scope not in {"shared", "strategy"}:
         raise typer.BadParameter("paper-capital-scope must be shared or strategy")
@@ -621,6 +649,7 @@ def arb_paper_matrix_stop() -> None:
 def arb_replay(
     start: Annotated[str, typer.Option("--start", help="ISO datetime")] = "",
     end: Annotated[str, typer.Option("--end", help="ISO datetime")] = "",
+    run_tag: Annotated[str, typer.Option("--run-tag", help="auto|current|custom")] = "auto",
     fast: Annotated[
         bool,
         typer.Option("--fast/--full", help="Fast replay skips detailed signal/order/fill writes"),
@@ -632,6 +661,11 @@ def arb_replay(
     refresh_process_env_from_file(preserve_existing=True)
     load_settings.cache_clear()
     settings = load_settings()
+    run_tag_value = run_tag.strip().lower()
+    if run_tag_value and run_tag_value not in {"auto", "current"}:
+        settings = settings.model_copy(update={"arb_run_tag": _sanitize_run_tag(run_tag)})
+    elif run_tag_value == "current":
+        settings = settings.model_copy(update={"arb_run_tag": arb_config_from_settings(settings).run_tag})
     setup_logging(settings.log_level)
     _ensure_windows_selector_loop()
     start_ts = parse_iso_datetime(start)
@@ -671,6 +705,7 @@ def arb_optimize() -> None:
 @app.command("arb-report")
 def arb_report(
     group_by: Annotated[str, typer.Option("--group-by", help="strategy,mode,source,day")] = "strategy,mode,source",
+    run_tag: Annotated[str, typer.Option("--run-tag", help="current|all|custom")] = "current",
 ) -> None:
     """Show aggregated performance report for Module2."""
     refresh_process_env_from_file(preserve_existing=True)
@@ -682,7 +717,8 @@ def arb_report(
     async def _run() -> None:
         ctx = await create_arb_runtime(settings)
         try:
-            rows = await ctx.reporter.report(group_by=group_by)
+            run_tag_filter = _resolve_run_tag_filter(run_tag, ctx.orchestrator.config.run_tag)
+            rows = await ctx.reporter.report(group_by=group_by, run_tag=run_tag_filter)
             typer.echo(json.dumps(rows, ensure_ascii=False, indent=2, default=str))
         finally:
             await close_arb_runtime(ctx)
@@ -695,6 +731,7 @@ def arb_summary(
     since_hours: Annotated[int, typer.Option("--since-hours", min=1, max=24 * 30)] = 12,
     mode: Annotated[str, typer.Option("--mode", help="all|shadow|paper_live|paper_replay|live")] = "paper_live",
     source_code: Annotated[str, typer.Option("--source", help="source code, or all")] = "polymarket",
+    run_tag: Annotated[str, typer.Option("--run-tag", help="current|all|custom")] = "current",
     output: Annotated[str, typer.Option("--output", help="Optional JSON output path")] = "",
 ) -> None:
     """Show strategy-level overnight summary for Module2."""
@@ -715,10 +752,12 @@ def arb_summary(
     async def _run() -> None:
         ctx = await create_arb_runtime(settings)
         try:
+            run_tag_filter = _resolve_run_tag_filter(run_tag, ctx.orchestrator.config.run_tag)
             result = await ctx.reporter.summary(
                 since_hours=since_hours,
                 mode=mode_filter,
                 source_code=source_filter,
+                run_tag=run_tag_filter,
             )
             text = json.dumps(result, ensure_ascii=False, indent=2, default=str)
             if output:
@@ -737,6 +776,7 @@ def arb_summary(
 def arb_go_live_check(
     since_hours: Annotated[int, typer.Option("--since-hours", min=1, max=24 * 30)] = 24,
     source_code: Annotated[str, typer.Option("--source", help="source code, or all")] = "all",
+    run_tag: Annotated[str, typer.Option("--run-tag", help="current|all|custom")] = "current",
     min_trades: Annotated[int, typer.Option("--min-trades", min=1)] = 20,
     min_net_pnl_usd: Annotated[float, typer.Option("--min-net-pnl-usd")] = 0.0,
     min_win_rate: Annotated[float, typer.Option("--min-win-rate", min=0.0, max=1.0)] = 0.45,
@@ -756,10 +796,12 @@ def arb_go_live_check(
     async def _run() -> int:
         ctx = await create_arb_runtime(settings)
         try:
+            run_tag_filter = _resolve_run_tag_filter(run_tag, ctx.orchestrator.config.run_tag)
             summary = await ctx.reporter.summary(
                 since_hours=since_hours,
                 mode="paper_live",
                 source_code=source_filter,
+                run_tag=run_tag_filter,
             )
         finally:
             await close_arb_runtime(ctx)
@@ -796,6 +838,7 @@ def arb_go_live_check(
             "passed": len(reasons) == 0,
             "window_hours": since_hours,
             "source": source_filter or "all",
+            "run_tag": run_tag_filter or "all",
             "thresholds": {
                 "min_trades": min_trades,
                 "min_net_pnl_usd": min_net_pnl_usd,
@@ -849,6 +892,66 @@ def arb_export(
                 f"arb-export completed: table={result['table']} rows={result['rows']} "
                 f"format={result['export_format']} file={result['output_path']}"
             )
+        finally:
+            await close_arb_runtime(ctx)
+
+    asyncio.run(_run())
+
+
+@app.command("arb-clean")
+def arb_clean(
+    mode: Annotated[str, typer.Option("--mode", help="all|shadow|paper_live|paper_replay|live")] = "all",
+    source_code: Annotated[str, typer.Option("--source", help="source code, or all")] = "all",
+    run_tag: Annotated[str, typer.Option("--run-tag", help="current|all|custom")] = "all",
+    since_hours: Annotated[int, typer.Option("--since-hours", min=0, max=24 * 365)] = 0,
+    apply: Annotated[bool, typer.Option("--apply/--dry-run")] = False,
+) -> None:
+    """Clean historical Module2 data to avoid old-version contamination."""
+    refresh_process_env_from_file(preserve_existing=True)
+    load_settings.cache_clear()
+    settings = load_settings()
+    setup_logging(settings.log_level)
+    _ensure_windows_selector_loop()
+
+    allowed_modes = {"all", "shadow", "paper_live", "paper_replay", "live"}
+    mode_normalized = mode.strip().lower()
+    if mode_normalized not in allowed_modes:
+        raise typer.BadParameter("mode must be one of: all, shadow, paper_live, paper_replay, live")
+    source_normalized = source_code.strip().lower()
+    mode_filter = None if mode_normalized == "all" else mode_normalized
+    source_filter = None if source_normalized == "all" else source_normalized
+
+    async def _run() -> None:
+        ctx = await create_arb_runtime(settings)
+        try:
+            run_tag_filter = _resolve_run_tag_filter(run_tag, ctx.orchestrator.config.run_tag)
+            since_start = datetime.now(tz=UTC) - timedelta(hours=since_hours) if since_hours > 0 else None
+
+            counts = await _arb_cleanup_counts(
+                ctx.db,
+                mode_filter=mode_filter,
+                source_filter=source_filter,
+                run_tag_filter=run_tag_filter,
+                since_start=since_start,
+            )
+            payload: dict[str, object] = {
+                "mode": mode_filter or "all",
+                "source_code": source_filter or "all",
+                "run_tag": run_tag_filter or "all",
+                "since_start": since_start,
+                "counts": counts,
+                "applied": apply,
+            }
+            if apply:
+                deleted = await _arb_cleanup_apply(
+                    ctx.db,
+                    mode_filter=mode_filter,
+                    source_filter=source_filter,
+                    run_tag_filter=run_tag_filter,
+                    since_start=since_start,
+                )
+                payload["deleted"] = deleted
+            typer.echo(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
         finally:
             await close_arb_runtime(ctx)
 
@@ -924,6 +1027,137 @@ def _install_signal_handlers(stop_event: asyncio.Event, reload_event: asyncio.Ev
             loop.add_signal_handler(signal.SIGHUP, reload_event.set)
     except NotImplementedError:
         return
+
+
+async def _arb_cleanup_counts(
+    db: Database,
+    *,
+    mode_filter: str | None,
+    source_filter: str | None,
+    run_tag_filter: str | None,
+    since_start: datetime | None,
+) -> dict[str, int]:
+    params = (
+        mode_filter,
+        mode_filter,
+        source_filter,
+        source_filter,
+        run_tag_filter,
+        run_tag_filter,
+        since_start,
+        since_start,
+    )
+    tables = {
+        "arb_signal": "coalesce(features->>'run_tag', '')",
+        "arb_trade_result": "coalesce(metadata->>'run_tag', '')",
+        "arb_cash_ledger": "coalesce(payload->>'run_tag', '')",
+        "arb_risk_event": "coalesce(payload->>'run_tag', '')",
+        "arb_replay_run": "coalesce(metadata->>'run_tag', '')",
+    }
+    counts: dict[str, int] = {}
+    for table, run_tag_expr in tables.items():
+        row = await db.fetch_one(
+            f"""
+            select count(*) as c
+            from {table}
+            where (%s::text is null or mode = %s::text)
+              and (%s::text is null or source_code = %s::text)
+              and (%s::text is null or {run_tag_expr} = %s::text)
+              and (%s::timestamptz is null or created_at >= %s::timestamptz)
+            """,
+            params,
+        )
+        counts[table] = int(row["c"] or 0) if row else 0
+
+    replay_metric_row = await db.fetch_one(
+        """
+        select count(*) as c
+        from arb_replay_metric m
+        join arb_replay_run r on r.replay_run_id = m.replay_run_id
+        where (%s::text is null or r.mode = %s::text)
+          and (%s::text is null or coalesce(r.metadata->>'source_code', '') = %s::text)
+          and (%s::text is null or coalesce(r.metadata->>'run_tag', '') = %s::text)
+          and (%s::timestamptz is null or r.started_at >= %s::timestamptz)
+        """,
+        params,
+    )
+    counts["arb_replay_metric"] = int(replay_metric_row["c"] or 0) if replay_metric_row else 0
+    return counts
+
+
+async def _arb_cleanup_apply(
+    db: Database,
+    *,
+    mode_filter: str | None,
+    source_filter: str | None,
+    run_tag_filter: str | None,
+    since_start: datetime | None,
+) -> dict[str, int]:
+    params = (
+        mode_filter,
+        mode_filter,
+        source_filter,
+        source_filter,
+        run_tag_filter,
+        run_tag_filter,
+        since_start,
+        since_start,
+    )
+    deleted: dict[str, int] = {}
+
+    replay_runs = await db.fetch_all(
+        """
+        select replay_run_id
+        from arb_replay_run
+        where (%s::text is null or mode = %s::text)
+          and (%s::text is null or coalesce(metadata->>'source_code', '') = %s::text)
+          and (%s::text is null or coalesce(metadata->>'run_tag', '') = %s::text)
+          and (%s::timestamptz is null or started_at >= %s::timestamptz)
+        """,
+        params,
+    )
+    replay_ids = [row["replay_run_id"] for row in replay_runs]
+    if replay_ids:
+        await db.execute("delete from arb_replay_run where replay_run_id = any(%s)", (replay_ids,))
+    deleted["arb_replay_run"] = len(replay_ids)
+
+    row = await db.fetch_one(
+        """
+        with gone as (
+            delete from arb_param_snapshot
+            where (%s::text is null or coalesce(score_breakdown->>'run_tag', '') = %s::text)
+              and (%s::timestamptz is null or created_at >= %s::timestamptz)
+            returning 1
+        )
+        select count(*) as c from gone
+        """,
+        (run_tag_filter, run_tag_filter, since_start, since_start),
+    )
+    deleted["arb_param_snapshot"] = int(row["c"] or 0) if row else 0
+
+    for table, run_tag_expr in (
+        ("arb_risk_event", "coalesce(payload->>'run_tag', '')"),
+        ("arb_cash_ledger", "coalesce(payload->>'run_tag', '')"),
+        ("arb_trade_result", "coalesce(metadata->>'run_tag', '')"),
+        ("arb_signal", "coalesce(features->>'run_tag', '')"),
+    ):
+        row = await db.fetch_one(
+            f"""
+            with gone as (
+                delete from {table}
+                where (%s::text is null or mode = %s::text)
+                  and (%s::text is null or source_code = %s::text)
+                  and (%s::text is null or {run_tag_expr} = %s::text)
+                  and (%s::timestamptz is null or created_at >= %s::timestamptz)
+                returning 1
+            )
+            select count(*) as c from gone
+            """,
+            params,
+        )
+        deleted[table] = int(row["c"] or 0) if row else 0
+
+    return deleted
 
 
 def _default_export_path(table: str, export_format: ExportFormat) -> Path:

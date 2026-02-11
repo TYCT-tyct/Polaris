@@ -8,6 +8,7 @@ from polaris.arb.reporting import ArbReporter
 @pytest.mark.asyncio
 async def test_arb_summary_includes_strategy_totals_and_latency(db) -> None:
     reporter = ArbReporter(db)
+    run_tag = "unit-report"
 
     signal_a = "11111111-1111-1111-1111-111111111111"
     signal_f = "22222222-2222-2222-2222-222222222222"
@@ -23,19 +24,28 @@ async def test_arb_summary_includes_strategy_totals_and_latency(db) -> None:
             edge_pct, expected_pnl_usd, ttl_ms, features, status, decision_note, created_at
         ) values (
             %s, 'paper_live', 'A', 'polymarket', 'event-a', '{m-a}', '{t-a}',
-            0.03, 0.05, 10000, '{}'::jsonb, 'executed', 'a ok', now() - interval '90 minutes'
+            0.03, 0.05, 10000, %s::jsonb, 'executed', 'a ok', now() - interval '90 minutes'
         ), (
             %s, 'paper_live', 'F', 'polymarket', 'event-f', '{m-f}', '{t-f}',
-            0.02, 0.02, 10000, '{}'::jsonb, 'executed', 'f ok', now() - interval '80 minutes'
+            0.02, 0.02, 10000, %s::jsonb, 'executed', 'f ok', now() - interval '80 minutes'
         ), (
             %s, 'paper_live', 'G', 'polymarket', 'event-g', '{m-g}', '{t-g}',
-            0.01, 0.01, 10000, '{}'::jsonb, 'rejected', 'g rejected', now() - interval '70 minutes'
+            0.01, 0.01, 10000, %s::jsonb, 'rejected', 'g rejected', now() - interval '70 minutes'
         ), (
             %s, 'shadow', 'A', 'polymarket', 'event-shadow', '{m-s}', '{t-s}',
-            0.01, 0.01, 10000, '{}'::jsonb, 'new', 'shadow only', now() - interval '60 minutes'
+            0.01, 0.01, 10000, %s::jsonb, 'new', 'shadow only', now() - interval '60 minutes'
         )
         """,
-        (signal_a, signal_f, signal_g, signal_shadow),
+        (
+            signal_a,
+            '{"run_tag":"unit-report"}',
+            signal_f,
+            '{"run_tag":"unit-report"}',
+            signal_g,
+            '{"run_tag":"unit-report"}',
+            signal_shadow,
+            '{"run_tag":"unit-report"}',
+        ),
     )
 
     await db.execute(
@@ -79,14 +89,19 @@ async def test_arb_summary_includes_strategy_totals_and_latency(db) -> None:
         ) values (
             %s, 'paper_live', 'A', 'polymarket', 'filled', 0.06, 0.01, 0.00, 0.05,
             1.00, 10, now() - interval '90 minutes', now() - interval '80 minutes',
-            '{}'::jsonb, now() - interval '80 minutes'
+            %s::jsonb, now() - interval '80 minutes'
         ), (
             %s, 'paper_live', 'F', 'polymarket', 'filled', -0.01, 0.01, 0.00, -0.02,
             1.00, 20, now() - interval '80 minutes', now() - interval '60 minutes',
-            '{}'::jsonb, now() - interval '60 minutes'
+            %s::jsonb, now() - interval '60 minutes'
         )
         """,
-        (signal_a, signal_f),
+        (
+            signal_a,
+            '{"run_tag":"unit-report"}',
+            signal_f,
+            '{"run_tag":"unit-report"}',
+        ),
     )
 
     await db.execute(
@@ -95,12 +110,18 @@ async def test_arb_summary_includes_strategy_totals_and_latency(db) -> None:
             mode, strategy_code, source_code, event_type, severity, reason, payload, created_at
         ) values (
             'paper_live', 'G', 'polymarket', 'reject', 'warning', 'daily_stop_loss_triggered',
-            '{}'::jsonb, now() - interval '55 minutes'
+            %s::jsonb, now() - interval '55 minutes'
         )
-        """
+        """,
+        ('{"run_tag":"unit-report"}',),
     )
 
-    result = await reporter.summary(since_hours=12, mode="paper_live", source_code="polymarket")
+    result = await reporter.summary(
+        since_hours=12,
+        mode="paper_live",
+        source_code="polymarket",
+        run_tag=run_tag,
+    )
     totals = result["totals"]
 
     assert int(totals["signals_found"]) == 3
@@ -131,3 +152,24 @@ async def test_arb_summary_includes_strategy_totals_and_latency(db) -> None:
     assert result["risk_top"]
     assert result["risk_top"][0]["reason"] == "daily_stop_loss_triggered"
 
+
+@pytest.mark.asyncio
+async def test_arb_report_filters_by_run_tag(db) -> None:
+    reporter = ArbReporter(db)
+    await db.execute(
+        """
+        insert into arb_trade_result(
+            signal_id, mode, strategy_code, source_code, status, gross_pnl_usd, fees_usd,
+            slippage_usd, net_pnl_usd, capital_used_usd, hold_minutes, opened_at, closed_at,
+            metadata, created_at
+        ) values
+        (gen_random_uuid(), 'paper_live', 'A', 'polymarket', 'filled', 0.01, 0, 0, 0.01, 1, 1, now(), now(), '{"run_tag":"tag-a"}'::jsonb, now()),
+        (gen_random_uuid(), 'paper_live', 'A', 'polymarket', 'filled', 0.02, 0, 0, 0.02, 1, 1, now(), now(), '{"run_tag":"tag-b"}'::jsonb, now())
+        """
+    )
+
+    rows = await reporter.report(group_by="strategy", run_tag="tag-a")
+    assert len(rows) == 1
+    assert rows[0]["strategy_code"] == "A"
+    assert rows[0]["trades"] == 1
+    assert rows[0]["net_pnl_usd"] == pytest.approx(0.01)

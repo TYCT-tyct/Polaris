@@ -25,7 +25,9 @@
 - `python -m polaris.cli arb-run --mode shadow --once`
 - `python -m polaris.cli arb-replay --start 2026-02-10T00:00:00+00:00 --end 2026-02-10T06:00:00+00:00 --fast`
 - `python -m polaris.cli arb-replay --start 2026-02-10T00:00:00+00:00 --end 2026-02-10T06:00:00+00:00 --full`
-- `python -m polaris.cli arb-report --group-by strategy,mode,source`
+- `python -m polaris.cli arb-report --group-by strategy,mode,source --run-tag current`
+- `python -m polaris.cli arb-summary --since-hours 12 --mode paper_live --source polymarket_shared10 --run-tag current`
+- `python -m polaris.cli arb-clean --mode paper_live --source all --run-tag all --dry-run`
 - `python -m polaris.cli arb-export --table arb_trade_result --format csv --since-hours 24`
 
 ## 风控默认值（$10 起步）

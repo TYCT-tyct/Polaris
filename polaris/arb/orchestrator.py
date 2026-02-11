@@ -137,7 +137,7 @@ class ArbOrchestrator:
                         allowed=False,
                         level=RiskLevel.HARD_STOP,
                         reason="strategy_health_blocked",
-                        payload=health_payload,
+                        payload={**health_payload, "run_tag": self.config.run_tag},
                     ),
                 )
                 continue
@@ -231,7 +231,14 @@ class ArbOrchestrator:
                         before,
                         after,
                         str(signal.signal_id),
-                        json.dumps({"status": result.status}, ensure_ascii=True),
+                        json.dumps(
+                            {
+                                "status": result.status,
+                                "run_tag": self.config.run_tag,
+                                "execution_backend": self.config.execution_backend,
+                            },
+                            ensure_ascii=True,
+                        ),
                     )
                 )
                 lot_rows.extend(_position_rows(signal, result.fills, result.net_pnl_usd))
@@ -288,7 +295,20 @@ class ArbOrchestrator:
                 replay_run_id, mode, status, window_start, window_end, metadata, started_at
             ) values (%s, 'paper_replay', 'running', %s, %s, %s::jsonb, now())
             """,
-            (replay_run_id, window_start, window_end, json.dumps({"fast_mode": fast}, ensure_ascii=True)),
+            (
+                replay_run_id,
+                window_start,
+                window_end,
+                json.dumps(
+                    {
+                        "fast_mode": fast,
+                        "source_code": source_code,
+                        "run_tag": self.config.run_tag,
+                        "execution_backend": self.config.execution_backend,
+                    },
+                    ensure_ascii=True,
+                ),
+            ),
         )
 
         per_strategy: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
@@ -565,6 +585,12 @@ class ArbOrchestrator:
             signals.extend(self.strategy_g.scan(mode, source_code, snapshots))
         if self.config.enable_strategy_c:
             signals.extend(self.strategy_c.scan(mode, source_code, snapshots))
+        for signal in signals:
+            features = dict(signal.features)
+            features["run_tag"] = self.config.run_tag
+            features["execution_backend"] = self.config.execution_backend
+            features["rust_bridge_mode"] = self.config.rust_bridge_mode if self.config.rust_bridge_enabled else "off"
+            signal.features = features
         return _filter_safe_mode_signals(mode, signals, self.config.safe_arbitrage_only)
 
     def _order_signals(self, signals: list[ArbSignal]) -> list[ArbSignal]:
@@ -672,10 +698,11 @@ class ArbOrchestrator:
                 select balance_after_usd
                 from arb_cash_ledger
                 where mode = %s and source_code = %s
+                  and coalesce(payload->>'run_tag', '') = %s
                 order by created_at desc
                 limit 1
                 """,
-                (mode.value, source_code),
+                (mode.value, source_code, self.config.run_tag),
             )
         else:
             row = await self.db.fetch_one(
@@ -683,10 +710,11 @@ class ArbOrchestrator:
                 select balance_after_usd
                 from arb_cash_ledger
                 where mode = %s and source_code = %s and strategy_code = %s
+                  and coalesce(payload->>'run_tag', '') = %s
                 order by created_at desc
                 limit 1
                 """,
-                (mode.value, source_code, strategy_code.value),
+                (mode.value, source_code, strategy_code.value, self.config.run_tag),
             )
         if row:
             return float(row["balance_after_usd"])
@@ -713,7 +741,14 @@ class ArbOrchestrator:
                 balance_before,
                 after,
                 str(signal.signal_id),
-                json.dumps({"status": result.status}, ensure_ascii=True),
+                json.dumps(
+                    {
+                        "status": result.status,
+                        "run_tag": self.config.run_tag,
+                        "execution_backend": self.config.execution_backend,
+                    },
+                    ensure_ascii=True,
+                ),
             ),
         )
         return after
@@ -786,24 +821,23 @@ class ArbOrchestrator:
                 count(*) as trades
             from arb_trade_result
             where mode = 'paper_live'
+              and coalesce(metadata->>'run_tag', '') = %s
               and created_at >= now() - (%s || ' hours')::interval
             """,
-            (self.config.optimize_paper_hours,),
+            (self.config.run_tag, self.config.optimize_paper_hours),
         )
         replay = await self.db.fetch_one(
             """
             select
-                coalesce(sum(net_pnl_usd),0) as pnl,
-                coalesce(sum(max_drawdown_usd),0) as drawdown,
-                coalesce(sum(trades),0) as trades
-            from arb_replay_metric
-            where replay_run_id in (
-                select replay_run_id
-                from arb_replay_run
-                where started_at >= now() - (%s || ' days')::interval
-            )
+                coalesce(sum(m.net_pnl_usd),0) as pnl,
+                coalesce(sum(m.max_drawdown_usd),0) as drawdown,
+                coalesce(sum(m.trades),0) as trades
+            from arb_replay_metric m
+            join arb_replay_run r on r.replay_run_id = m.replay_run_id
+            where r.started_at >= now() - (%s || ' days')::interval
+              and coalesce(r.metadata->>'run_tag', '') = %s
             """,
-            (self.config.optimize_replay_days,),
+            (self.config.optimize_replay_days, self.config.run_tag),
         )
         paper_pnl = float(paper["pnl"]) if paper else 0.0
         paper_loss = float(paper["losses"]) if paper else 0.0
@@ -834,7 +868,7 @@ class ArbOrchestrator:
                     "module2",
                     version,
                     status,
-                    json.dumps(params, ensure_ascii=True),
+                    json.dumps({**params, "run_tag": self.config.run_tag}, ensure_ascii=True),
                     score,
                     json.dumps(
                         {
@@ -842,6 +876,8 @@ class ArbOrchestrator:
                             "paper_loss": paper_loss,
                             "replay_pnl": replay_pnl,
                             "replay_drawdown": replay_drawdown,
+                            "run_tag": self.config.run_tag,
+                            "execution_backend": self.config.execution_backend,
                         },
                         ensure_ascii=True,
                     ),
@@ -870,12 +906,14 @@ class ArbOrchestrator:
             where mode = %s
               and source_code = %s
               and strategy_code = %s
+              and coalesce(metadata->>'run_tag', '') = %s
               and created_at >= now() - (%s || ' hours')::interval
             """,
             (
                 signal.mode.value,
                 signal.source_code,
                 signal.strategy_code.value,
+                self.config.run_tag,
                 self.config.strategy_health_window_hours,
             ),
         )

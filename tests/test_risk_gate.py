@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 
 import pytest
@@ -35,6 +36,7 @@ async def test_risk_gate_blocks_after_daily_stop(db) -> None:
     )
     config = arb_config_from_settings(settings)
     gate = RiskGate(db, config)
+    run_tag = config.run_tag
 
     await db.execute(
         """
@@ -43,9 +45,10 @@ async def test_risk_gate_blocks_after_daily_stop(db) -> None:
             edge_pct, expected_pnl_usd, ttl_ms, features, status, decision_note, created_at
         ) values (
             gen_random_uuid(), 'paper_live', 'A', 'polymarket', 'event-x', '{m1}', '{t1}',
-            0.03, 0.03, 5000, '{}'::jsonb, 'executed', 'seed', now()
+            0.03, 0.03, 5000, %s::jsonb, 'executed', 'seed', now()
         )
-        """
+        """,
+        (json.dumps({"run_tag": run_tag}, ensure_ascii=True),),
     )
     await db.execute(
         """
@@ -53,12 +56,13 @@ async def test_risk_gate_blocks_after_daily_stop(db) -> None:
             signal_id, mode, strategy_code, source_code, status, gross_pnl_usd, fees_usd,
             slippage_usd, net_pnl_usd, capital_used_usd, hold_minutes, opened_at, closed_at, metadata, created_at
         )
-        select signal_id, 'paper_live', 'A', 'polymarket', 'filled', -0.60, 0, 0, -0.60, 1, 1, now(), now(), '{}'::jsonb, now()
+        select signal_id, 'paper_live', 'A', 'polymarket', 'filled', -0.60, 0, 0, -0.60, 1, 1, now(), now(), %s::jsonb, now()
         from arb_signal
         where mode = 'paper_live' and strategy_code = 'A' and source_code = 'polymarket'
         order by created_at desc
         limit 1
-        """
+        """,
+        (json.dumps({"run_tag": run_tag}, ensure_ascii=True),),
     )
 
     state = await gate.load_state(RunMode.PAPER_LIVE, "polymarket")
@@ -109,16 +113,22 @@ async def test_risk_gate_strategy_scope_uses_strategy_balance(db) -> None:
         database_url="postgresql://postgres:postgres@localhost:55432/polaris",
         arb_paper_initial_bankroll_usd=10.0,
     )
-    gate = RiskGate(db, arb_config_from_settings(settings))
+    config = arb_config_from_settings(settings)
+    gate = RiskGate(db, config)
+    run_tag = config.run_tag
     await db.execute(
         """
         insert into arb_cash_ledger(
             mode, strategy_code, source_code, entry_type, amount_usd,
             balance_before_usd, balance_after_usd, ref_signal_id, payload, created_at
         ) values
-        ('paper_live', 'A', 'scope-test', 'seed', 0, 10, 7, null, '{}'::jsonb, now()),
-        ('paper_live', 'G', 'scope-test', 'seed', 0, 10, 9, null, '{}'::jsonb, now() + interval '1 second')
-        """
+        ('paper_live', 'A', 'scope-test', 'seed', 0, 10, 7, null, %s::jsonb, now()),
+        ('paper_live', 'G', 'scope-test', 'seed', 0, 10, 9, null, %s::jsonb, now() + interval '1 second')
+        """,
+        (
+            json.dumps({"run_tag": run_tag}, ensure_ascii=True),
+            json.dumps({"run_tag": run_tag}, ensure_ascii=True),
+        ),
     )
     a_state = await gate.load_state(RunMode.PAPER_LIVE, "scope-test", strategy_code=StrategyCode.A)
     g_state = await gate.load_state(RunMode.PAPER_LIVE, "scope-test", strategy_code=StrategyCode.G)

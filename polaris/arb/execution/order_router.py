@@ -192,6 +192,8 @@ class OrderRouter:
                 "expected_gross_pnl_usd": expected_gross,
                 "mark_to_book_gross_pnl_usd": mark_to_book,
                 "entry_gross_pnl_usd": gross,
+                "run_tag": self.config.run_tag,
+                "execution_backend": self.config.execution_backend,
             },
         )
 
@@ -457,6 +459,8 @@ class OrderRouter:
                 "expected_gross_pnl_usd": expected_gross,
                 "mark_to_book_gross_pnl_usd": gross,
                 "entry_gross_pnl_usd": realized_gross,
+                "run_tag": self.config.run_tag,
+                "execution_backend": self.config.execution_backend,
             },
         )
 
@@ -537,7 +541,14 @@ class OrderRouter:
                 i.limit_price,
                 i.shares,
                 i.notional_usd,
-                json.dumps(i.payload, ensure_ascii=True),
+                json.dumps(
+                    {
+                        **i.payload,
+                        "run_tag": self.config.run_tag,
+                        "execution_backend": self.config.execution_backend,
+                    },
+                    ensure_ascii=True,
+                ),
             )
             for i in plan.intents
         ]
@@ -617,6 +628,9 @@ class OrderRouter:
 
     async def _record_trade_result(self, result: TradeResult, started_at: datetime) -> None:
         signal = result.signal
+        metadata = dict(result.metadata)
+        metadata["run_tag"] = self.config.run_tag
+        metadata["execution_backend"] = self.config.execution_backend
         await self.db.execute(
             """
             insert into arb_trade_result(
@@ -638,7 +652,7 @@ class OrderRouter:
                 result.capital_used_usd,
                 result.hold_minutes,
                 started_at,
-                json.dumps(result.metadata, ensure_ascii=True),
+                json.dumps(metadata, ensure_ascii=True),
             ),
         )
 

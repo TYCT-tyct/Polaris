@@ -9,11 +9,11 @@
 
 ## 2. 启动方式
 - 影子模式：
-  `python -m polaris.cli arb-run --mode shadow --source polymarket_shadow`
+  `python -m polaris.cli arb-run --mode shadow --source polymarket_shadow --run-tag auto`
 - 实时 paper：
-  `python -m polaris.cli arb-run --mode paper_live --source polymarket_shared10 --paper-capital-scope shared`
+  `python -m polaris.cli arb-run --mode paper_live --source polymarket_shared10 --paper-capital-scope shared --run-tag auto`
 - 实盘：
-  `python -m polaris.cli arb-run --mode live --source polymarket_live`
+  `python -m polaris.cli arb-run --mode live --source polymarket_live --run-tag auto`
 
 独立资金池（每个策略独立 10 美元）：
 `python -m polaris.cli arb-run --mode paper_live --source polymarket_isolated10 --paper-capital-scope strategy`
@@ -69,9 +69,15 @@
 
 ## 4. 报表与导出
 - 聚合报表：
-  `python -m polaris.cli arb-report --group-by strategy,mode,source`
+  `python -m polaris.cli arb-report --group-by strategy,mode,source --run-tag current`
 - 隔夜策略总结（推荐早晨查看）：
-  `python -m polaris.cli arb-summary --since-hours 12 --mode paper_live --source polymarket_shared10`
+  `python -m polaris.cli arb-summary --since-hours 12 --mode paper_live --source polymarket_shared10 --run-tag current`
+- 查看历史全部版本（用于横向对比）：
+  `python -m polaris.cli arb-summary --since-hours 24 --mode paper_live --source all --run-tag all`
+- 清理旧版本污染数据（先预览）：
+  `python -m polaris.cli arb-clean --mode paper_live --source all --run-tag all --since-hours 0 --dry-run`
+- 清理旧版本污染数据（执行删除）：
+  `python -m polaris.cli arb-clean --mode paper_live --source all --run-tag all --since-hours 0 --apply`
 - 导出隔夜总结到文件：
   `python -m polaris.cli arb-summary --since-hours 12 --mode paper_live --source polymarket_shared10 --output exports/overnight_summary_shared.json`
   `python -m polaris.cli arb-summary --since-hours 12 --mode paper_live --source polymarket_isolated10 --output exports/overnight_summary_isolated.json`

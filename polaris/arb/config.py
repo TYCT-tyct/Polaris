@@ -1,8 +1,16 @@
 from __future__ import annotations
 
+import hashlib
+import json
+import re
+import subprocess
 from dataclasses import dataclass
+from pathlib import Path
 
 from polaris.config import PolarisSettings
+
+_RUN_TAG_ALLOWED = re.compile(r"[^a-z0-9_.-]+")
+_ALLOWED_BACKENDS = {"python", "rust_daemon", "rust_subprocess", "rust_pyo3"}
 
 
 @dataclass(frozen=True)
@@ -20,10 +28,12 @@ class ArbConfig:
     execution_concurrency: int
     live_preflight_max_age_ms: int
     live_preflight_force_refresh: bool
+    execution_backend: str
     rust_bridge_enabled: bool
     rust_bridge_mode: str
     rust_bridge_bin: str
     rust_bridge_timeout_sec: int
+    run_tag: str
     signal_dedupe_ttl_sec: int
     scope_block_cooldown_sec: int
     safe_arbitrage_only: bool
@@ -79,6 +89,8 @@ class ArbConfig:
 
 
 def arb_config_from_settings(settings: PolarisSettings) -> ArbConfig:
+    execution_backend = _resolve_execution_backend(settings)
+    rust_enabled, rust_mode = _resolve_rust_bridge(execution_backend, settings)
     return ArbConfig(
         default_mode=settings.arb_default_mode,
         scan_interval_sec=settings.arb_scan_interval_sec,
@@ -93,10 +105,12 @@ def arb_config_from_settings(settings: PolarisSettings) -> ArbConfig:
         execution_concurrency=settings.arb_execution_concurrency,
         live_preflight_max_age_ms=settings.arb_live_preflight_max_age_ms,
         live_preflight_force_refresh=settings.arb_live_preflight_force_refresh,
-        rust_bridge_enabled=settings.arb_rust_bridge_enabled,
-        rust_bridge_mode=settings.arb_rust_bridge_mode.strip().lower(),
+        execution_backend=execution_backend,
+        rust_bridge_enabled=rust_enabled,
+        rust_bridge_mode=rust_mode,
         rust_bridge_bin=settings.arb_rust_bridge_bin,
         rust_bridge_timeout_sec=settings.arb_rust_bridge_timeout_sec,
+        run_tag=resolve_run_tag(settings),
         signal_dedupe_ttl_sec=settings.arb_signal_dedupe_ttl_sec,
         scope_block_cooldown_sec=settings.arb_scope_block_cooldown_sec,
         safe_arbitrage_only=settings.arb_safe_arbitrage_only,
@@ -145,3 +159,96 @@ def arb_config_from_settings(settings: PolarisSettings) -> ArbConfig:
         ai_provider_order=tuple(settings.ai_provider_order),
         ai_single_model=settings.arb_ai_single_model,
     )
+
+
+def resolve_run_tag(settings: PolarisSettings) -> str:
+    raw = (settings.arb_run_tag or "").strip()
+    if raw and raw.lower() != "auto":
+        return _sanitize_run_tag(raw)
+
+    code_rev = _current_code_revision()
+    signature = _arb_config_signature(settings)
+    return _sanitize_run_tag(f"auto-{code_rev}-{signature}")
+
+
+def _resolve_execution_backend(settings: PolarisSettings) -> str:
+    raw = (settings.arb_execution_backend or "").strip().lower()
+    aliases = {
+        "python": "python",
+        "rust-daemon": "rust_daemon",
+        "rust_daemon": "rust_daemon",
+        "daemon": "rust_daemon",
+        "rust-subprocess": "rust_subprocess",
+        "rust_subprocess": "rust_subprocess",
+        "subprocess": "rust_subprocess",
+        "rust-pyo3": "rust_pyo3",
+        "rust_pyo3": "rust_pyo3",
+        "pyo3": "rust_pyo3",
+    }
+    if raw in aliases:
+        return aliases[raw]
+    if raw in _ALLOWED_BACKENDS:
+        return raw
+
+    if settings.arb_rust_bridge_enabled:
+        mode = (settings.arb_rust_bridge_mode or "").strip().lower()
+        if mode == "subprocess":
+            return "rust_subprocess"
+        if mode == "pyo3":
+            return "rust_pyo3"
+        return "rust_daemon"
+    return "python"
+
+
+def _resolve_rust_bridge(execution_backend: str, settings: PolarisSettings) -> tuple[bool, str]:
+    if execution_backend == "python":
+        return False, "daemon"
+    if execution_backend == "rust_subprocess":
+        return True, "subprocess"
+    if execution_backend == "rust_pyo3":
+        return True, "pyo3"
+    if execution_backend == "rust_daemon":
+        return True, "daemon"
+    mode = (settings.arb_rust_bridge_mode or "daemon").strip().lower()
+    if mode not in {"daemon", "subprocess", "pyo3"}:
+        mode = "daemon"
+    return bool(settings.arb_rust_bridge_enabled), mode
+
+
+def _arb_config_signature(settings: PolarisSettings) -> str:
+    payload: dict[str, object] = {}
+    for key, value in settings.model_dump().items():
+        if not key.startswith("arb_"):
+            continue
+        if "api_key" in key:
+            continue
+        payload[key] = value
+    canonical = json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha1(canonical.encode("utf-8")).hexdigest()[:10]
+
+
+def _current_code_revision() -> str:
+    root = Path(__file__).resolve().parents[2]
+    try:
+        output = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=root,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=2,
+        )
+        value = output.strip().lower()
+        if value:
+            return value
+    except Exception:
+        pass
+    return "unknown"
+
+
+def _sanitize_run_tag(value: str) -> str:
+    normalized = value.strip().lower()
+    normalized = _RUN_TAG_ALLOWED.sub("-", normalized)
+    normalized = normalized.strip("-")
+    if not normalized:
+        return "default"
+    return normalized[:64]

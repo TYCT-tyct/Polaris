@@ -13,7 +13,7 @@ class ArbReporter:
     def __init__(self, db: Database) -> None:
         self.db = db
 
-    async def report(self, group_by: str = "strategy,mode,source") -> list[dict]:
+    async def report(self, group_by: str = "strategy,mode,source", run_tag: str | None = None) -> list[dict]:
         groups = [part.strip().lower() for part in group_by.split(",") if part.strip()]
         group_cols: list[str] = []
         mapping = {
@@ -37,16 +37,18 @@ class ArbReporter:
                 sum(gross_pnl_usd) as gross_pnl_usd,
                 sum(capital_used_usd) as turnover_usd
             from arb_trade_result
+            where (%s::text is null or coalesce(metadata->>'run_tag', '') = %s::text)
             group by {select_cols}
             order by net_pnl_usd desc nulls last
         """
-        return await self.db.fetch_all(sql)
+        return await self.db.fetch_all(sql, (run_tag, run_tag))
 
     async def summary(
         self,
         since_hours: int = 12,
         mode: str | None = "paper_live",
         source_code: str | None = "polymarket",
+        run_tag: str | None = None,
     ) -> dict[str, Any]:
         now_utc = datetime.now(tz=UTC)
         window_start = now_utc - timedelta(hours=max(1, since_hours))
@@ -59,6 +61,7 @@ class ArbReporter:
                 where created_at >= %s
                   and (%s::text is null or mode = %s::text)
                   and (%s::text is null or source_code = %s::text)
+                  and (%s::text is null or coalesce(features->>'run_tag', '') = %s::text)
             ),
             window_trades as (
                 select *
@@ -66,6 +69,7 @@ class ArbReporter:
                 where created_at >= %s
                   and (%s::text is null or mode = %s::text)
                   and (%s::text is null or source_code = %s::text)
+                  and (%s::text is null or coalesce(metadata->>'run_tag', '') = %s::text)
             )
             select
                 coalesce((select count(*) from window_signals), 0) as signals_found,
@@ -92,11 +96,15 @@ class ArbReporter:
                 mode,
                 source_code,
                 source_code,
+                run_tag,
+                run_tag,
                 window_start,
                 mode,
                 mode,
                 source_code,
                 source_code,
+                run_tag,
+                run_tag,
             ),
         )
 
@@ -108,6 +116,7 @@ class ArbReporter:
                 where created_at >= %s
                   and (%s::text is null or mode = %s::text)
                   and (%s::text is null or source_code = %s::text)
+                  and (%s::text is null or coalesce(features->>'run_tag', '') = %s::text)
             ),
             window_trades as (
                 select *
@@ -115,6 +124,7 @@ class ArbReporter:
                 where created_at >= %s
                   and (%s::text is null or mode = %s::text)
                   and (%s::text is null or source_code = %s::text)
+                  and (%s::text is null or coalesce(metadata->>'run_tag', '') = %s::text)
             ),
             signal_stats as (
                 select
@@ -218,11 +228,15 @@ class ArbReporter:
                 mode,
                 source_code,
                 source_code,
+                run_tag,
+                run_tag,
                 window_start,
                 mode,
                 mode,
                 source_code,
                 source_code,
+                run_tag,
+                run_tag,
             ),
         )
 
@@ -236,11 +250,12 @@ class ArbReporter:
             where created_at >= %s
               and (%s::text is null or mode = %s::text)
               and (%s::text is null or source_code = %s::text)
+              and (%s::text is null or coalesce(payload->>'run_tag', '') = %s::text)
             group by reason, severity
             order by events desc
             limit 15
             """,
-            (window_start, mode, mode, source_code, source_code),
+            (window_start, mode, mode, source_code, source_code, run_tag, run_tag),
         )
 
         totals = _normalize_row(totals_row or {})
@@ -256,6 +271,7 @@ class ArbReporter:
                 "end_at": now_utc,
                 "mode": mode or "all",
                 "source_code": source_code or "all",
+                "run_tag": run_tag or "all",
             },
             "totals": totals,
             "by_strategy": strategy_rows_normalized,

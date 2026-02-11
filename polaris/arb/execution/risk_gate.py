@@ -43,6 +43,7 @@ class RiskGate:
                     where mode = %s
                       and source_code = %s
                       { "and strategy_code = %s" if strategy_filter else "" }
+                      and coalesce(metadata->>'run_tag', '') = %s
                       and status in ('filled', 'submitted')
                       and coalesce(hold_minutes, 0) > 1
                       and created_at + (coalesce(hold_minutes, 0)::text || ' minutes')::interval > now()
@@ -53,6 +54,7 @@ class RiskGate:
                     where mode = %s
                       and source_code = %s
                       { "and strategy_code = %s" if strategy_filter else "" }
+                      and coalesce(metadata->>'run_tag', '') = %s
                       and created_at >= date_trunc('day', now())
                 ), 0) as day_pnl,
                 (
@@ -61,11 +63,12 @@ class RiskGate:
                     where mode = %s
                       and source_code = %s
                       { "and strategy_code = %s" if strategy_filter else "" }
+                      and coalesce(payload->>'run_tag', '') = %s
                     order by created_at desc
                     limit 1
                 ) as cash_balance
             """,
-            _load_state_params(mode.value, source_code, strategy_filter),
+            _load_state_params(mode.value, source_code, strategy_filter, self.config.run_tag),
         )
         exposure = float(row["exposure"]) if row else 0.0
         day_pnl = float(row["day_pnl"]) if row else 0.0
@@ -164,9 +167,10 @@ class RiskGate:
             from arb_trade_result
             where mode = %s
               and source_code = %s
+              and coalesce(metadata->>'run_tag', '') = %s
               and created_at >= date_trunc('day', now())
             """,
-            (mode.value, source_code),
+            (mode.value, source_code, self.config.run_tag),
         )
         return float(row["pnl"]) if row else 0.0
 
@@ -177,11 +181,12 @@ class RiskGate:
             from arb_trade_result
             where mode = %s
               and source_code = %s
+              and coalesce(metadata->>'run_tag', '') = %s
               and status in ('filled', 'submitted')
               and coalesce(hold_minutes, 0) > 1
               and created_at + (coalesce(hold_minutes, 0)::text || ' minutes')::interval > now()
             """,
-            (mode.value, source_code),
+            (mode.value, source_code, self.config.run_tag),
         )
         return float(row["exposure"]) if row else 0.0
 
@@ -221,6 +226,9 @@ class RiskGate:
         source_code: str,
         decision: RiskDecision,
     ) -> None:
+        payload = dict(decision.payload)
+        payload["run_tag"] = self.config.run_tag
+        payload["execution_backend"] = self.config.execution_backend
         await self.db.execute(
             """
             insert into arb_risk_event(
@@ -235,7 +243,7 @@ class RiskGate:
                 "risk_gate",
                 decision.level.value,
                 decision.reason,
-                json.dumps(decision.payload, ensure_ascii=True),
+                json.dumps(payload, ensure_ascii=True),
                 datetime.now(tz=UTC),
             ),
         )
@@ -248,26 +256,37 @@ class RiskGate:
         return
 
 
-def _load_state_params(mode_value: str, source_code: str, strategy_filter: str | None) -> tuple[object, ...]:
+def _load_state_params(
+    mode_value: str,
+    source_code: str,
+    strategy_filter: str | None,
+    run_tag: str,
+) -> tuple[object, ...]:
     if strategy_filter is None:
         return (
             mode_value,
             source_code,
+            run_tag,
             mode_value,
             source_code,
+            run_tag,
             mode_value,
             source_code,
+            run_tag,
         )
     return (
         mode_value,
         source_code,
         strategy_filter,
+        run_tag,
         mode_value,
         source_code,
         strategy_filter,
+        run_tag,
         mode_value,
         source_code,
         strategy_filter,
+        run_tag,
     )
 
 

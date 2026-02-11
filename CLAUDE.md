@@ -27,7 +27,8 @@
 │  │     ├─ 0001_init.sql
 │  │     ├─ 0002_partitions_indexes.sql
 │  │     ├─ 0003_module2_core.sql
-│  │     └─ 0004_module2_views.sql
+│  │     ├─ 0004_module2_views.sql
+│  │     └─ 0005_module2_run_tag_indexes.sql
 │  ├─ infra/
 │  │  ├─ __init__.py
 │  │  ├─ rate_limiter.py
@@ -144,6 +145,7 @@
 - A/C 策略扫描范围收敛为 NegRisk 市场组，避免在普通二元市场产生伪机会。
 - 持有型策略在开仓时使用 `entry_only` 收益口径，避免把未实现浮盈亏误计为已实现亏损。
 - 引入 Rust 桥接可选路径，支持 `daemon/subprocess/pyo3` 三种模式，默认关闭，稳定后按环境开关灰度开启。
+- Module2 全链路引入 `run_tag` 隔离（signal/trade/risk/cash/replay），报表默认看 `current`，避免旧版本数据污染当前收益判断。
 
 ## 变更日志
 - 2026-02-10：新增 Module2 迁移 `0003/0004` 与 `arb_*` 数据模型。
@@ -157,3 +159,4 @@
 - 2026-02-12：新增 `rust/polaris_book_sim` 与 `rust_bridge` 可选加速路径。
 - 2026-02-12：新增 `arb-benchmark-t2t` 与 Rust `bench-orderbook` 子命令，用于真实 tick 更新口径对比。
 - 2026-02-12：新增 `rust/polaris_pyo3` 与 `pyo3` 执行模式，支持同进程 Rust 基准与 paper 模拟。
+- 2026-02-12：新增 `0005_module2_run_tag_indexes.sql`、`arb-clean` 命令和 `run_tag` 报表过滤，修复旧配置混入历史报表问题。
