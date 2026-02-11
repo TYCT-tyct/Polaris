@@ -21,6 +21,10 @@ build/
 *.db
 backups/
 exports/
+benchmarks/
+bench_*.json
+benchmarks_*.json
+.tmp_*.tar
 
 # local notes / legacy artifacts
 analysis_final/
