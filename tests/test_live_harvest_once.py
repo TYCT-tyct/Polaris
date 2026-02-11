@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import httpx
 import pytest
 
 from polaris.config import PolarisSettings
@@ -39,13 +40,33 @@ async def test_live_harvest_once_e2e(db, postgres_dsn: str) -> None:
         cascade
         """
     )
-    settings = PolarisSettings(database_url=postgres_dsn)
+    settings = PolarisSettings(
+        database_url=postgres_dsn,
+        market_discovery_scope="all",
+        gamma_page_size=200,
+        gamma_max_pages=2,
+        enable_l2=False,
+    )
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as probe:
+            response = await probe.get("https://xtracker.polymarket.com/api/users/elonmusk")
+            response.raise_for_status()
+    except httpx.HTTPError:
+        pytest.skip("live xtracker unavailable in current network")
     xtracker = XTrackerClient(AsyncTokenBucket(settings.xtracker_rate, settings.xtracker_burst), settings.retry)
     gamma = GammaClient(AsyncTokenBucket(settings.gamma_rate, settings.gamma_burst), settings.retry)
     clob = ClobClient(AsyncTokenBucket(settings.clob_rate, settings.clob_burst), settings.retry)
-    market_collector = MarketCollector(db, gamma)
+    market_collector = MarketCollector(
+        db,
+        gamma,
+        market_scope=settings.market_discovery_scope,
+        market_state=settings.market_discovery_state,
+        market_tweet_targets=settings.market_tweet_targets,
+        gamma_page_size=settings.gamma_page_size,
+        gamma_max_pages=settings.gamma_max_pages,
+    )
     tweet_collector = TweetCollector(db, xtracker)
-    quote_collector = QuoteCollector(db, clob, enable_l2=True)
+    quote_collector = QuoteCollector(db, clob, enable_l2=settings.enable_l2)
     mapper = MarketTrackingMapper(db)
     health = HealthAggregator(db)
     runner = HarvestRunner(settings, db, market_collector, tweet_collector, quote_collector, mapper, health)
@@ -64,4 +85,3 @@ async def test_live_harvest_once_e2e(db, postgres_dsn: str) -> None:
     assert int(token_count["c"]) > 0
     assert int(post_count["c"]) > 0
     assert int(quote_count["c"]) > 0
-

@@ -156,6 +156,28 @@ async def test_arb_summary_includes_strategy_totals_and_latency(db) -> None:
 @pytest.mark.asyncio
 async def test_arb_report_filters_by_run_tag(db) -> None:
     reporter = ArbReporter(db)
+    signal_a = "aaaaaaaa-1111-1111-1111-111111111111"
+    signal_b = "bbbbbbbb-2222-2222-2222-222222222222"
+    await db.execute(
+        """
+        insert into arb_signal(
+            signal_id, mode, strategy_code, source_code, event_id, market_ids, token_ids,
+            edge_pct, expected_pnl_usd, ttl_ms, features, status, decision_note, created_at
+        ) values (
+            %s, 'paper_live', 'A', 'polymarket', 'event-a', '{m-a}', '{t-a}',
+            0.01, 0.01, 10000, %s::jsonb, 'executed', 'tag-a signal', now()
+        ), (
+            %s, 'paper_live', 'A', 'polymarket', 'event-b', '{m-b}', '{t-b}',
+            0.02, 0.02, 10000, %s::jsonb, 'executed', 'tag-b signal', now()
+        )
+        """,
+        (
+            signal_a,
+            '{"run_tag":"tag-a"}',
+            signal_b,
+            '{"run_tag":"tag-b"}',
+        ),
+    )
     await db.execute(
         """
         insert into arb_trade_result(
@@ -163,13 +185,15 @@ async def test_arb_report_filters_by_run_tag(db) -> None:
             slippage_usd, net_pnl_usd, capital_used_usd, hold_minutes, opened_at, closed_at,
             metadata, created_at
         ) values
-        (gen_random_uuid(), 'paper_live', 'A', 'polymarket', 'filled', 0.01, 0, 0, 0.01, 1, 1, now(), now(), '{"run_tag":"tag-a"}'::jsonb, now()),
-        (gen_random_uuid(), 'paper_live', 'A', 'polymarket', 'filled', 0.02, 0, 0, 0.02, 1, 1, now(), now(), '{"run_tag":"tag-b"}'::jsonb, now())
+        (%s, 'paper_live', 'A', 'polymarket', 'filled', 0.01, 0, 0, 0.01, 1, 1, now(), now(), '{"run_tag":"tag-a"}'::jsonb, now()),
+        (%s, 'paper_live', 'A', 'polymarket', 'filled', 0.02, 0, 0, 0.02, 1, 1, now(), now(), '{"run_tag":"tag-b"}'::jsonb, now())
         """
+        ,
+        (signal_a, signal_b),
     )
 
     rows = await reporter.report(group_by="strategy", run_tag="tag-a")
     assert len(rows) == 1
     assert rows[0]["strategy_code"] == "A"
     assert rows[0]["trades"] == 1
-    assert rows[0]["net_pnl_usd"] == pytest.approx(0.01)
+    assert float(rows[0]["net_pnl_usd"]) == pytest.approx(0.01)

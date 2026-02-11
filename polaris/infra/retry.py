@@ -16,6 +16,10 @@ def _is_retryable(exc: BaseException) -> bool:
         return True
     if isinstance(exc, httpx.NetworkError):
         return True
+    if isinstance(exc, httpx.RemoteProtocolError):
+        return True
+    if isinstance(exc, httpx.ReadError):
+        return True
     if isinstance(exc, httpx.HTTPStatusError):
         return exc.response.status_code in {429, 500, 502, 503, 504}
     return False
@@ -33,4 +37,3 @@ async def with_retry(fn: Callable[[], Any], config: RetryConfig) -> T:
                 return await fn()
     except RetryError as exc:
         raise exc.last_attempt.exception() from exc
-

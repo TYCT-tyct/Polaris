@@ -1,4 +1,5 @@
 import pytest
+import httpx
 
 from polaris.sources.gamma_client import GammaClient
 
@@ -42,3 +43,29 @@ async def test_iter_markets_without_fixed_page_cap() -> None:
     rows = await client.iter_markets(page_size=2, max_pages=None)
     assert [row["id"] for row in rows] == [1, 2, 3, 4, 5]
     assert client.calls == [(2, 0), (2, 2), (2, 4)]
+
+
+class _FlakyGammaClient(GammaClient):
+    def __init__(self):
+        self.calls = []
+        self._raised = False
+        self._rows = {
+            0: [{"id": 1}, {"id": 2}],
+            2: [{"id": 3}],
+        }
+
+    async def fetch_markets_page(self, limit: int, offset: int):
+        self.calls.append((limit, offset))
+        if offset == 0 and limit >= 4 and not self._raised:
+            self._raised = True
+            raise httpx.RemoteProtocolError("incomplete chunked read")
+        return self._rows.get(offset, [])
+
+
+@pytest.mark.asyncio
+async def test_iter_markets_reduces_page_size_on_chunked_read() -> None:
+    client = _FlakyGammaClient()
+    rows = await client.iter_markets(page_size=20, max_pages=None)
+    assert [row["id"] for row in rows] == [1, 2]
+    assert client.calls[0] == (20, 0)
+    assert client.calls[1] == (10, 0)

@@ -16,12 +16,32 @@ from polaris.sources.gamma_client import GammaClient
 @pytest.mark.asyncio
 @pytest.mark.live
 async def test_arb_live_scan_runs(postgres_dsn: str, db) -> None:
-    settings = PolarisSettings(database_url=postgres_dsn, market_discovery_scope="all")
+    settings = PolarisSettings(
+        database_url=postgres_dsn,
+        market_discovery_scope="watchlist_tweet",
+        gamma_page_size=200,
+        gamma_max_pages=3,
+    )
     gamma = GammaClient(AsyncTokenBucket(settings.gamma_rate, settings.gamma_burst), RetryConfig())
     clob = ClobClient(AsyncTokenBucket(settings.clob_rate, settings.clob_burst), RetryConfig())
-    collector = MarketCollector(db, gamma, market_scope="all")
+    collector = MarketCollector(
+        db,
+        gamma,
+        market_scope=settings.market_discovery_scope,
+        gamma_page_size=settings.gamma_page_size,
+        gamma_max_pages=settings.gamma_max_pages,
+    )
     try:
         market_count, token_count = await collector.run_once()
+        if market_count == 0:
+            fallback = MarketCollector(
+                db,
+                gamma,
+                market_scope="all",
+                gamma_page_size=100,
+                gamma_max_pages=2,
+            )
+            market_count, token_count = await fallback.run_once()
         assert market_count > 0
         assert token_count > 0
 

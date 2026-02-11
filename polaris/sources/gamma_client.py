@@ -41,18 +41,28 @@ class GammaClient:
 
     async def iter_markets(self, page_size: int = 500, max_pages: int | None = None) -> list[dict[str, Any]]:
         all_rows: list[dict[str, Any]] = []
-        page = 0
+        offset = 0
+        fetched_pages = 0
+        current_page_size = max(1, page_size)
         while True:
-            if max_pages is not None and max_pages > 0 and page >= max_pages:
+            if max_pages is not None and max_pages > 0 and fetched_pages >= max_pages:
                 break
-            offset = page * page_size
-            rows = await self.fetch_markets_page(page_size, offset)
+            try:
+                rows = await self.fetch_markets_page(current_page_size, offset)
+            except (httpx.RemoteProtocolError, httpx.ReadError):
+                # Gamma occasionally closes large chunked responses early.
+                # Reducing page size keeps discovery resilient instead of failing a whole cycle.
+                if current_page_size <= 10:
+                    raise
+                current_page_size = max(10, current_page_size // 2)
+                continue
             if not rows:
                 break
             all_rows.extend(rows)
-            if len(rows) < page_size:
+            fetched_pages += 1
+            offset += len(rows)
+            if len(rows) < current_page_size:
                 break
-            page += 1
         return all_rows
 
     @staticmethod
