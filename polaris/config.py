@@ -215,7 +215,11 @@ def load_settings() -> PolarisSettings:
     return PolarisSettings()
 
 
-def refresh_process_env_from_file(path: str | Path = ".env", prefix: str = "POLARIS_") -> bool:
+def refresh_process_env_from_file(
+    path: str | Path = ".env",
+    prefix: str = "POLARIS_",
+    preserve_existing: bool = True,
+) -> bool:
     env_path = Path(path)
     if not env_path.exists():
         return False
@@ -223,6 +227,8 @@ def refresh_process_env_from_file(path: str | Path = ".env", prefix: str = "POLA
     values = dotenv_values(env_path)
     for key, value in values.items():
         if value is None or not key.startswith(prefix):
+            continue
+        if preserve_existing and key in os.environ:
             continue
         if os.environ.get(key) != value:
             os.environ[key] = value
