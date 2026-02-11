@@ -14,6 +14,7 @@ def _make_config() -> ArbConfig:
     settings = PolarisSettings(
         database_url="postgresql://postgres:postgres@localhost:55432/polaris",
         arb_single_risk_usd=20.0,
+        arb_enable_strategy_f=True,
     )
     return arb_config_from_settings(settings)
 

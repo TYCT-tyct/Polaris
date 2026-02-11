@@ -554,7 +554,7 @@ class ArbOrchestrator:
             signals.extend(self.strategy_g.scan(mode, source_code, snapshots))
         if self.config.enable_strategy_c:
             signals.extend(self.strategy_c.scan(mode, source_code, snapshots))
-        return signals
+        return _filter_safe_mode_signals(mode, signals, self.config.safe_arbitrage_only)
 
     def _order_signals(self, signals: list[ArbSignal]) -> list[ArbSignal]:
         priority = {name: idx for idx, name in enumerate(self.config.strategy_priority)}
@@ -949,6 +949,22 @@ _SCOPE_BLOCK_REASONS = {
     "insufficient_bankroll",
     "strategy_health_blocked",
 }
+
+_SAFE_ARBITRAGE_STRATEGIES = {
+    StrategyCode.A,
+    StrategyCode.B,
+    StrategyCode.C,
+}
+
+
+def _filter_safe_mode_signals(
+    mode: RunMode,
+    signals: list[ArbSignal],
+    safe_arbitrage_only: bool,
+) -> list[ArbSignal]:
+    if not safe_arbitrage_only or mode == RunMode.SHADOW:
+        return signals
+    return [signal for signal in signals if signal.strategy_code in _SAFE_ARBITRAGE_STRATEGIES]
 
 
 def _signal_fingerprint(signal: ArbSignal) -> str:

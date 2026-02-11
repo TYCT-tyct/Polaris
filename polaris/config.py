@@ -94,6 +94,7 @@ class PolarisSettings(BaseSettings):
     arb_live_preflight_force_refresh: bool = Field(default=False)
     arb_signal_dedupe_ttl_sec: int = Field(default=30)
     arb_scope_block_cooldown_sec: int = Field(default=300)
+    arb_safe_arbitrage_only: bool = Field(default=True)
     arb_strategy_health_gate_enabled: bool = Field(default=True)
     arb_strategy_health_window_hours: int = Field(default=24)
     arb_strategy_health_min_trades: int = Field(default=12)
@@ -121,10 +122,10 @@ class PolarisSettings(BaseSettings):
     arb_enable_strategy_a: bool = Field(default=True)
     arb_enable_strategy_b: bool = Field(default=True)
     arb_enable_strategy_c: bool = Field(default=True)
-    arb_enable_strategy_f: bool = Field(default=True)
-    arb_enable_strategy_g: bool = Field(default=True)
+    arb_enable_strategy_f: bool = Field(default=False)
+    arb_enable_strategy_g: bool = Field(default=False)
     arb_c_live_enabled: bool = Field(default=False)
-    arb_strategy_priority: str = Field(default="A,G,F,B")
+    arb_strategy_priority: str = Field(default="A,B,G,F")
 
     # module2: strategy thresholds
     arb_a_min_edge_pct: float = Field(default=0.015)

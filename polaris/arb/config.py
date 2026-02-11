@@ -22,6 +22,7 @@ class ArbConfig:
     live_preflight_force_refresh: bool
     signal_dedupe_ttl_sec: int
     scope_block_cooldown_sec: int
+    safe_arbitrage_only: bool
     strategy_health_gate_enabled: bool
     strategy_health_window_hours: int
     strategy_health_min_trades: int
@@ -90,6 +91,7 @@ def arb_config_from_settings(settings: PolarisSettings) -> ArbConfig:
         live_preflight_force_refresh=settings.arb_live_preflight_force_refresh,
         signal_dedupe_ttl_sec=settings.arb_signal_dedupe_ttl_sec,
         scope_block_cooldown_sec=settings.arb_scope_block_cooldown_sec,
+        safe_arbitrage_only=settings.arb_safe_arbitrage_only,
         strategy_health_gate_enabled=settings.arb_strategy_health_gate_enabled,
         strategy_health_window_hours=settings.arb_strategy_health_window_hours,
         strategy_health_min_trades=settings.arb_strategy_health_min_trades,
