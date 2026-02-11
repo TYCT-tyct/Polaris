@@ -83,6 +83,9 @@ class PolarisSettings(BaseSettings):
     arb_universe_token_limit: int = Field(default=2000)
     arb_clob_books_batch_size: int = Field(default=500)
     arb_clob_books_max_concurrency: int = Field(default=4)
+    arb_execution_concurrency: int = Field(default=3)
+    arb_live_preflight_max_age_ms: int = Field(default=2000)
+    arb_live_preflight_force_refresh: bool = Field(default=False)
 
     # module2: risk and sizing
     arb_min_order_notional_usd: float = Field(default=1.0)

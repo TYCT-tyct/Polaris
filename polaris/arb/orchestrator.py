@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from collections import defaultdict
@@ -12,6 +13,7 @@ from polaris.arb.config import ArbConfig
 from polaris.arb.contracts import (
     ArbSignal,
     ExecutionPlan,
+    FillEvent,
     OrderIntent,
     PriceLevel,
     RunMode,
@@ -93,42 +95,97 @@ class ArbOrchestrator:
         snapshot_map = {item.token_id: item for item in snapshots}
         risk_state = await self.risk_gate.load_state(mode, source_code)
         cash_balance = await self._load_latest_cash_balance(mode, source_code)
+        rejected: list[tuple[ArbSignal, SignalStatus, str | None]] = []
+        expired: list[tuple[ArbSignal, SignalStatus, str | None]] = []
+        approved: list[tuple[ArbSignal, float, ExecutionPlan]] = []
         for signal in ordered:
             if signal.is_expired():
-                await self._record_signal(signal, SignalStatus.EXPIRED)
+                expired.append((signal, SignalStatus.EXPIRED, None))
                 continue
-
             if signal.strategy_code == StrategyCode.G:
                 ai_decision = await self.ai_gate.evaluate(signal, context={"token_count": len(snapshots)})
                 if not ai_decision.allow:
-                    await self._record_signal(signal, SignalStatus.REJECTED, note=f"ai_reject:{ai_decision.reason}")
+                    rejected.append((signal, SignalStatus.REJECTED, f"ai_reject:{ai_decision.reason}"))
                     continue
 
             notional = _estimate_capital(signal)
             decision = await self.risk_gate.assess(signal, notional, state=risk_state)
             if not decision.allowed:
-                await self._record_signal(signal, SignalStatus.REJECTED, note=decision.reason)
+                rejected.append((signal, SignalStatus.REJECTED, decision.reason))
                 await self.risk_gate.record_risk_event(signal.mode, signal.strategy_code, signal.source_code, decision)
                 continue
 
             self.risk_gate.reserve_exposure(risk_state, notional)
-            plan = self._build_plan(signal)
-            await self._record_signal(signal, SignalStatus.NEW)
-            result = await self.order_router.execute(plan, snapshot_map)
-            success = result.status == "filled"
-            self.risk_gate.settle_execution(
-                state=risk_state,
-                success=success,
-                capital_required_usd=notional,
-                realized_pnl_usd=result.net_pnl_usd if success else 0.0,
-            )
-            if success:
+            approved.append((signal, notional, self._build_plan(signal)))
+
+        if expired:
+            await self._record_signals(expired)
+        if rejected:
+            await self._record_signals(rejected)
+
+        status_updates: list[tuple[str, str]] = []
+        cash_rows: list[tuple[str, str, str, str, float, float, float, str, str]] = []
+        lot_rows: list[tuple[str, str, str, str, str, str, float, float, float, float, float]] = []
+        if approved:
+            await self._record_signals([(signal, SignalStatus.NEW, None) for signal, _, _ in approved])
+            concurrency = max(1, self.config.execution_concurrency)
+            semaphore = asyncio.Semaphore(concurrency)
+
+            async def _execute_plan(plan: ExecutionPlan):
+                async with semaphore:
+                    return await self.order_router.execute(plan, snapshot_map)
+
+            tasks = [asyncio.create_task(_execute_plan(plan)) for _, _, plan in approved]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for (signal, notional, _plan), result in zip(approved, results, strict=False):
+                if isinstance(result, Exception):
+                    logger.exception("signal execution failed", extra={"signal_id": str(signal.signal_id)})
+                    self.risk_gate.settle_execution(
+                        state=risk_state,
+                        success=False,
+                        capital_required_usd=notional,
+                        realized_pnl_usd=0.0,
+                    )
+                    status_updates.append((SignalStatus.REJECTED.value, str(signal.signal_id)))
+                    continue
+
+                success = result.status == "filled"
+                self.risk_gate.settle_execution(
+                    state=risk_state,
+                    success=success,
+                    capital_required_usd=notional,
+                    realized_pnl_usd=result.net_pnl_usd if success else 0.0,
+                )
+                if not success:
+                    status_updates.append((SignalStatus.REJECTED.value, str(signal.signal_id)))
+                    continue
+
                 executed += 1
-                cash_balance = await self._record_cash_ledger(result, cash_balance)
-                await self._record_position_lots(result)
-                await self._mark_signal_status(signal.signal_id, SignalStatus.EXECUTED)
-            else:
-                await self._mark_signal_status(signal.signal_id, SignalStatus.REJECTED)
+                before = cash_balance
+                after = before + result.net_pnl_usd
+                cash_balance = after
+                cash_rows.append(
+                    (
+                        signal.mode.value,
+                        signal.strategy_code.value,
+                        signal.source_code,
+                        "trade_net_pnl",
+                        result.net_pnl_usd,
+                        before,
+                        after,
+                        str(signal.signal_id),
+                        json.dumps({"status": result.status}, ensure_ascii=True),
+                    )
+                )
+                lot_rows.extend(_position_rows(signal, result.fills, result.net_pnl_usd))
+                status_updates.append((SignalStatus.EXECUTED.value, str(signal.signal_id)))
+
+        if cash_rows:
+            await self._record_cash_ledger_rows(cash_rows)
+        if lot_rows:
+            await self._record_position_lot_rows(lot_rows)
+        if status_updates:
+            await self._mark_signal_status_many(status_updates)
 
         if mode == RunMode.PAPER_LIVE:
             await self._maybe_run_optimization()
@@ -447,17 +504,12 @@ class ArbOrchestrator:
         return ExecutionPlan(signal=signal, intents=intents)
 
     async def _record_signal(self, signal: ArbSignal, status: SignalStatus, note: str | None = None) -> None:
-        await self.db.execute(
-            """
-            insert into arb_signal(
-                signal_id, mode, strategy_code, source_code, event_id, market_ids, token_ids,
-                edge_pct, expected_pnl_usd, ttl_ms, features, status, decision_note, created_at
-            )
-            values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s)
-            on conflict (signal_id) do update
-            set status = excluded.status,
-                decision_note = excluded.decision_note
-            """,
+        await self._record_signals([(signal, status, note)])
+
+    async def _record_signals(self, rows: list[tuple[ArbSignal, SignalStatus, str | None]]) -> None:
+        if not rows:
+            return
+        payload = [
             (
                 str(signal.signal_id),
                 signal.mode.value,
@@ -473,11 +525,33 @@ class ArbOrchestrator:
                 status.value,
                 note or signal.decision_note,
                 signal.created_at,
-            ),
+            )
+            for signal, status, note in rows
+        ]
+        await self.db.executemany(
+            """
+            insert into arb_signal(
+                signal_id, mode, strategy_code, source_code, event_id, market_ids, token_ids,
+                edge_pct, expected_pnl_usd, ttl_ms, features, status, decision_note, created_at
+            )
+            values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s)
+            on conflict (signal_id) do update
+            set status = excluded.status,
+                decision_note = excluded.decision_note
+            """,
+            payload,
         )
 
     async def _mark_signal_status(self, signal_id, status: SignalStatus) -> None:
         await self.db.execute("update arb_signal set status = %s where signal_id = %s", (status.value, str(signal_id)))
+
+    async def _mark_signal_status_many(self, rows: list[tuple[str, str]]) -> None:
+        if not rows:
+            return
+        await self.db.executemany(
+            "update arb_signal set status = %s where signal_id = %s",
+            rows,
+        )
 
     async def _load_latest_cash_balance(self, mode: RunMode, source_code: str) -> float:
         row = await self.db.fetch_one(
@@ -516,24 +590,30 @@ class ArbOrchestrator:
         )
         return after
 
+    async def _record_cash_ledger_rows(self, rows: list[tuple[str, str, str, str, float, float, float, str, str]]) -> None:
+        if not rows:
+            return
+        await self.db.executemany(
+            """
+            insert into arb_cash_ledger(
+                mode, strategy_code, source_code, entry_type, amount_usd,
+                balance_before_usd, balance_after_usd, ref_signal_id, payload, created_at
+            ) values (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, now())
+            """,
+            rows,
+        )
+
     async def _record_position_lots(self, result) -> None:
         signal = result.signal
-        rows = [
-            (
-                signal.mode.value,
-                signal.strategy_code.value,
-                signal.source_code,
-                fill.market_id,
-                fill.token_id,
-                fill.side,
-                fill.fill_price,
-                fill.fill_size,
-                fill.fill_notional_usd,
-                fill.fill_price,
-                result.net_pnl_usd,
-            )
-            for fill in result.fills
-        ]
+        rows = _position_rows(signal, result.fills, result.net_pnl_usd)
+        if not rows:
+            return
+        await self._record_position_lot_rows(rows)
+
+    async def _record_position_lot_rows(
+        self,
+        rows: list[tuple[str, str, str, str, str, str, float, float, float, float, float]],
+    ) -> None:
         if not rows:
             return
         await self.db.executemany(
@@ -675,7 +755,28 @@ def _signal_rank_key(signal: ArbSignal, priority: dict[str, int]) -> tuple[float
     )
 
 
-async def _sleep(seconds: float) -> None:
-    import asyncio
+def _position_rows(
+    signal: ArbSignal,
+    fills: list[FillEvent],
+    realized_pnl_usd: float,
+) -> list[tuple[str, str, str, str, str, str, float, float, float, float, float]]:
+    return [
+        (
+            signal.mode.value,
+            signal.strategy_code.value,
+            signal.source_code,
+            fill.market_id,
+            fill.token_id,
+            fill.side,
+            fill.fill_price,
+            fill.fill_size,
+            fill.fill_notional_usd,
+            fill.fill_price,
+            realized_pnl_usd,
+        )
+        for fill in fills
+    ]
 
+
+async def _sleep(seconds: float) -> None:
     await asyncio.sleep(seconds)

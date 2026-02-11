@@ -98,7 +98,8 @@
    ├─ test_live_harvest_once.py
    ├─ test_arb_live_scan.py
    ├─ test_arb_replay_real.py
-   └─ test_arb_reporting.py
+   ├─ test_arb_reporting.py
+   └─ test_order_router_preflight.py
 ```
 
 ## 模块职责
@@ -130,3 +131,4 @@
 - 2026-02-10：市场发现支持全市场范围并保持 `elon_tweet` 兼容模式。
 - 2026-02-11：新增 `arb-summary` 隔夜总结命令与 `ArbReporter.summary` 统计指标增强。
 - 2026-02-11：新增 `tests/test_arb_reporting.py`，验证策略级发现/执行/盈亏/延迟口径。
+- 2026-02-11：优化 Module2 执行链路并发与 Live 预检复用，新增 `tests/test_order_router_preflight.py`。

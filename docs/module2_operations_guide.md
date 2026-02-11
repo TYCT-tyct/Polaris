@@ -63,4 +63,7 @@
 - `POLARIS_ARB_C_MAX_CANDIDATES_PER_EVENT=1`：策略 C 每个事件只执行最优候选，减少重复腿。
 - `POLARIS_ARB_CLOB_BOOKS_BATCH_SIZE=500`：`/books` 批量大小，过大可能触发 400。
 - `POLARIS_ARB_CLOB_BOOKS_MAX_CONCURRENCY=4`：并发批次上限，过高会放大网络抖动。
+- `POLARIS_ARB_EXECUTION_CONCURRENCY=3`：单轮并发执行信号数，提升多机会同时捕获能力。
+- `POLARIS_ARB_LIVE_PREFLIGHT_MAX_AGE_MS=2000`：Live 预检快照最大复用时长，过期才二次拉盘口。
+- `POLARIS_ARB_LIVE_PREFLIGHT_FORCE_REFRESH=false`：是否强制每单二次拉盘口，默认关闭以减少延迟。
 - 说明：系统已内置 `/books` 的 400/413 自动拆分回退，不会因为单个大批次失败而整轮中断。

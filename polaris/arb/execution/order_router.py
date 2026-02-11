@@ -179,7 +179,10 @@ class OrderRouter:
                 metadata={"error": "missing_live_key"},
             )
 
-        live_books = await self._load_preflight_books(plan.intents)
+        refresh_preflight = self._should_refresh_preflight(plan.intents, snapshots)
+        live_books: dict[str, TokenSnapshot] = {}
+        if refresh_preflight:
+            live_books = await self._load_preflight_books(plan.intents)
         fills: list[FillEvent] = []
         total_notional = 0.0
         event_rows: list[tuple[str, str, int, str, str]] = []
@@ -371,6 +374,7 @@ class OrderRouter:
                 "submitted": submitted,
                 "rejected": rejected,
                 "live_order_type": self.config.live_order_type,
+                "preflight_refresh": refresh_preflight,
             },
         )
 
@@ -397,6 +401,26 @@ class OrderRouter:
                 captured_at=now,
             )
         return snapshots
+
+    def _should_refresh_preflight(
+        self,
+        intents: list[Any],
+        snapshots: dict[str, TokenSnapshot],
+    ) -> bool:
+        if self.config.live_preflight_force_refresh:
+            return True
+        max_age_ms = max(0, self.config.live_preflight_max_age_ms)
+        if max_age_ms == 0:
+            return False
+        now = datetime.now(tz=UTC)
+        for intent in intents:
+            snap = snapshots.get(intent.token_id)
+            if snap is None:
+                return True
+            age_ms = (now - snap.captured_at).total_seconds() * 1000
+            if age_ms > max_age_ms:
+                return True
+        return False
 
     def _get_live_client(self) -> Any | None:
         if self._live_client is not None:

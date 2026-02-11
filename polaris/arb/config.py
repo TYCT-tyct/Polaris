@@ -17,6 +17,9 @@ class ArbConfig:
     universe_token_limit: int
     clob_books_batch_size: int
     clob_books_max_concurrency: int
+    execution_concurrency: int
+    live_preflight_max_age_ms: int
+    live_preflight_force_refresh: bool
 
     min_order_notional_usd: float
     single_risk_usd: float
@@ -68,6 +71,9 @@ def arb_config_from_settings(settings: PolarisSettings) -> ArbConfig:
         universe_token_limit=settings.arb_universe_token_limit,
         clob_books_batch_size=settings.arb_clob_books_batch_size,
         clob_books_max_concurrency=settings.arb_clob_books_max_concurrency,
+        execution_concurrency=settings.arb_execution_concurrency,
+        live_preflight_max_age_ms=settings.arb_live_preflight_max_age_ms,
+        live_preflight_force_refresh=settings.arb_live_preflight_force_refresh,
         min_order_notional_usd=settings.arb_min_order_notional_usd,
         single_risk_usd=settings.arb_single_risk_usd,
         max_exposure_usd=settings.arb_max_exposure_usd,
