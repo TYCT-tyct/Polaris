@@ -16,7 +16,7 @@ def test_refresh_env_preserves_existing_values(tmp_path: Path) -> None:
     os.environ["POLARIS_ARB_ENABLE_STRATEGY_G"] = "false"
     os.environ.pop("POLARIS_ARB_ENABLE_STRATEGY_F", None)
 
-    changed = refresh_process_env_from_file(env_file)
+    changed = refresh_process_env_from_file(env_file, preserve_existing=True)
 
     assert changed
     assert os.environ["POLARIS_ARB_ENABLE_STRATEGY_G"] == "false"

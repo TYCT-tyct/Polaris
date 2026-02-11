@@ -17,15 +17,21 @@ class StrategyC:
 
         by_event_market: dict[str, dict[str, dict[str, TokenSnapshot]]] = defaultdict(dict)
         for token in snapshots:
-            if not token.event_id:
+            if not token.is_neg_risk:
                 continue
-            per_market = by_event_market[token.event_id].setdefault(token.market_id, {})
+            if token.event_id:
+                event_key = f"event:{token.event_id}"
+            elif token.condition_id:
+                event_key = f"condition:{token.condition_id}"
+            else:
+                continue
+            per_market = by_event_market[event_key].setdefault(token.market_id, {})
             per_market[token.outcome_side] = token
 
         signals: list[ArbSignal] = []
         shares = max(1.0, self.config.min_order_notional_usd)
         max_candidates = max(1, self.config.c_max_candidates_per_event)
-        for event_id, markets in by_event_market.items():
+        for event_key, markets in by_event_market.items():
             if len(markets) < 3:
                 continue
 
@@ -47,6 +53,14 @@ class StrategyC:
             if len(yes_prices) < 3 or len(no_prices) < 3:
                 continue
 
+            sample_event_id = None
+            for sides in markets.values():
+                yes = sides.get("YES")
+                no = sides.get("NO")
+                token = yes or no
+                if token and token.event_id:
+                    sample_event_id = token.event_id
+                    break
             event_candidates: list[tuple[float, str, ArbSignal]] = []
             for base_market in market_ids:
                 no_price = no_prices.get(base_market)
@@ -75,7 +89,7 @@ class StrategyC:
                             strategy_code=StrategyCode.C,
                             mode=mode,
                             source_code=source_code,
-                            event_id=event_id,
+                            event_id=sample_event_id,
                             market_ids=[base_market],
                             token_ids=[base_no.token_id],
                             edge_pct=edge_pct,
@@ -97,6 +111,7 @@ class StrategyC:
                                 "complement_yes_cost": complement_cost,
                                 "expected_edge_pct": edge_pct,
                                 "expected_hold_minutes": 45,
+                                "group_key": event_key,
                             },
                             decision_note="neg_risk_no_to_yes_conversion",
                         ),

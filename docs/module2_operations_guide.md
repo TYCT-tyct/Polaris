@@ -27,6 +27,17 @@
 停止一键启动的两套后台 paper：
 `python -m polaris.cli arb-paper-matrix-stop`
 
+## 2.1 Rust 低抖动桥接（可选）
+默认关闭。启用后，paper/replay 的订单簿撮合计算走 Rust 二进制，降低 Python GC 抖动对延迟尾部的影响。
+
+1. 编译 Rust 二进制（服务器执行）：
+   `cd rust/polaris_book_sim && cargo build --release`
+2. 配置 `.env`：
+   `POLARIS_ARB_RUST_BRIDGE_ENABLED=true`
+   `POLARIS_ARB_RUST_BRIDGE_BIN=/home/ubuntu/polaris/rust/polaris_book_sim/target/release/polaris-book-sim`
+   `POLARIS_ARB_RUST_BRIDGE_TIMEOUT_SEC=5`
+3. 重启 `arb-run` 进程并观察日志是否出现 rust bridge 启动记录。
+
 ## 3. 回放验证
 默认高速回放（推荐）：
 `python -m polaris.cli arb-replay --start 2026-02-10T00:00:00+00:00 --end 2026-02-10T06:00:00+00:00 --fast`
@@ -62,6 +73,7 @@
 
 ## 5. 常见排查
 - 无信号：先检查 `dim_market` 和 `dim_token` 是否有 active 市场。
+- A/C 无信号：确认 `dim_market.neg_risk=true` 的市场是否存在。A/C 仅对 NegRisk 组扫描，不再对普通二元市场误扫。
 - 有信号不执行：检查 `arb_risk_event` 的拒单原因。
 - paper 有成交但 live 无成交：检查 `POLARIS_ARB_LIVE_PRIVATE_KEY` 和链路权限。
 
@@ -79,4 +91,5 @@
 - `POLARIS_ARB_EXECUTION_CONCURRENCY=3`：单轮并发执行信号数，提升多机会同时捕获能力。
 - `POLARIS_ARB_LIVE_PREFLIGHT_MAX_AGE_MS=2000`：Live 预检快照最大复用时长，过期才二次拉盘口。
 - `POLARIS_ARB_LIVE_PREFLIGHT_FORCE_REFRESH=false`：是否强制每单二次拉盘口，默认关闭以减少延迟。
+- `POLARIS_ARB_RUST_BRIDGE_ENABLED=false`：默认关闭，稳定后再切到 `true`。
 - 说明：系统已内置 `/books` 的 400/413 自动拆分回退，不会因为单个大批次失败而整轮中断。

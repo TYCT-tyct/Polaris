@@ -11,6 +11,7 @@ from typing import Any
 from polaris.arb.config import ArbConfig
 from polaris.arb.contracts import ExecutionPlan, FillEvent, RunMode, TokenSnapshot, TradeResult
 from polaris.arb.execution.fill_simulator import simulate_buy_fill, simulate_sell_fill
+from polaris.arb.execution.rust_bridge import simulate_paper_with_rust
 from polaris.db.pool import Database
 from polaris.sources.clob_client import ClobClient
 
@@ -49,75 +50,105 @@ class OrderRouter:
         total_notional = 0.0
         event_rows: list[tuple[str, str, int, str, str]] = []
         fill_rows: list[tuple[str, str, str, str, float, float, float, float]] = []
-        for intent in plan.intents:
-            snap = snapshots.get(intent.token_id)
-            if snap is None:
-                if persist:
-                    event_rows.append(
-                        (
-                            str(intent.intent_id),
-                            "reject",
-                            404,
-                            "missing_snapshot",
-                            json.dumps({}, ensure_ascii=True),
-                        )
-                    )
-                continue
-            fill, reject_reason, requested = _simulate_intent_fill(
-                intent.limit_price,
-                intent.shares,
-                intent.notional_usd,
-                intent.side,
-                snap,
-                order_type=intent.order_type,
+
+        rust_result = None
+        if self.config.rust_bridge_enabled:
+            rust_result = await simulate_paper_with_rust(
+                plan,
+                snapshots,
+                binary=self.config.rust_bridge_bin,
+                timeout_sec=self.config.rust_bridge_timeout_sec,
                 slippage_bps=self.config.slippage_bps,
             )
-            if fill is None:
+        if rust_result is not None:
+            fills = rust_result.fills
+            total_notional = rust_result.capital_used_usd
+            if persist and rust_result.events:
+                event_rows.extend(rust_result.events)
+            if persist:
+                for fill in fills:
+                    fill_rows.append(
+                        (
+                            str(_find_intent_id(plan, fill.token_id)),
+                            fill.market_id,
+                            fill.token_id,
+                            fill.side,
+                            fill.fill_price,
+                            fill.fill_size,
+                            fill.fill_notional_usd,
+                            fill.fee_usd,
+                        )
+                    )
+        else:
+            for intent in plan.intents:
+                snap = snapshots.get(intent.token_id)
+                if snap is None:
+                    if persist:
+                        event_rows.append(
+                            (
+                                str(intent.intent_id),
+                                "reject",
+                                404,
+                                "missing_snapshot",
+                                json.dumps({}, ensure_ascii=True),
+                            )
+                        )
+                    continue
+                fill, reject_reason, requested = _simulate_intent_fill(
+                    intent.limit_price,
+                    intent.shares,
+                    intent.notional_usd,
+                    intent.side,
+                    snap,
+                    order_type=intent.order_type,
+                    slippage_bps=self.config.slippage_bps,
+                )
+                if fill is None:
+                    if persist:
+                        event_rows.append(
+                            (
+                                str(intent.intent_id),
+                                "reject",
+                                422,
+                                reject_reason,
+                                json.dumps({}, ensure_ascii=True),
+                            )
+                        )
+                    continue
+                fills.append(fill)
+                total_notional += fill.fill_notional_usd
                 if persist:
+                    event_name = "partial_fill" if fill.fill_size + 1e-12 < requested else "fill"
+                    message = "paper_partial_fill" if event_name == "partial_fill" else "paper_fill"
                     event_rows.append(
                         (
                             str(intent.intent_id),
-                            "reject",
-                            422,
-                            reject_reason,
-                            json.dumps({}, ensure_ascii=True),
+                            event_name,
+                            200,
+                            message,
+                            json.dumps(
+                                {
+                                    "price": fill.fill_price,
+                                    "size": fill.fill_size,
+                                    "requested_size": requested,
+                                    "notional": fill.fill_notional_usd,
+                                },
+                                ensure_ascii=True,
+                            ),
                         )
                     )
-                continue
-            fills.append(fill)
-            total_notional += fill.fill_notional_usd
-            if persist:
-                event_name = "partial_fill" if fill.fill_size + 1e-12 < requested else "fill"
-                message = "paper_partial_fill" if event_name == "partial_fill" else "paper_fill"
-                event_rows.append(
-                    (
-                        str(intent.intent_id),
-                        event_name,
-                        200,
-                        message,
-                        json.dumps(
-                            {
-                                "price": fill.fill_price,
-                                "size": fill.fill_size,
-                                "requested_size": requested,
-                                "notional": fill.fill_notional_usd,
-                            },
-                            ensure_ascii=True,
-                        ),
+                    fill_rows.append(
+                        (
+                            str(intent.intent_id),
+                            fill.market_id,
+                            fill.token_id,
+                            fill.side,
+                            fill.fill_price,
+                            fill.fill_size,
+                            fill.fill_notional_usd,
+                            fill.fee_usd,
+                        )
                     )
-                )
-                fill_rows.append(
-                    (
-                        str(intent.intent_id),
-                        fill.market_id,
-                        fill.token_id,
-                        fill.side,
-                        fill.fill_price,
-                        fill.fill_size,
-                        fill.fill_notional_usd,
-                        fill.fee_usd,
-                    )
-                )
         if persist:
             await self._record_order_events(event_rows)
             await self._record_fills(fill_rows)
@@ -129,13 +160,7 @@ class OrderRouter:
             self.config.fee_bps,
         )
         hold_minutes = float(plan.signal.features.get("expected_hold_minutes", 0) or 0)
-        if hold_minutes > 1:
-            # 持有型策略在开仓时不确认浮盈亏，避免把未实现波动误记成已实现盈亏。
-            gross = 0.0
-            pnl_model = "entry_only"
-        else:
-            gross = mark_to_book
-            pnl_model = "mark_to_book"
+        gross, pnl_model = _resolve_realized_gross(mark_to_book, hold_minutes)
         return TradeResult(
             signal=plan.signal,
             status="filled" if fills else "rejected",
@@ -395,15 +420,17 @@ class OrderRouter:
             snapshot_for_pnl,
             self.config.fee_bps,
         )
+        hold_minutes = float(plan.signal.features.get("expected_hold_minutes", 0) or 0)
+        realized_gross, pnl_model = _resolve_realized_gross(gross, hold_minutes)
         return TradeResult(
             signal=plan.signal,
             status="filled" if fills else ("submitted" if submitted > 0 else "error"),
-            gross_pnl_usd=gross,
+            gross_pnl_usd=realized_gross,
             fees_usd=fees,
             slippage_usd=slip,
-            net_pnl_usd=gross - fees - slip,
+            net_pnl_usd=realized_gross - fees - slip,
             capital_used_usd=total_notional,
-            hold_minutes=float(plan.signal.features.get("expected_hold_minutes", 0) or 0),
+            hold_minutes=hold_minutes,
             fills=fills,
             metadata={
                 "mode": plan.signal.mode.value,
@@ -412,9 +439,10 @@ class OrderRouter:
                 "rejected": rejected,
                 "live_order_type": self.config.live_order_type,
                 "preflight_refresh": refresh_preflight,
-                "pnl_model": "mark_to_book",
+                "pnl_model": pnl_model,
                 "expected_gross_pnl_usd": expected_gross,
                 "mark_to_book_gross_pnl_usd": gross,
+                "entry_gross_pnl_usd": realized_gross,
             },
         )
 
@@ -769,3 +797,17 @@ def _submit_live_orders(
     if isinstance(result, dict):
         return [result]
     return [{"response": result}]
+
+
+def _resolve_realized_gross(mark_to_book: float, hold_minutes: float) -> tuple[float, str]:
+    if hold_minutes > 1:
+        # 持有型策略在入场时只确认成本，不把浮盈亏计入已实现收益。
+        return 0.0, "entry_only"
+    return mark_to_book, "mark_to_book"
+
+
+def _find_intent_id(plan: ExecutionPlan, token_id: str) -> str:
+    for intent in plan.intents:
+        if intent.token_id == token_id:
+            return str(intent.intent_id)
+    return str(plan.intents[0].intent_id) if plan.intents else ""

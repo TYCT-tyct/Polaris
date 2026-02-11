@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from polaris.arb.config import ArbConfig
 from polaris.arb.contracts import ArbSignal, RunMode, StrategyCode, TokenSnapshot
-from polaris.arb.strategies.common import executable_buy_price, group_by_event, uniform_basket_shares
+from polaris.arb.strategies.common import executable_buy_price, group_neg_risk, uniform_basket_shares
 
 
 class StrategyA:
@@ -14,8 +14,8 @@ class StrategyA:
             return []
 
         signals: list[ArbSignal] = []
-        grouped = group_by_event(snapshots)
-        for event_id, tokens in grouped.items():
+        grouped = group_neg_risk(snapshots)
+        for group_key, tokens in grouped.items():
             yes_tokens = [
                 token
                 for token in tokens
@@ -68,6 +68,7 @@ class StrategyA:
             if capital_used > self.config.single_risk_usd:
                 continue
             expected_pnl = target_shares * edge_pct
+            event_id = next((token.event_id for token in yes_tokens if token.event_id), None)
             signal = ArbSignal(
                 strategy_code=StrategyCode.A,
                 mode=mode,
@@ -85,6 +86,7 @@ class StrategyA:
                     "capital_used_usd": capital_used,
                     "expected_edge_pct": edge_pct,
                     "expected_hold_minutes": 30,
+                    "group_key": group_key,
                 },
                 decision_note="negrisk_yes_sum",
             )

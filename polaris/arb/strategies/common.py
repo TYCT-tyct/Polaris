@@ -16,6 +16,19 @@ def group_by_event(tokens: Iterable[TokenSnapshot]) -> dict[str, list[TokenSnaps
     return dict(grouped)
 
 
+def group_neg_risk(tokens: Iterable[TokenSnapshot]) -> dict[str, list[TokenSnapshot]]:
+    grouped: dict[str, list[TokenSnapshot]] = defaultdict(list)
+    for token in tokens:
+        if not token.is_neg_risk:
+            continue
+        if token.event_id:
+            grouped[f"event:{token.event_id}"].append(token)
+            continue
+        if token.condition_id:
+            grouped[f"condition:{token.condition_id}"].append(token)
+    return dict(grouped)
+
+
 def group_by_market(tokens: Iterable[TokenSnapshot]) -> dict[str, list[TokenSnapshot]]:
     grouped: dict[str, list[TokenSnapshot]] = defaultdict(list)
     for token in tokens:

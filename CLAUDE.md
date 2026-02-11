@@ -67,7 +67,8 @@
 │  │  │  ├─ fill_simulator.py
 │  │  │  ├─ sizer.py
 │  │  │  ├─ risk_gate.py
-│  │  │  └─ order_router.py
+│  │  │  ├─ order_router.py
+│  │  │  └─ rust_bridge.py
 │  │  └─ ai/
 │  │     ├─ __init__.py
 │  │     ├─ gate.py
@@ -82,6 +83,11 @@
 │     ├─ exporter.py
 │     ├─ health.py
 │     └─ backfill.py
+├─ rust/
+│  └─ polaris_book_sim/
+│     ├─ Cargo.toml
+│     └─ src/
+│        └─ main.rs
 └─ tests/
    ├─ conftest.py
    ├─ test_discovery.py
@@ -108,8 +114,10 @@
 - `polaris/arb/*`：Module2 套利引擎，统一编排扫描、风控、执行、回放、参数进化。
 - `polaris/arb/strategies/*`：策略检测器（A/B/C/F/G）。
 - `polaris/arb/execution/*`：执行路由、成交模拟、仓位与风险控制。
+- `polaris/arb/execution/rust_bridge.py`：可选 Rust 二进制桥接，承载低抖动 paper/replay 撮合热路径。
 - `polaris/arb/ai/*`：G 策略可选 AI 复核层（google/claude/gpt/minimax/zhipu）。
 - `polaris/ops/exporter.py`：统一导出 Module1/2 关键表与视图。
+- `rust/polaris_book_sim`：Rust 订单簿撮合模拟器，供 Module2 可选调用。
 
 ## 依赖边界
 - 采集链路：`cli -> harvest.runner -> collectors -> sources/db`。
@@ -123,6 +131,9 @@
 - C 策略完整实现但默认禁止实盘，符合小资金风险边界。
 - G 策略支持规则锁定 + 可选 AI 复核，AI 不可用时自动退化为纯规则。
 - 参数进化基于“历史回放 + 最近 24h paper”双评分，所有版本可追溯。
+- A/C 策略扫描范围收敛为 NegRisk 市场组，避免在普通二元市场产生伪机会。
+- 持有型策略在开仓时使用 `entry_only` 收益口径，避免把未实现浮盈亏误计为已实现亏损。
+- 引入 Rust 桥接可选路径，默认关闭，稳定后按环境开关灰度开启。
 
 ## 变更日志
 - 2026-02-10：新增 Module2 迁移 `0003/0004` 与 `arb_*` 数据模型。
@@ -132,3 +143,5 @@
 - 2026-02-11：新增 `arb-summary` 隔夜总结命令与 `ArbReporter.summary` 统计指标增强。
 - 2026-02-11：新增 `tests/test_arb_reporting.py`，验证策略级发现/执行/盈亏/延迟口径。
 - 2026-02-11：优化 Module2 执行链路并发与 Live 预检复用，新增 `tests/test_order_router_preflight.py`。
+- 2026-02-12：修复 `.env` 热更新覆盖语义、A/C NegRisk 分组过滤、持有型策略收益口径统一。
+- 2026-02-12：新增 `rust/polaris_book_sim` 与 `rust_bridge` 可选加速路径。

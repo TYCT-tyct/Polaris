@@ -20,6 +20,9 @@ class ArbConfig:
     execution_concurrency: int
     live_preflight_max_age_ms: int
     live_preflight_force_refresh: bool
+    rust_bridge_enabled: bool
+    rust_bridge_bin: str
+    rust_bridge_timeout_sec: int
     signal_dedupe_ttl_sec: int
     scope_block_cooldown_sec: int
     safe_arbitrage_only: bool
@@ -89,6 +92,9 @@ def arb_config_from_settings(settings: PolarisSettings) -> ArbConfig:
         execution_concurrency=settings.arb_execution_concurrency,
         live_preflight_max_age_ms=settings.arb_live_preflight_max_age_ms,
         live_preflight_force_refresh=settings.arb_live_preflight_force_refresh,
+        rust_bridge_enabled=settings.arb_rust_bridge_enabled,
+        rust_bridge_bin=settings.arb_rust_bridge_bin,
+        rust_bridge_timeout_sec=settings.arb_rust_bridge_timeout_sec,
         signal_dedupe_ttl_sec=settings.arb_signal_dedupe_ttl_sec,
         scope_block_cooldown_sec=settings.arb_scope_block_cooldown_sec,
         safe_arbitrage_only=settings.arb_safe_arbitrage_only,

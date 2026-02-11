@@ -92,6 +92,9 @@ class PolarisSettings(BaseSettings):
     arb_execution_concurrency: int = Field(default=3)
     arb_live_preflight_max_age_ms: int = Field(default=2000)
     arb_live_preflight_force_refresh: bool = Field(default=False)
+    arb_rust_bridge_enabled: bool = Field(default=False)
+    arb_rust_bridge_bin: str = Field(default="polaris-book-sim")
+    arb_rust_bridge_timeout_sec: int = Field(default=5)
     arb_signal_dedupe_ttl_sec: int = Field(default=30)
     arb_scope_block_cooldown_sec: int = Field(default=300)
     arb_safe_arbitrage_only: bool = Field(default=True)
@@ -218,7 +221,7 @@ def load_settings() -> PolarisSettings:
 def refresh_process_env_from_file(
     path: str | Path = ".env",
     prefix: str = "POLARIS_",
-    preserve_existing: bool = True,
+    preserve_existing: bool = False,
 ) -> bool:
     env_path = Path(path)
     if not env_path.exists():

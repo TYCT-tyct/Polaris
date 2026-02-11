@@ -55,6 +55,8 @@ class TokenSnapshot:
     tick_size: float | None
     best_bid: float | None
     best_ask: float | None
+    condition_id: str | None = None
+    is_neg_risk: bool = True
     is_other_outcome: bool = False
     is_placeholder_outcome: bool = False
     bids: tuple[PriceLevel, ...] = ()
