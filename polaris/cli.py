@@ -206,7 +206,7 @@ def run(
     reload_poll_sec: Annotated[int, typer.Option("--reload-poll-sec", min=1, max=60)] = 2,
 ) -> None:
     """Run continuous scheduler."""
-    refresh_process_env_from_file()
+    refresh_process_env_from_file(preserve_existing=True)
     load_settings.cache_clear()
     settings = load_settings()
     setup_logging(settings.log_level)
@@ -224,7 +224,7 @@ def run(
         )
         try:
             while not stop_event.is_set():
-                refresh_process_env_from_file()
+                refresh_process_env_from_file(preserve_existing=True)
                 load_settings.cache_clear()
                 current_settings = load_settings()
                 setup_logging(current_settings.log_level)
@@ -373,7 +373,7 @@ def export_data(
     since_hours: Annotated[int, typer.Option("--since-hours", min=0)] = 0,
 ) -> None:
     """Export one table/view to CSV or JSON."""
-    refresh_process_env_from_file()
+    refresh_process_env_from_file(preserve_existing=True)
     load_settings.cache_clear()
     settings = load_settings()
     setup_logging(settings.log_level)
@@ -422,7 +422,7 @@ def backup(
     keep_last: Annotated[int, typer.Option("--keep-last", min=1, max=365)] = 14,
 ) -> None:
     """Create a consistent backup snapshot."""
-    refresh_process_env_from_file()
+    refresh_process_env_from_file(preserve_existing=True)
     load_settings.cache_clear()
     settings = load_settings()
     setup_logging(settings.log_level)
@@ -488,7 +488,7 @@ def arb_run(
     once: Annotated[bool, typer.Option("--once/--loop", help="Run one scan cycle or keep running")] = False,
 ) -> None:
     """Run Module2 arbitrage engine."""
-    refresh_process_env_from_file()
+    refresh_process_env_from_file(preserve_existing=True)
     load_settings.cache_clear()
     settings = load_settings()
     scope = paper_capital_scope.strip().lower()
@@ -525,7 +525,7 @@ def arb_paper_matrix_start(
     1) shared capital pool (all strategies share one bankroll)
     2) isolated capital pool (each strategy has its own bankroll)
     """
-    refresh_process_env_from_file()
+    refresh_process_env_from_file(preserve_existing=True)
     load_settings.cache_clear()
     settings = load_settings()
     setup_logging(settings.log_level)
@@ -621,7 +621,7 @@ def arb_replay(
     """Run historical replay with real captured market data."""
     if not start or not end:
         raise typer.BadParameter("start and end are required")
-    refresh_process_env_from_file()
+    refresh_process_env_from_file(preserve_existing=True)
     load_settings.cache_clear()
     settings = load_settings()
     setup_logging(settings.log_level)
@@ -643,7 +643,7 @@ def arb_replay(
 @app.command("arb-optimize")
 def arb_optimize() -> None:
     """Run one parameter evolution cycle for Module2."""
-    refresh_process_env_from_file()
+    refresh_process_env_from_file(preserve_existing=True)
     load_settings.cache_clear()
     settings = load_settings()
     setup_logging(settings.log_level)
@@ -665,7 +665,7 @@ def arb_report(
     group_by: Annotated[str, typer.Option("--group-by", help="strategy,mode,source,day")] = "strategy,mode,source",
 ) -> None:
     """Show aggregated performance report for Module2."""
-    refresh_process_env_from_file()
+    refresh_process_env_from_file(preserve_existing=True)
     load_settings.cache_clear()
     settings = load_settings()
     setup_logging(settings.log_level)
@@ -690,7 +690,7 @@ def arb_summary(
     output: Annotated[str, typer.Option("--output", help="Optional JSON output path")] = "",
 ) -> None:
     """Show strategy-level overnight summary for Module2."""
-    refresh_process_env_from_file()
+    refresh_process_env_from_file(preserve_existing=True)
     load_settings.cache_clear()
     settings = load_settings()
     setup_logging(settings.log_level)
@@ -736,7 +736,7 @@ def arb_go_live_check(
     strategy_min_trades: Annotated[int, typer.Option("--strategy-min-trades", min=1)] = 8,
 ) -> None:
     """Evaluate whether paper results are healthy enough before live funds."""
-    refresh_process_env_from_file()
+    refresh_process_env_from_file(preserve_existing=True)
     load_settings.cache_clear()
     settings = load_settings()
     setup_logging(settings.log_level)
@@ -815,7 +815,7 @@ def arb_export(
     since_hours: Annotated[int, typer.Option("--since-hours", min=0)] = 24,
 ) -> None:
     """Export Module2 tables and views."""
-    refresh_process_env_from_file()
+    refresh_process_env_from_file(preserve_existing=True)
     load_settings.cache_clear()
     settings = load_settings()
     setup_logging(settings.log_level)
@@ -855,7 +855,7 @@ def arb_benchmark(
     output: Annotated[str, typer.Option("--output", help="Optional output json path")] = "",
 ) -> None:
     """Run repeated Module2 cycles and print latency percentiles."""
-    refresh_process_env_from_file()
+    refresh_process_env_from_file(preserve_existing=True)
     load_settings.cache_clear()
     settings = load_settings()
     setup_logging(settings.log_level)
