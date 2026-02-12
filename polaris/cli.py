@@ -784,7 +784,8 @@ def arb_paper_matrix_start(
             start_new_session=True,
         )
         log_handle.close()
-        (run_dir / f"arb_paper_{name}.pid").write_text(str(proc.pid), encoding="utf-8")
+        pid_path = run_dir / f"arb_paper_{name}_{timestamp}.pid"
+        pid_path.write_text(str(proc.pid), encoding="utf-8")
         return proc.pid, log_path, source
 
     started: list[tuple[str, int, Path, str]] = []
