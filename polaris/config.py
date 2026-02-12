@@ -97,6 +97,7 @@ class PolarisSettings(BaseSettings):
     arb_rust_bridge_mode: str = Field(default="daemon")
     arb_rust_bridge_bin: str = Field(default="polaris-book-sim")
     arb_rust_bridge_timeout_sec: int = Field(default=5)
+    arb_paper_realized_pnl_mode: str = Field(default="entry_only")
     arb_run_tag: str = Field(default="auto")
     arb_signal_dedupe_ttl_sec: int = Field(default=30)
     arb_scope_block_cooldown_sec: int = Field(default=300)

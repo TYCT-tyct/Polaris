@@ -174,7 +174,11 @@ class OrderRouter:
             self.config.fee_bps,
         )
         hold_minutes = float(plan.signal.features.get("expected_hold_minutes", 0) or 0)
-        gross, pnl_model = _resolve_realized_gross(mark_to_book, hold_minutes)
+        gross, pnl_model = _resolve_realized_gross(
+            mark_to_book,
+            hold_minutes,
+            self.config.paper_realized_pnl_mode,
+        )
         return TradeResult(
             signal=plan.signal,
             status="filled" if fills else "rejected",
@@ -437,7 +441,11 @@ class OrderRouter:
             self.config.fee_bps,
         )
         hold_minutes = float(plan.signal.features.get("expected_hold_minutes", 0) or 0)
-        realized_gross, pnl_model = _resolve_realized_gross(gross, hold_minutes)
+        realized_gross, pnl_model = _resolve_realized_gross(
+            gross,
+            hold_minutes,
+            self.config.paper_realized_pnl_mode,
+        )
         return TradeResult(
             signal=plan.signal,
             status="filled" if fills else ("submitted" if submitted > 0 else "error"),
@@ -827,7 +835,14 @@ def _submit_live_orders(
     return [{"response": result}]
 
 
-def _resolve_realized_gross(mark_to_book: float, hold_minutes: float) -> tuple[float, str]:
+def _resolve_realized_gross(
+    mark_to_book: float,
+    hold_minutes: float,
+    realized_mode: str,
+) -> tuple[float, str]:
+    mode = (realized_mode or "entry_only").strip().lower()
+    if mode == "mark_to_book":
+        return mark_to_book, "mark_to_book"
     if hold_minutes > 1:
         # 持有型策略在入场时只确认成本，不把浮盈亏计入已实现收益。
         return 0.0, "entry_only"
