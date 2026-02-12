@@ -175,7 +175,7 @@ class PolarisSettings(BaseSettings):
     clob_ws_enabled: bool = Field(default=False)
     clob_ws_url: str = Field(default="wss://ws-subscriptions-clob.polymarket.com/ws/market")
     clob_ws_book_max_age_sec: float = Field(default=2.5)
-    clob_book_cache_max_age_sec: float = Field(default=12.0)
+    clob_book_cache_max_age_sec: float = Field(default=24.0)
     clob_ws_max_subscribe_tokens: int = Field(default=3500)
     clob_ws_reconnect_min_sec: float = Field(default=0.5)
     clob_ws_reconnect_max_sec: float = Field(default=8.0)
