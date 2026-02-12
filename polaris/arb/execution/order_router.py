@@ -175,7 +175,11 @@ class OrderRouter:
         )
         hold_minutes = float(plan.signal.features.get("expected_hold_minutes", 0) or 0)
         realized_mode = self.config.paper_realized_pnl_mode
-        if realized_mode == "mark_to_book" and plan.signal.strategy_code == StrategyCode.C:
+        if (
+            realized_mode == "mark_to_book"
+            and plan.signal.strategy_code == StrategyCode.C
+            and self.config.c_force_entry_only_in_paper
+        ):
             # C 是转换型策略，不做即时按盘平仓估值，避免在 paper 里被系统性误判为亏损。
             realized_mode = "entry_only"
         gross, pnl_model = _resolve_realized_gross(

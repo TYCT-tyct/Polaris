@@ -36,6 +36,7 @@ class ArbConfig:
     rust_bridge_bin: str
     rust_bridge_timeout_sec: int
     paper_realized_pnl_mode: str
+    c_force_entry_only_in_paper: bool
     run_tag: str
     signal_dedupe_ttl_sec: int
     scope_block_cooldown_sec: int
@@ -116,6 +117,7 @@ def arb_config_from_settings(settings: PolarisSettings) -> ArbConfig:
         rust_bridge_bin=settings.arb_rust_bridge_bin,
         rust_bridge_timeout_sec=settings.arb_rust_bridge_timeout_sec,
         paper_realized_pnl_mode=(settings.arb_paper_realized_pnl_mode or "entry_only").strip().lower(),
+        c_force_entry_only_in_paper=settings.arb_c_force_entry_only_in_paper,
         run_tag=resolve_run_tag(settings),
         signal_dedupe_ttl_sec=settings.arb_signal_dedupe_ttl_sec,
         scope_block_cooldown_sec=settings.arb_scope_block_cooldown_sec,

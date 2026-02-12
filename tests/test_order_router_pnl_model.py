@@ -197,3 +197,88 @@ async def test_simulate_paper_uses_entry_only_for_holding_signals() -> None:
     assert result.net_pnl_usd == pytest.approx(-0.0047, abs=1e-9)
     assert result.metadata["pnl_model"] == "entry_only"
     assert result.metadata["mark_to_book_gross_pnl_usd"] < -4.0
+
+
+@pytest.mark.asyncio
+async def test_simulate_paper_allows_strategy_c_mark_to_book_when_unlocked() -> None:
+    settings = PolarisSettings(
+        database_url="postgresql://postgres:postgres@localhost:55432/polaris",
+        arb_single_risk_usd=5.0,
+        arb_min_order_notional_usd=1.0,
+        arb_fee_bps=0,
+        arb_paper_realized_pnl_mode="mark_to_book",
+        arb_c_force_entry_only_in_paper=False,
+    )
+    router = OrderRouter(
+        db=_NoopDb(),
+        config=arb_config_from_settings(settings),
+        clob_client=ClobClient(AsyncTokenBucket(5.0, 8), RetryConfig()),
+    )
+    signal = ArbSignal(
+        strategy_code=StrategyCode.C,
+        mode=RunMode.PAPER_LIVE,
+        source_code="paper-test",
+        event_id="event-1",
+        market_ids=["m1"],
+        token_ids=["t1"],
+        edge_pct=0.03,
+        expected_pnl_usd=0.03,
+        ttl_ms=30_000,
+        features={
+            "expected_hold_minutes": 45,
+            "expected_edge_pct": 0.03,
+            "legs": [
+                {
+                    "market_id": "m1",
+                    "token_id": "t1",
+                    "side": "BUY",
+                    "price": 0.5,
+                    "shares": 2.0,
+                    "notional_usd": 1.0,
+                }
+            ],
+        },
+        decision_note="c_mark",
+    )
+    plan = ExecutionPlan(
+        signal=signal,
+        intents=[
+            OrderIntent(
+                intent_id=uuid4(),
+                signal_id=signal.signal_id,
+                mode=signal.mode,
+                strategy_code=signal.strategy_code,
+                source_code=signal.source_code,
+                order_index=0,
+                market_id="m1",
+                token_id="t1",
+                side="BUY",
+                order_type="PAPER",
+                limit_price=0.5,
+                shares=2.0,
+                notional_usd=1.0,
+                payload={},
+            )
+        ],
+    )
+    snapshot = TokenSnapshot(
+        token_id="t1",
+        market_id="m1",
+        event_id="e1",
+        market_question="q",
+        market_end=None,
+        outcome_label="YES",
+        outcome_side="YES",
+        outcome_index=0,
+        min_order_size=1.0,
+        tick_size=0.01,
+        best_bid=0.49,
+        best_ask=0.5,
+        bids=(PriceLevel(price=0.49, size=100.0),),
+        asks=(PriceLevel(price=0.5, size=100.0),),
+    )
+    result = await router.simulate_paper(plan, {"t1": snapshot})
+    assert result.status == "filled"
+    assert result.metadata["pnl_model"] == "mark_to_book"
+    assert result.gross_pnl_usd == pytest.approx(-0.02, abs=1e-9)
+    assert result.net_pnl_usd == pytest.approx(-0.02, abs=1e-9)

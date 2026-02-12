@@ -86,3 +86,12 @@ def test_arb_config_maps_universe_cache_and_liquidity_floor() -> None:
     cfg = arb_config_from_settings(settings)
     assert cfg.universe_refresh_sec == 90
     assert cfg.universe_min_liquidity == 250.0
+
+
+def test_arb_config_maps_c_paper_entry_mode_switch() -> None:
+    settings = PolarisSettings(
+        database_url="postgresql://postgres:postgres@localhost:55432/polaris",
+        arb_c_force_entry_only_in_paper=False,
+    )
+    cfg = arb_config_from_settings(settings)
+    assert cfg.c_force_entry_only_in_paper is False
