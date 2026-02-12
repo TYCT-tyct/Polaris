@@ -1107,6 +1107,10 @@ class ArbOrchestrator:
     async def _strategy_health_decision(self, signal: ArbSignal) -> tuple[bool, dict[str, float]]:
         if not self.config.strategy_health_gate_enabled:
             return True, {}
+        # paper 默认是 entry_only（不确认浮盈亏），此时用 trade_result.net_pnl_usd 做健康闸门会把所有策略误判为“持续不盈利”，
+        # 进而触发 strategy_health_blocked，导致整机长期 0 交易。要做健康门控，必须切到 mark_to_book 或未来的结算/平仓模型。
+        if signal.mode in {RunMode.PAPER_LIVE, RunMode.PAPER_REPLAY} and self.config.paper_realized_pnl_mode != "mark_to_book":
+            return True, {}
         row = await self.db.fetch_one(
             """
             select

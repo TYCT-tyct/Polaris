@@ -6,11 +6,6 @@ from dataclasses import dataclass
 
 from polaris.arb.config import ArbConfig
 from polaris.arb.contracts import AiGateDecision, ArbSignal, StrategyCode
-from polaris.arb.ai.provider_anthropic import AnthropicProvider
-from polaris.arb.ai.provider_google import GoogleProvider
-from polaris.arb.ai.provider_minimax import MiniMaxProvider
-from polaris.arb.ai.provider_openai import OpenAIProvider
-from polaris.arb.ai.provider_zhipu import ZhipuProvider
 from polaris.config import PolarisSettings
 
 
@@ -21,6 +16,18 @@ class AiGate:
 
     @classmethod
     def from_settings(cls, settings: PolarisSettings, config: ArbConfig) -> "AiGate":
+        # 重要：AI 默认关闭。这里必须保持“轻量导入”，避免在非 AI 场景下引入 httpx/rich 等重依赖，
+        # 进而在 Windows/WMI 等环境里导致 import 阶段卡死（会让测试/本地诊断不可用）。
+        if not config.ai_enabled:
+            return cls(config=config, providers={})
+
+        # 仅在启用 AI 时延迟导入各 provider，避免无谓的启动开销。
+        from polaris.arb.ai.provider_anthropic import AnthropicProvider  # noqa: PLC0415
+        from polaris.arb.ai.provider_google import GoogleProvider  # noqa: PLC0415
+        from polaris.arb.ai.provider_minimax import MiniMaxProvider  # noqa: PLC0415
+        from polaris.arb.ai.provider_openai import OpenAIProvider  # noqa: PLC0415
+        from polaris.arb.ai.provider_zhipu import ZhipuProvider  # noqa: PLC0415
+
         providers: dict[str, object] = {
             "google": GoogleProvider(settings.arb_google_api_key, settings.arb_google_model),
             "anthropic": AnthropicProvider(settings.arb_anthropic_api_key, settings.arb_anthropic_model),

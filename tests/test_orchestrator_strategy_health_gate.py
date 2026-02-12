@@ -87,6 +87,7 @@ class _NoAiGate:
 async def test_strategy_health_decision_blocks_lossing_strategy() -> None:
     settings = PolarisSettings(
         database_url="postgresql://postgres:postgres@localhost:55432/polaris",
+        arb_paper_realized_pnl_mode="mark_to_book",
         arb_strategy_health_gate_enabled=True,
         arb_strategy_health_window_hours=24,
         arb_strategy_health_min_trades=12,
@@ -115,6 +116,7 @@ async def test_strategy_health_decision_blocks_lossing_strategy() -> None:
 async def test_run_once_blocks_scope_when_strategy_health_bad(monkeypatch) -> None:
     settings = PolarisSettings(
         database_url="postgresql://postgres:postgres@localhost:55432/polaris",
+        arb_paper_realized_pnl_mode="mark_to_book",
         arb_strategy_health_gate_enabled=True,
         arb_scope_block_cooldown_sec=300,
         arb_signal_dedupe_ttl_sec=30,
@@ -155,3 +157,22 @@ async def test_run_once_blocks_scope_when_strategy_health_bad(monkeypatch) -> No
     assert len(rejected_rows) == 1
     assert rejected_rows[0][2] == "strategy_health_blocked"
     assert risk_calls == ["strategy_health_blocked"]
+
+
+@pytest.mark.asyncio
+async def test_strategy_health_gate_skipped_for_entry_only_paper_mode() -> None:
+    settings = PolarisSettings(
+        database_url="postgresql://postgres:postgres@localhost:55432/polaris",
+        arb_strategy_health_gate_enabled=True,
+        arb_paper_realized_pnl_mode="entry_only",
+        arb_strategy_health_min_trades=1,
+    )
+    orchestrator = ArbOrchestrator(
+        db=_NoopDb({"trades": 20, "net_pnl_usd": -1.25, "avg_trade_pnl_usd": -0.06, "win_rate": 0.25}),
+        clob_client=SimpleNamespace(),
+        config=arb_config_from_settings(settings),
+        ai_gate=_NoAiGate(),
+    )
+    ok, payload = await orchestrator._strategy_health_decision(_signal("paper-health", "t1"))
+    assert ok
+    assert payload == {}
