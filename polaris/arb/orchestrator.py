@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import UTC, datetime, timedelta
 from time import perf_counter
 from typing import Any
@@ -88,6 +88,7 @@ class ArbOrchestrator:
         all_signals = self._scan_all(mode, source_code, snapshots)
         ordered = self._order_signals(all_signals)
         ordered = self._dedupe_signals(ordered)
+        scan_diag = _init_scan_diag_stats(all_signals, ordered)
         scan_ms = int((perf_counter() - scan_started) * 1000)
         if self.config.max_signals_per_cycle > 0 and len(ordered) > self.config.max_signals_per_cycle:
             logger.info(
@@ -113,15 +114,20 @@ class ArbOrchestrator:
         for signal in ordered:
             if signal.is_expired():
                 expired.append((signal, SignalStatus.EXPIRED, None))
+                scan_diag[signal.strategy_code.value]["expired"] += 1
                 continue
             if signal.strategy_code == StrategyCode.G:
                 ai_decision = await self.ai_gate.evaluate(signal, context={"token_count": len(snapshots)})
                 if not ai_decision.allow:
-                    rejected.append((signal, SignalStatus.REJECTED, f"ai_reject:{ai_decision.reason}"))
+                    reason = f"ai_reject:{ai_decision.reason}"
+                    rejected.append((signal, SignalStatus.REJECTED, reason))
+                    _note_scan_diag_reject(scan_diag, signal.strategy_code.value, reason)
                     continue
 
             scope_key = self._state_scope_key(signal)
             if self._is_scope_blocked(scope_key):
+                reason = "scope_blocked"
+                _note_scan_diag_reject(scan_diag, signal.strategy_code.value, reason)
                 continue
             health_key = f"{signal.mode.value}:{signal.source_code}:{signal.strategy_code.value}"
             health_ok, health_payload = health_decisions.get(health_key, (True, {}))
@@ -133,7 +139,9 @@ class ArbOrchestrator:
                 if scope_key in blocked_this_cycle:
                     continue
                 blocked_this_cycle.add(scope_key)
-                rejected.append((signal, SignalStatus.REJECTED, "strategy_health_blocked"))
+                reason = "strategy_health_blocked"
+                rejected.append((signal, SignalStatus.REJECTED, reason))
+                _note_scan_diag_reject(scan_diag, signal.strategy_code.value, reason)
                 await self.risk_gate.record_risk_event(
                     signal.mode,
                     signal.strategy_code,
@@ -169,10 +177,12 @@ class ArbOrchestrator:
                         continue
                     blocked_this_cycle.add(scope_key)
                 rejected.append((signal, SignalStatus.REJECTED, decision.reason))
+                _note_scan_diag_reject(scan_diag, signal.strategy_code.value, decision.reason)
                 await self.risk_gate.record_risk_event(signal.mode, signal.strategy_code, signal.source_code, decision)
                 continue
 
             self.risk_gate.reserve_exposure(risk_state, notional)
+            scan_diag[signal.strategy_code.value]["approved"] += 1
             approved.append((signal, notional, self._build_plan(signal), scope_key))
 
         if expired:
@@ -247,6 +257,7 @@ class ArbOrchestrator:
                     )
                 )
                 lot_rows.extend(_position_rows(signal, result.fills, result.net_pnl_usd))
+                scan_diag[signal.strategy_code.value]["executed"] += 1
                 status_updates.append((SignalStatus.EXECUTED.value, str(signal.signal_id)))
 
         if cash_rows:
@@ -255,6 +266,8 @@ class ArbOrchestrator:
             await self._record_position_lot_rows(lot_rows)
         if status_updates:
             await self._mark_signal_status_many(status_updates)
+        if scan_diag:
+            await self._record_scan_diag(mode, source_code, scan_diag)
 
         if mode == RunMode.PAPER_LIVE:
             await self._maybe_run_optimization()
@@ -880,20 +893,61 @@ class ArbOrchestrator:
 
     async def _record_position_lot_rows(
         self,
-        rows: list[tuple[str, str, str, str, str, str, float, float, float, float, float]],
+        rows: list[tuple[str, str, str, str, str, str, str, float, float, float, float, float]],
     ) -> None:
         if not rows:
             return
         await self.db.executemany(
             """
             insert into arb_position_lot(
-                mode, strategy_code, source_code, market_id, token_id, side,
+                mode, strategy_code, source_code, run_tag, market_id, token_id, side,
                 open_price, open_size, open_notional_usd, remaining_size,
                 status, opened_at, closed_at, close_price, realized_pnl_usd
             )
-            values (%s, %s, %s, %s, %s, %s, %s, %s, %s, 0, 'closed', now(), now(), %s, %s)
+            values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 0, 'closed', now(), now(), %s, %s)
             """,
             rows,
+        )
+
+    async def _record_scan_diag(
+        self,
+        mode: RunMode,
+        source_code: str,
+        rows: dict[str, dict[str, Any]],
+    ) -> None:
+        payload: list[tuple[str, str, str, str, int, int, int, int, int, int, str]] = []
+        for strategy_code, stat in rows.items():
+            reasons = stat["reasons"]
+            topn = {
+                reason: count
+                for reason, count in sorted(reasons.items(), key=lambda item: (-item[1], item[0]))[:5]
+            }
+            payload.append(
+                (
+                    mode.value,
+                    strategy_code,
+                    source_code,
+                    self.config.run_tag,
+                    int(stat["evaluated"]),
+                    int(stat["processed"]),
+                    int(stat["approved"]),
+                    int(stat["executed"]),
+                    int(stat["rejected"]),
+                    int(stat["expired"]),
+                    json.dumps(topn, ensure_ascii=True),
+                )
+            )
+        if not payload:
+            return
+        await self.db.executemany(
+            """
+            insert into arb_scan_diag(
+                mode, strategy_code, source_code, run_tag, evaluated, processed,
+                approved, executed, rejected, expired, blocked_reason_topn, created_at
+            )
+            values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, now())
+            """,
+            payload,
         )
 
     async def _maybe_run_optimization(self) -> None:
@@ -1074,12 +1128,13 @@ def _position_rows(
     signal: ArbSignal,
     fills: list[FillEvent],
     realized_pnl_usd: float,
-) -> list[tuple[str, str, str, str, str, str, float, float, float, float, float]]:
+) -> list[tuple[str, str, str, str, str, str, str, float, float, float, float, float]]:
     return [
         (
             signal.mode.value,
             signal.strategy_code.value,
             signal.source_code,
+            str(signal.features.get("run_tag", "")),
             fill.market_id,
             fill.token_id,
             fill.side,
@@ -1091,6 +1146,32 @@ def _position_rows(
         )
         for fill in fills
     ]
+
+
+def _init_scan_diag_stats(all_signals: list[ArbSignal], ordered_signals: list[ArbSignal]) -> dict[str, dict[str, Any]]:
+    stats: dict[str, dict[str, Any]] = {}
+    for signal in all_signals:
+        bucket = stats.setdefault(
+            signal.strategy_code.value,
+            {"evaluated": 0, "processed": 0, "approved": 0, "executed": 0, "rejected": 0, "expired": 0, "reasons": Counter()},
+        )
+        bucket["evaluated"] += 1
+    for signal in ordered_signals:
+        bucket = stats.setdefault(
+            signal.strategy_code.value,
+            {"evaluated": 0, "processed": 0, "approved": 0, "executed": 0, "rejected": 0, "expired": 0, "reasons": Counter()},
+        )
+        bucket["processed"] += 1
+    return stats
+
+
+def _note_scan_diag_reject(stats: dict[str, dict[str, Any]], strategy_code: str, reason: str) -> None:
+    bucket = stats.setdefault(
+        strategy_code,
+        {"evaluated": 0, "processed": 0, "approved": 0, "executed": 0, "rejected": 0, "expired": 0, "reasons": Counter()},
+    )
+    bucket["rejected"] += 1
+    bucket["reasons"][reason] += 1
 
 
 async def _sleep(seconds: float) -> None:

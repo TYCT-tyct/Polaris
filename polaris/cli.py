@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import Counter
 import importlib
 import json
 import re
@@ -215,6 +216,93 @@ def _resolve_run_tag_filter(raw: str, current_tag: str) -> str | None:
     if value == "all":
         return None
     return _sanitize_run_tag(raw)
+
+
+_PAPER_PROFILE_PRESETS: dict[str, dict[str, str]] = {
+    "trigger_safe_50": {
+        "POLARIS_ARB_PAPER_INITIAL_BANKROLL_USD": "50",
+        "POLARIS_ARB_SINGLE_RISK_USD": "6",
+        "POLARIS_ARB_MAX_EXPOSURE_USD": "24",
+        "POLARIS_ARB_DAILY_STOP_LOSS_USD": "8",
+        "POLARIS_ARB_A_MIN_EDGE_PCT": "0.005",
+        "POLARIS_ARB_B_MIN_EDGE_PCT": "0.004",
+        "POLARIS_ARB_C_MIN_EDGE_PCT": "0.008",
+        "POLARIS_ARB_F_MIN_PROB": "0.85",
+        "POLARIS_ARB_F_MAX_HOURS_TO_RESOLVE": "72",
+        "POLARIS_ARB_F_MIN_ANNUALIZED_RETURN": "0.02",
+        "POLARIS_ARB_F_MAX_SPREAD": "0.03",
+        "POLARIS_ARB_G_MAX_HOURS_TO_RESOLVE": "72",
+        "POLARIS_ARB_G_MIN_CONFIDENCE": "0.75",
+        "POLARIS_ARB_G_MIN_EXPECTED_EDGE_PCT": "0.005",
+        "POLARIS_ARB_SAFE_ARBITRAGE_ONLY": "false",
+        "POLARIS_ARB_ENABLE_STRATEGY_A": "true",
+        "POLARIS_ARB_ENABLE_STRATEGY_B": "true",
+        "POLARIS_ARB_ENABLE_STRATEGY_C": "true",
+        "POLARIS_ARB_ENABLE_STRATEGY_F": "true",
+        "POLARIS_ARB_ENABLE_STRATEGY_G": "true",
+    },
+    "conservative_50": {
+        "POLARIS_ARB_PAPER_INITIAL_BANKROLL_USD": "50",
+        "POLARIS_ARB_SINGLE_RISK_USD": "4",
+        "POLARIS_ARB_MAX_EXPOSURE_USD": "16",
+        "POLARIS_ARB_DAILY_STOP_LOSS_USD": "6",
+        "POLARIS_ARB_A_MIN_EDGE_PCT": "0.015",
+        "POLARIS_ARB_B_MIN_EDGE_PCT": "0.012",
+        "POLARIS_ARB_C_MIN_EDGE_PCT": "0.015",
+        "POLARIS_ARB_F_MIN_PROB": "0.94",
+        "POLARIS_ARB_F_MAX_HOURS_TO_RESOLVE": "72",
+        "POLARIS_ARB_F_MIN_ANNUALIZED_RETURN": "0.08",
+        "POLARIS_ARB_F_MAX_SPREAD": "0.03",
+        "POLARIS_ARB_G_MAX_HOURS_TO_RESOLVE": "72",
+        "POLARIS_ARB_G_MIN_CONFIDENCE": "0.90",
+        "POLARIS_ARB_G_MIN_EXPECTED_EDGE_PCT": "0.02",
+        "POLARIS_ARB_SAFE_ARBITRAGE_ONLY": "false",
+        "POLARIS_ARB_ENABLE_STRATEGY_A": "true",
+        "POLARIS_ARB_ENABLE_STRATEGY_B": "true",
+        "POLARIS_ARB_ENABLE_STRATEGY_C": "true",
+        "POLARIS_ARB_ENABLE_STRATEGY_F": "true",
+        "POLARIS_ARB_ENABLE_STRATEGY_G": "true",
+    },
+}
+
+
+def _resolve_paper_profile(name: str) -> dict[str, str]:
+    key = name.strip().lower()
+    if key not in _PAPER_PROFILE_PRESETS:
+        available = ", ".join(sorted(_PAPER_PROFILE_PRESETS.keys()))
+        raise typer.BadParameter(f"unknown profile={name!r}, available: {available}")
+    return dict(_PAPER_PROFILE_PRESETS[key])
+
+
+def _apply_profile_to_env_file(env_path: Path, profile: dict[str, str]) -> int:
+    existing: list[str] = []
+    if env_path.exists():
+        existing = env_path.read_text(encoding="utf-8").splitlines()
+    changed = 0
+    matched: set[str] = set()
+    updated: list[str] = []
+    for line in existing:
+        raw = line.strip()
+        if not raw or raw.startswith("#") or "=" not in line:
+            updated.append(line)
+            continue
+        key = line.split("=", 1)[0].strip()
+        if key in profile:
+            value = profile[key]
+            newline = f"{key}={value}"
+            if line != newline:
+                changed += 1
+            updated.append(newline)
+            matched.add(key)
+        else:
+            updated.append(line)
+    for key, value in profile.items():
+        if key in matched:
+            continue
+        updated.append(f"{key}={value}")
+        changed += 1
+    env_path.write_text("\n".join(updated).rstrip() + "\n", encoding="utf-8")
+    return changed
 
 
 @app.command("migrate")
@@ -580,24 +668,74 @@ def arb_run(
     asyncio.run(_run())
 
 
+@app.command("arb-paper-profile")
+def arb_paper_profile(
+    name: Annotated[str, typer.Option("--name")] = "trigger_safe_50",
+    env_file: Annotated[str, typer.Option("--env-file")] = ".env",
+    apply: Annotated[bool, typer.Option("--apply/--print")] = True,
+) -> None:
+    """Apply a paper parameter profile for triggerability/risk control."""
+    profile = _resolve_paper_profile(name)
+    payload: dict[str, object] = {"profile": name.strip().lower(), "values": profile, "applied": False}
+    if apply:
+        path = Path(env_file).expanduser()
+        changed = _apply_profile_to_env_file(path, profile)
+        refresh_process_env_from_file(path, preserve_existing=False)
+        load_settings.cache_clear()
+        payload["applied"] = True
+        payload["env_file"] = str(path)
+        payload["changed"] = changed
+    typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+@app.command("arb-doctor")
+def arb_doctor(
+    mode: Annotated[str, typer.Option("--mode", help="shadow|paper_live|live")] = "paper_live",
+    source: Annotated[str, typer.Option("--source")] = "polymarket",
+) -> None:
+    """Check triggerability before paper/live run and explain why signals may be zero."""
+    refresh_process_env_from_file(preserve_existing=True)
+    load_settings.cache_clear()
+    settings = load_settings()
+    setup_logging(settings.log_level)
+    _ensure_windows_selector_loop()
+    run_mode = parse_run_mode(mode)
+    source_code = source.strip().lower() or "polymarket"
+
+    async def _run() -> int:
+        ctx = await create_arb_runtime(settings)
+        try:
+            report = await _build_arb_doctor_report(ctx, run_mode, source_code)
+            typer.echo(json.dumps(report, ensure_ascii=False, indent=2, default=str))
+            return 2 if bool(report.get("likely_zero_signal")) else 0
+        finally:
+            await close_arb_runtime(ctx)
+
+    code = asyncio.run(_run())
+    raise typer.Exit(code=code)
+
+
 @app.command("arb-paper-matrix-start")
 def arb_paper_matrix_start(
-    duration_hours: Annotated[int, typer.Option("--duration-hours", min=1, max=72)] = 8,
+    duration_hours: Annotated[int, typer.Option("--duration-hours", min=1, max=72)] = 4,
     source_prefix: Annotated[str, typer.Option("--source-prefix")] = "polymarket",
-    bankroll_usd: Annotated[float, typer.Option("--bankroll-usd", min=1.0)] = 10.0,
+    profile: Annotated[str, typer.Option("--profile")] = "trigger_safe_50",
+    bankroll_usd: Annotated[float, typer.Option("--bankroll-usd", min=1.0)] = 50.0,
     include_c: Annotated[bool, typer.Option("--include-c/--no-include-c")] = True,
 ) -> None:
-    """Start two background paper runs:
-    1) shared capital pool (all strategies share one bankroll)
-    2) isolated capital pool (each strategy has its own bankroll)
+    """Start paper matrix:
+    - A/B/C/F/G each isolated bankroll
+    - ABCFG shared bankroll
     """
     refresh_process_env_from_file(preserve_existing=True)
     load_settings.cache_clear()
     settings = load_settings()
     setup_logging(settings.log_level)
+    profile_env = _resolve_paper_profile(profile)
 
     strategies = ["A", "B", "F", "G"] + (["C"] if include_c else [])
     timestamp = datetime.now(tz=UTC).strftime("%Y%m%d_%H%M%S")
+    matrix_tag = _sanitize_run_tag(f"paper-{profile}-{timestamp}")
     logs_dir = Path("logs")
     logs_dir.mkdir(parents=True, exist_ok=True)
     run_dir = Path("run")
@@ -605,17 +743,19 @@ def arb_paper_matrix_start(
 
     bankroll_tag = str(int(bankroll_usd)) if float(bankroll_usd).is_integer() else f"{bankroll_usd:g}"
 
-    def _spawn(scope: str) -> tuple[int, Path, str]:
-        source = f"{source_prefix}_{scope}{bankroll_tag}".lower()
-        log_path = logs_dir / f"arb_paper_{scope}_{timestamp}.log"
+    def _spawn(name: str, enabled: set[str], split_by_strategy: bool) -> tuple[int, Path, str]:
+        source = f"{source_prefix}_{profile}_{name}{bankroll_tag}".lower()
+        log_path = logs_dir / f"arb_paper_{name}_{timestamp}.log"
         env = os.environ.copy()
+        env.update(profile_env)
+        env["POLARIS_ARB_RUN_TAG"] = matrix_tag
         env["POLARIS_ARB_PAPER_INITIAL_BANKROLL_USD"] = f"{bankroll_usd:.4f}"
-        env["POLARIS_ARB_PAPER_SPLIT_BY_STRATEGY"] = "true" if scope == "isolated" else "false"
-        env["POLARIS_ARB_ENABLE_STRATEGY_A"] = "true" if "A" in strategies else "false"
-        env["POLARIS_ARB_ENABLE_STRATEGY_B"] = "true" if "B" in strategies else "false"
-        env["POLARIS_ARB_ENABLE_STRATEGY_C"] = "true" if "C" in strategies else "false"
-        env["POLARIS_ARB_ENABLE_STRATEGY_F"] = "true" if "F" in strategies else "false"
-        env["POLARIS_ARB_ENABLE_STRATEGY_G"] = "true" if "G" in strategies else "false"
+        env["POLARIS_ARB_PAPER_SPLIT_BY_STRATEGY"] = "true" if split_by_strategy else "false"
+        env["POLARIS_ARB_ENABLE_STRATEGY_A"] = "true" if "A" in enabled else "false"
+        env["POLARIS_ARB_ENABLE_STRATEGY_B"] = "true" if "B" in enabled else "false"
+        env["POLARIS_ARB_ENABLE_STRATEGY_C"] = "true" if "C" in enabled else "false"
+        env["POLARIS_ARB_ENABLE_STRATEGY_F"] = "true" if "F" in enabled else "false"
+        env["POLARIS_ARB_ENABLE_STRATEGY_G"] = "true" if "G" in enabled else "false"
 
         cmd: list[str] = [
             sys.executable,
@@ -626,8 +766,10 @@ def arb_paper_matrix_start(
             "paper_live",
             "--source",
             source,
+            "--run-tag",
+            matrix_tag,
             "--paper-capital-scope",
-            "strategy" if scope == "isolated" else "shared",
+            "strategy" if split_by_strategy else "shared",
         ]
         if not sys.platform.startswith("win"):
             cmd = ["timeout", f"{duration_hours}h"] + cmd
@@ -642,15 +784,20 @@ def arb_paper_matrix_start(
             start_new_session=True,
         )
         log_handle.close()
-        (run_dir / f"arb_paper_{scope}.pid").write_text(str(proc.pid), encoding="utf-8")
+        (run_dir / f"arb_paper_{name}.pid").write_text(str(proc.pid), encoding="utf-8")
         return proc.pid, log_path, source
 
-    shared_pid, shared_log, shared_source = _spawn("shared")
-    isolated_pid, isolated_log, isolated_source = _spawn("isolated")
+    started: list[tuple[str, int, Path, str]] = []
+    shared_name = "shared_abcfg"
+    started.append((shared_name, *_spawn(shared_name, set(strategies), False)))
+    for strategy in strategies:
+        name = f"isolated_{strategy.lower()}"
+        started.append((name, *_spawn(name, {strategy}, True)))
 
     typer.echo("arb-paper-matrix started")
-    typer.echo(f"shared:   pid={shared_pid} source={shared_source} log={shared_log}")
-    typer.echo(f"isolated: pid={isolated_pid} source={isolated_source} log={isolated_log}")
+    typer.echo(f"profile={profile} run_tag={matrix_tag} bankroll={bankroll_usd:g}")
+    for name, pid, log_path, source in started:
+        typer.echo(f"{name}: pid={pid} source={source} log={log_path}")
 
 
 @app.command("arb-paper-matrix-stop")
@@ -658,10 +805,7 @@ def arb_paper_matrix_stop() -> None:
     """Stop background matrix paper runs if pid files exist."""
     run_dir = Path("run")
     stopped = 0
-    for scope in ("shared", "isolated"):
-        pid_file = run_dir / f"arb_paper_{scope}.pid"
-        if not pid_file.exists():
-            continue
+    for pid_file in run_dir.glob("arb_paper_*.pid"):
         try:
             pid = int(pid_file.read_text(encoding="utf-8").strip())
         except Exception:
@@ -936,6 +1080,11 @@ def arb_clean(
     source_code: Annotated[str, typer.Option("--source", help="source code, or all")] = "all",
     run_tag: Annotated[str, typer.Option("--run-tag", help="current|all|custom")] = "all",
     since_hours: Annotated[int, typer.Option("--since-hours", min=0, max=24 * 365)] = 0,
+    include_position_lot: Annotated[bool, typer.Option("--include-position-lot/--no-include-position-lot")] = False,
+    include_param_snapshot: Annotated[
+        bool,
+        typer.Option("--include-param-snapshot/--no-include-param-snapshot"),
+    ] = False,
     apply: Annotated[bool, typer.Option("--apply/--dry-run")] = False,
 ) -> None:
     """Clean historical Module2 data to avoid old-version contamination."""
@@ -965,12 +1114,16 @@ def arb_clean(
                 source_filter=source_filter,
                 run_tag_filter=run_tag_filter,
                 since_start=since_start,
+                include_position_lot=include_position_lot,
+                include_param_snapshot=include_param_snapshot,
             )
             payload: dict[str, object] = {
                 "mode": mode_filter or "all",
                 "source_code": source_filter or "all",
                 "run_tag": run_tag_filter or "all",
                 "since_start": since_start,
+                "include_position_lot": include_position_lot,
+                "include_param_snapshot": include_param_snapshot,
                 "counts": counts,
                 "applied": apply,
             }
@@ -981,6 +1134,8 @@ def arb_clean(
                     source_filter=source_filter,
                     run_tag_filter=run_tag_filter,
                     since_start=since_start,
+                    include_position_lot=include_position_lot,
+                    include_param_snapshot=include_param_snapshot,
                 )
                 payload["deleted"] = deleted
             typer.echo(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
@@ -1068,8 +1223,10 @@ async def _arb_cleanup_counts(
     source_filter: str | None,
     run_tag_filter: str | None,
     since_start: datetime | None,
+    include_position_lot: bool,
+    include_param_snapshot: bool,
 ) -> dict[str, int]:
-    params = (
+    signal_params = (
         mode_filter,
         mode_filter,
         source_filter,
@@ -1079,41 +1236,172 @@ async def _arb_cleanup_counts(
         since_start,
         since_start,
     )
-    tables = {
-        "arb_signal": "coalesce(features->>'run_tag', '')",
-        "arb_trade_result": "coalesce(metadata->>'run_tag', '')",
-        "arb_cash_ledger": "coalesce(payload->>'run_tag', '')",
-        "arb_risk_event": "coalesce(payload->>'run_tag', '')",
-        "arb_replay_run": "coalesce(metadata->>'run_tag', '')",
-    }
+    replay_params = (
+        mode_filter,
+        mode_filter,
+        source_filter,
+        source_filter,
+        run_tag_filter,
+        run_tag_filter,
+        since_start,
+        since_start,
+    )
     counts: dict[str, int] = {}
-    for table, run_tag_expr in tables.items():
-        row = await db.fetch_one(
-            f"""
+
+    def _as_int(row: dict[str, object] | None) -> int:
+        if not row:
+            return 0
+        return int(row.get("c", 0) or 0)
+
+    counts["arb_signal"] = _as_int(
+        await db.fetch_one(
+            """
             select count(*) as c
-            from {table}
+            from arb_signal
             where (%s::text is null or mode = %s::text)
               and (%s::text is null or source_code = %s::text)
-              and (%s::text is null or {run_tag_expr} = %s::text)
+              and (%s::text is null or coalesce(features->>'run_tag', '') = %s::text)
               and (%s::timestamptz is null or created_at >= %s::timestamptz)
             """,
-            params,
+            signal_params,
         )
-        counts[table] = int(row["c"] or 0) if row else 0
-
-    replay_metric_row = await db.fetch_one(
-        """
-        select count(*) as c
-        from arb_replay_metric m
-        join arb_replay_run r on r.replay_run_id = m.replay_run_id
-        where (%s::text is null or r.mode = %s::text)
-          and (%s::text is null or coalesce(r.metadata->>'source_code', '') = %s::text)
-          and (%s::text is null or coalesce(r.metadata->>'run_tag', '') = %s::text)
-          and (%s::timestamptz is null or r.started_at >= %s::timestamptz)
-        """,
-        params,
     )
-    counts["arb_replay_metric"] = int(replay_metric_row["c"] or 0) if replay_metric_row else 0
+    counts["arb_order_intent"] = _as_int(
+        await db.fetch_one(
+            """
+            select count(*) as c
+            from arb_order_intent i
+            join arb_signal s on s.signal_id = i.signal_id
+            where (%s::text is null or s.mode = %s::text)
+              and (%s::text is null or s.source_code = %s::text)
+              and (%s::text is null or coalesce(s.features->>'run_tag', '') = %s::text)
+              and (%s::timestamptz is null or s.created_at >= %s::timestamptz)
+            """,
+            signal_params,
+        )
+    )
+    counts["arb_order_event"] = _as_int(
+        await db.fetch_one(
+            """
+            select count(*) as c
+            from arb_order_event e
+            join arb_order_intent i on i.intent_id = e.intent_id
+            join arb_signal s on s.signal_id = i.signal_id
+            where (%s::text is null or s.mode = %s::text)
+              and (%s::text is null or s.source_code = %s::text)
+              and (%s::text is null or coalesce(s.features->>'run_tag', '') = %s::text)
+              and (%s::timestamptz is null or s.created_at >= %s::timestamptz)
+            """,
+            signal_params,
+        )
+    )
+    counts["arb_fill"] = _as_int(
+        await db.fetch_one(
+            """
+            select count(*) as c
+            from arb_fill f
+            join arb_order_intent i on i.intent_id = f.intent_id
+            join arb_signal s on s.signal_id = i.signal_id
+            where (%s::text is null or s.mode = %s::text)
+              and (%s::text is null or s.source_code = %s::text)
+              and (%s::text is null or coalesce(s.features->>'run_tag', '') = %s::text)
+              and (%s::timestamptz is null or s.created_at >= %s::timestamptz)
+            """,
+            signal_params,
+        )
+    )
+    counts["arb_trade_result"] = _as_int(
+        await db.fetch_one(
+            """
+            select count(*) as c
+            from arb_trade_result
+            where (%s::text is null or mode = %s::text)
+              and (%s::text is null or source_code = %s::text)
+              and (%s::text is null or coalesce(metadata->>'run_tag', '') = %s::text)
+              and (%s::timestamptz is null or created_at >= %s::timestamptz)
+            """,
+            signal_params,
+        )
+    )
+    counts["arb_cash_ledger"] = _as_int(
+        await db.fetch_one(
+            """
+            select count(*) as c
+            from arb_cash_ledger
+            where (%s::text is null or mode = %s::text)
+              and (%s::text is null or source_code = %s::text)
+              and (%s::text is null or coalesce(payload->>'run_tag', '') = %s::text)
+              and (%s::timestamptz is null or created_at >= %s::timestamptz)
+            """,
+            signal_params,
+        )
+    )
+    counts["arb_risk_event"] = _as_int(
+        await db.fetch_one(
+            """
+            select count(*) as c
+            from arb_risk_event
+            where (%s::text is null or mode = %s::text)
+              and (%s::text is null or source_code = %s::text)
+              and (%s::text is null or coalesce(payload->>'run_tag', '') = %s::text)
+              and (%s::timestamptz is null or created_at >= %s::timestamptz)
+            """,
+            signal_params,
+        )
+    )
+    counts["arb_replay_run"] = _as_int(
+        await db.fetch_one(
+            """
+            select count(*) as c
+            from arb_replay_run
+            where (%s::text is null or mode = %s::text)
+              and (%s::text is null or coalesce(metadata->>'source_code', '') = %s::text)
+              and (%s::text is null or coalesce(metadata->>'run_tag', '') = %s::text)
+              and (%s::timestamptz is null or started_at >= %s::timestamptz)
+            """,
+            replay_params,
+        )
+    )
+    counts["arb_replay_metric"] = _as_int(
+        await db.fetch_one(
+            """
+            select count(*) as c
+            from arb_replay_metric m
+            join arb_replay_run r on r.replay_run_id = m.replay_run_id
+            where (%s::text is null or r.mode = %s::text)
+              and (%s::text is null or coalesce(r.metadata->>'source_code', '') = %s::text)
+              and (%s::text is null or coalesce(r.metadata->>'run_tag', '') = %s::text)
+              and (%s::timestamptz is null or r.started_at >= %s::timestamptz)
+            """,
+            replay_params,
+        )
+    )
+    if include_position_lot:
+        counts["arb_position_lot"] = _as_int(
+            await db.fetch_one(
+                """
+                select count(*) as c
+                from arb_position_lot
+                where (%s::text is null or mode = %s::text)
+                  and (%s::text is null or source_code = %s::text)
+                  and (%s::text is null or coalesce(run_tag, '') = %s::text)
+                  and (%s::timestamptz is null or opened_at >= %s::timestamptz)
+                """,
+                signal_params,
+            )
+        )
+    if include_param_snapshot:
+        counts["arb_param_snapshot"] = _as_int(
+            await db.fetch_one(
+                """
+                select count(*) as c
+                from arb_param_snapshot
+                where (%s::text is null or coalesce(score_breakdown->>'run_tag', '') = %s::text)
+                  and (%s::timestamptz is null or created_at >= %s::timestamptz)
+                """,
+                (run_tag_filter, run_tag_filter, since_start, since_start),
+            )
+        )
     return counts
 
 
@@ -1124,8 +1412,10 @@ async def _arb_cleanup_apply(
     source_filter: str | None,
     run_tag_filter: str | None,
     since_start: datetime | None,
+    include_position_lot: bool,
+    include_param_snapshot: bool,
 ) -> dict[str, int]:
-    params = (
+    signal_params = (
         mode_filter,
         mode_filter,
         source_filter,
@@ -1135,61 +1425,217 @@ async def _arb_cleanup_apply(
         since_start,
         since_start,
     )
-    deleted: dict[str, int] = {}
+    replay_params = (
+        mode_filter,
+        mode_filter,
+        source_filter,
+        source_filter,
+        run_tag_filter,
+        run_tag_filter,
+        since_start,
+        since_start,
+    )
+    deleted = await _arb_cleanup_counts(
+        db,
+        mode_filter=mode_filter,
+        source_filter=source_filter,
+        run_tag_filter=run_tag_filter,
+        since_start=since_start,
+        include_position_lot=include_position_lot,
+        include_param_snapshot=include_param_snapshot,
+    )
 
-    replay_runs = await db.fetch_all(
+    await db.execute(
         """
-        select replay_run_id
-        from arb_replay_run
+        delete from arb_replay_run
         where (%s::text is null or mode = %s::text)
           and (%s::text is null or coalesce(metadata->>'source_code', '') = %s::text)
           and (%s::text is null or coalesce(metadata->>'run_tag', '') = %s::text)
           and (%s::timestamptz is null or started_at >= %s::timestamptz)
         """,
-        params,
+        replay_params,
     )
-    replay_ids = [row["replay_run_id"] for row in replay_runs]
-    if replay_ids:
-        await db.execute("delete from arb_replay_run where replay_run_id = any(%s)", (replay_ids,))
-    deleted["arb_replay_run"] = len(replay_ids)
 
-    row = await db.fetch_one(
-        """
-        with gone as (
+    if include_param_snapshot:
+        await db.execute(
+            """
             delete from arb_param_snapshot
             where (%s::text is null or coalesce(score_breakdown->>'run_tag', '') = %s::text)
               and (%s::timestamptz is null or created_at >= %s::timestamptz)
-            returning 1
-        )
-        select count(*) as c from gone
-        """,
-        (run_tag_filter, run_tag_filter, since_start, since_start),
-    )
-    deleted["arb_param_snapshot"] = int(row["c"] or 0) if row else 0
-
-    for table, run_tag_expr in (
-        ("arb_risk_event", "coalesce(payload->>'run_tag', '')"),
-        ("arb_cash_ledger", "coalesce(payload->>'run_tag', '')"),
-        ("arb_trade_result", "coalesce(metadata->>'run_tag', '')"),
-        ("arb_signal", "coalesce(features->>'run_tag', '')"),
-    ):
-        row = await db.fetch_one(
-            f"""
-            with gone as (
-                delete from {table}
-                where (%s::text is null or mode = %s::text)
-                  and (%s::text is null or source_code = %s::text)
-                  and (%s::text is null or {run_tag_expr} = %s::text)
-                  and (%s::timestamptz is null or created_at >= %s::timestamptz)
-                returning 1
-            )
-            select count(*) as c from gone
             """,
-            params,
+            (run_tag_filter, run_tag_filter, since_start, since_start),
         )
-        deleted[table] = int(row["c"] or 0) if row else 0
+    if include_position_lot:
+        await db.execute(
+            """
+            delete from arb_position_lot
+            where (%s::text is null or mode = %s::text)
+              and (%s::text is null or source_code = %s::text)
+              and (%s::text is null or coalesce(run_tag, '') = %s::text)
+              and (%s::timestamptz is null or opened_at >= %s::timestamptz)
+            """,
+            signal_params,
+        )
+
+    await db.execute(
+        """
+        delete from arb_risk_event
+        where (%s::text is null or mode = %s::text)
+          and (%s::text is null or source_code = %s::text)
+          and (%s::text is null or coalesce(payload->>'run_tag', '') = %s::text)
+          and (%s::timestamptz is null or created_at >= %s::timestamptz)
+        """,
+        signal_params,
+    )
+    await db.execute(
+        """
+        delete from arb_cash_ledger
+        where (%s::text is null or mode = %s::text)
+          and (%s::text is null or source_code = %s::text)
+          and (%s::text is null or coalesce(payload->>'run_tag', '') = %s::text)
+          and (%s::timestamptz is null or created_at >= %s::timestamptz)
+        """,
+        signal_params,
+    )
+    await db.execute(
+        """
+        delete from arb_trade_result
+        where (%s::text is null or mode = %s::text)
+          and (%s::text is null or source_code = %s::text)
+          and (%s::text is null or coalesce(metadata->>'run_tag', '') = %s::text)
+          and (%s::timestamptz is null or created_at >= %s::timestamptz)
+        """,
+        signal_params,
+    )
+    await db.execute(
+        """
+        delete from arb_signal
+        where (%s::text is null or mode = %s::text)
+          and (%s::text is null or source_code = %s::text)
+          and (%s::text is null or coalesce(features->>'run_tag', '') = %s::text)
+          and (%s::timestamptz is null or created_at >= %s::timestamptz)
+        """,
+        signal_params,
+    )
 
     return deleted
+
+
+async def _build_arb_doctor_report(
+    ctx: ArbRuntimeContext,
+    mode: RunMode,
+    source_code: str,
+) -> dict[str, object]:
+    config = ctx.orchestrator.config
+    snapshots = await ctx.orchestrator._load_live_snapshots()
+    now = datetime.now(tz=UTC)
+
+    market_hours: dict[str, float] = {}
+    min_order_notionals: list[float] = []
+    for snapshot in snapshots:
+        if snapshot.market_end:
+            market_hours.setdefault(snapshot.market_id, (snapshot.market_end - now).total_seconds() / 3600.0)
+        if snapshot.best_ask is not None and snapshot.min_order_size is not None:
+            required = float(snapshot.best_ask) * float(snapshot.min_order_size)
+            if required > 0:
+                min_order_notionals.append(required)
+
+    def _hours_count(limit: float) -> int:
+        return sum(1 for value in market_hours.values() if value <= limit)
+
+    raw_strategy_counts: dict[str, int] = {}
+    strategy_scanners = (
+        ("A", config.enable_strategy_a, ctx.orchestrator.strategy_a),
+        ("B", config.enable_strategy_b, ctx.orchestrator.strategy_b),
+        ("C", config.enable_strategy_c, ctx.orchestrator.strategy_c),
+        ("F", config.enable_strategy_f, ctx.orchestrator.strategy_f),
+        ("G", config.enable_strategy_g, ctx.orchestrator.strategy_g),
+    )
+    for code, enabled, scanner in strategy_scanners:
+        if not enabled:
+            continue
+        raw_strategy_counts[code] = len(scanner.scan(mode, source_code, snapshots))
+
+    active_signals = ctx.orchestrator._scan_all(mode, source_code, snapshots)
+    active_counts: Counter[str] = Counter(signal.strategy_code.value for signal in active_signals)
+
+    allow_counts: Counter[str] = Counter()
+    reject_by_strategy: dict[str, Counter[str]] = {}
+    state_cache: dict[str, object] = {}
+    for signal in active_signals:
+        if signal.is_expired():
+            bucket = reject_by_strategy.setdefault(signal.strategy_code.value, Counter())
+            bucket["expired"] += 1
+            continue
+        scope_key = ctx.orchestrator._state_scope_key(signal)
+        runtime_state = state_cache.get(scope_key)
+        if runtime_state is None:
+            runtime_state = await ctx.orchestrator.risk_gate.load_state(
+                signal.mode,
+                signal.source_code,
+                strategy_code=signal.strategy_code if ctx.orchestrator._paper_strategy_split(signal.mode) else None,
+            )
+            state_cache[scope_key] = runtime_state
+        plan = ctx.orchestrator._build_plan(signal)
+        notional = sum(float(intent.notional_usd or 0.0) for intent in plan.intents)
+        decision = await ctx.orchestrator.risk_gate.assess(signal, notional, state=runtime_state)
+        if decision.allowed:
+            allow_counts[signal.strategy_code.value] += 1
+        else:
+            bucket = reject_by_strategy.setdefault(signal.strategy_code.value, Counter())
+            bucket[decision.reason] += 1
+
+    p50_min_order = _pct(min_order_notionals, 50) if min_order_notionals else 0.0
+    p90_min_order = _pct(min_order_notionals, 90) if min_order_notionals else 0.0
+    suggestions: list[str] = []
+    if p50_min_order > 0 and config.single_risk_usd < p50_min_order:
+        suggestions.append(
+            f"single_risk_usd({config.single_risk_usd:.3f}) 低于 p50(min_order_notional={p50_min_order:.3f})，会导致大量风险门拒绝"
+        )
+    if config.max_exposure_usd < (3.0 * config.single_risk_usd):
+        suggestions.append(
+            f"max_exposure_usd({config.max_exposure_usd:.3f}) < 3 * single_risk_usd({config.single_risk_usd:.3f})，并发空间过窄"
+        )
+    if config.safe_arbitrage_only and (config.enable_strategy_f or config.enable_strategy_g):
+        suggestions.append("safe_arbitrage_only=true 会在非 shadow 模式过滤 F/G")
+    if _hours_count(12.0) == 0 and (config.enable_strategy_f or config.enable_strategy_g):
+        suggestions.append("当前 <=12h 到期市场为 0，F/G 很难触发")
+
+    likely_zero_signal = (sum(active_counts.values()) == 0) or (sum(allow_counts.values()) == 0)
+    rejection_top = {
+        strategy: dict(sorted(counter.items(), key=lambda item: (-item[1], item[0]))[:5])
+        for strategy, counter in reject_by_strategy.items()
+    }
+    return {
+        "mode": mode.value,
+        "source_code": source_code,
+        "run_tag": config.run_tag,
+        "execution_backend": config.execution_backend,
+        "snapshot": {
+            "token_count": len(snapshots),
+            "market_count": len(market_hours),
+            "market_hours_le_4": _hours_count(4.0),
+            "market_hours_le_12": _hours_count(12.0),
+            "market_hours_le_72": _hours_count(72.0),
+            "min_order_notional_p50": round(p50_min_order, 6),
+            "min_order_notional_p90": round(p90_min_order, 6),
+            "metrics": dict(ctx.orchestrator._last_snapshot_metrics),
+        },
+        "raw_signal_counts": dict(raw_strategy_counts),
+        "active_signal_counts": dict(active_counts),
+        "risk_allowed_counts": dict(allow_counts),
+        "risk_reject_topn": rejection_top,
+        "checks": {
+            "single_risk_usd": config.single_risk_usd,
+            "max_exposure_usd": config.max_exposure_usd,
+            "daily_stop_loss_usd": config.daily_stop_loss_usd,
+            "safe_arbitrage_only": config.safe_arbitrage_only,
+            "single_risk_meets_p50_min_order": config.single_risk_usd >= p50_min_order if p50_min_order > 0 else True,
+            "exposure_ge_3x_single_risk": config.max_exposure_usd >= (3.0 * config.single_risk_usd),
+        },
+        "likely_zero_signal": likely_zero_signal,
+        "suggestions": suggestions,
+    }
 
 
 def _default_export_path(table: str, export_format: ExportFormat) -> Path:

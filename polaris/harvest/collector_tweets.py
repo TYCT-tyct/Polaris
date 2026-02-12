@@ -17,31 +17,22 @@ class TweetCollector:
 
     async def sync_account(self, handle: str) -> XTrackerUser:
         user = await self.client.get_user(handle)
-        existing = await self.db.fetch_one(
-            "select account_id from dim_account where handle = %s",
-            (user.handle,),
-        )
-        canonical_account_id = existing["account_id"] if existing else user.account_id
-        await self.db.execute(
+        row = await self.db.fetch_one(
             """
-            insert into dim_account(
-                account_id, handle, platform_id, display_name, avatar_url, bio, verified,
-                post_count, last_sync, created_at, updated_at
-            )
-            values (%s, %s, %s, %s, %s, %s, %s, %s, %s, now(), now())
-            on conflict (account_id) do update
-            set handle = excluded.handle,
-                platform_id = excluded.platform_id,
-                display_name = excluded.display_name,
-                avatar_url = excluded.avatar_url,
-                bio = excluded.bio,
-                verified = excluded.verified,
-                post_count = excluded.post_count,
-                last_sync = excluded.last_sync,
+            update dim_account
+            set handle = %s,
+                platform_id = %s,
+                display_name = %s,
+                avatar_url = %s,
+                bio = %s,
+                verified = %s,
+                post_count = %s,
+                last_sync = %s,
                 updated_at = now()
+            where account_id = %s
+            returning account_id
             """,
             (
-                canonical_account_id,
                 user.handle,
                 user.platform_id,
                 user.name,
@@ -50,8 +41,41 @@ class TweetCollector:
                 user.verified,
                 user.post_count,
                 user.last_sync,
+                user.account_id,
             ),
         )
+        if row is None:
+            row = await self.db.fetch_one(
+                """
+                insert into dim_account(
+                    account_id, handle, platform_id, display_name, avatar_url, bio, verified,
+                    post_count, last_sync, created_at, updated_at
+                )
+                values (%s, %s, %s, %s, %s, %s, %s, %s, %s, now(), now())
+                on conflict (handle) do update
+                set platform_id = excluded.platform_id,
+                    display_name = excluded.display_name,
+                    avatar_url = excluded.avatar_url,
+                    bio = excluded.bio,
+                    verified = excluded.verified,
+                    post_count = excluded.post_count,
+                    last_sync = excluded.last_sync,
+                    updated_at = now()
+                returning account_id
+                """,
+                (
+                    user.account_id,
+                    user.handle,
+                    user.platform_id,
+                    user.name,
+                    user.avatar_url,
+                    user.bio,
+                    user.verified,
+                    user.post_count,
+                    user.last_sync,
+                ),
+            )
+        canonical_account_id = row["account_id"] if row else user.account_id
         if canonical_account_id != user.account_id:
             return user.model_copy(update={"account_id": canonical_account_id})
         return user

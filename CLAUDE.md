@@ -28,7 +28,8 @@
 │  │     ├─ 0002_partitions_indexes.sql
 │  │     ├─ 0003_module2_core.sql
 │  │     ├─ 0004_module2_views.sql
-│  │     └─ 0005_module2_run_tag_indexes.sql
+│  │     ├─ 0005_module2_run_tag_indexes.sql
+│  │     └─ 0006_module2_diag_and_cleanup.sql
 │  ├─ infra/
 │  │  ├─ __init__.py
 │  │  ├─ rate_limiter.py
@@ -113,9 +114,11 @@
    ├─ test_arb_live_scan.py
    ├─ test_arb_replay_real.py
    ├─ test_arb_reporting.py
+   ├─ test_arb_clean_compat.py
    ├─ test_order_router_preflight.py
    ├─ test_clob_prices_parser.py
-   └─ test_t2t_benchmark.py
+   ├─ test_t2t_benchmark.py
+   └─ test_tweet_sync_account_conflict.py
 ```
 
 ## 模块职责
@@ -147,6 +150,10 @@
 - 持有型策略在开仓时使用 `entry_only` 收益口径，避免把未实现浮盈亏误计为已实现亏损。
 - 引入 Rust 桥接可选路径，支持 `daemon/subprocess/pyo3` 三种模式，默认关闭，稳定后按环境开关灰度开启。
 - Module2 全链路引入 `run_tag` 隔离（signal/trade/risk/cash/replay），报表默认看 `current`，避免旧版本数据污染当前收益判断。
+- Module2 新增 `arb_scan_diag` 扫描诊断表，按策略沉淀每轮 evaluated/approved/rejected 与阻塞原因 TopN。
+- `arb-clean` 改为表级字段映射清理，支持 `arb_position_lot` 与 `arb_param_snapshot` 可选深度清理，避免跨版本残留污染。
+- `arb_position_lot` 增加 `run_tag`，实现仓位层数据与 run 版本隔离。
+- `TweetCollector.sync_account` 改为账号优先更新 + handle 冲突兜底上推，修复并发唯一键冲突路径。
 - CLOB 客户端启用 HTTP/2 与连接池参数，减少连接抖动；`/books` 失败时降级到 `/prices`，保证循环不断。
 - 增加 Universe 元数据缓存与流动性下限过滤，优先高质量市场并降低每轮数据库查询负担。
 
@@ -164,3 +171,4 @@
 - 2026-02-12：新增 `rust/polaris_pyo3` 与 `pyo3` 执行模式，支持同进程 Rust 基准与 paper 模拟。
 - 2026-02-12：新增 `0005_module2_run_tag_indexes.sql`、`arb-clean` 命令和 `run_tag` 报表过滤，修复旧配置混入历史报表问题。
 - 2026-02-12：新增 CLOB HTTP/2 连接参数、`/prices` 降级路径、Universe 缓存与流动性筛选，并补充 `test_clob_prices_parser.py`。
+- 2026-02-12：新增 `0006_module2_diag_and_cleanup.sql`、`arb-doctor`、`arb-paper-profile`、新版 `arb-paper-matrix-start`，并修复 `arb-clean` 字段兼容问题。

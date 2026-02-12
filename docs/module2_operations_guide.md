@@ -11,20 +11,26 @@
 - 影子模式：
   `python -m polaris.cli arb-run --mode shadow --source polymarket_shadow --run-tag auto`
 - 实时 paper：
-  `python -m polaris.cli arb-run --mode paper_live --source polymarket_shared10 --paper-capital-scope shared --run-tag auto`
+  `python -m polaris.cli arb-run --mode paper_live --source polymarket_shared50 --paper-capital-scope shared --run-tag auto`
 - 实盘：
   `python -m polaris.cli arb-run --mode live --source polymarket_live --run-tag auto`
 
-独立资金池（每个策略独立 10 美元）：
-`python -m polaris.cli arb-run --mode paper_live --source polymarket_isolated10 --paper-capital-scope strategy`
+独立资金池（每个策略独立 50 美元）：
+`python -m polaris.cli arb-run --mode paper_live --source polymarket_isolated50 --paper-capital-scope strategy`
 
-共享资金池（所有策略共享 10 美元）：
-`python -m polaris.cli arb-run --mode paper_live --source polymarket_shared10 --paper-capital-scope shared`
+共享资金池（所有策略共享 50 美元）：
+`python -m polaris.cli arb-run --mode paper_live --source polymarket_shared50 --paper-capital-scope shared`
 
-一键同时启动“独立+共享”两套后台 paper：
-`python -m polaris.cli arb-paper-matrix-start --duration-hours 8 --bankroll-usd 10 --source-prefix polymarket`
+启动前可触发性体检（建议先跑）：
+`python -m polaris.cli arb-doctor --mode paper_live --source polymarket`
 
-停止一键启动的两套后台 paper：
+应用“可触发但控风险”参数模板：
+`python -m polaris.cli arb-paper-profile --name trigger_safe_50`
+
+一键同时启动 6 组后台 paper（A/B/C/F/G 各自隔离 + ABCFG 共享）：
+`python -m polaris.cli arb-paper-matrix-start --profile trigger_safe_50 --duration-hours 4 --bankroll-usd 50 --source-prefix polymarket`
+
+停止一键启动的全部后台 paper：
 `python -m polaris.cli arb-paper-matrix-stop`
 
 ## 2.1 Rust 低抖动桥接（可选）
@@ -78,6 +84,8 @@
   `python -m polaris.cli arb-clean --mode paper_live --source all --run-tag all --since-hours 0 --dry-run`
 - 清理旧版本污染数据（执行删除）：
   `python -m polaris.cli arb-clean --mode paper_live --source all --run-tag all --since-hours 0 --apply`
+- 深度清理（包含仓位与参数快照）：
+  `python -m polaris.cli arb-clean --mode all --source all --run-tag all --include-position-lot --include-param-snapshot --apply`
 - 导出隔夜总结到文件：
   `python -m polaris.cli arb-summary --since-hours 12 --mode paper_live --source polymarket_shared10 --output exports/overnight_summary_shared.json`
   `python -m polaris.cli arb-summary --since-hours 12 --mode paper_live --source polymarket_isolated10 --output exports/overnight_summary_isolated.json`
@@ -94,6 +102,9 @@
 - `totals.signals_executed`：实际执行信号总数。
 - `totals.trades`：完成交易总数。
 - `totals.net_pnl_usd`：净盈亏。
+- `totals.expected_net_pnl_usd`：理论期望收益汇总（信号级 edge × notional）。
+- `totals.mark_to_book_net_pnl_usd`：按当前盘口估值的净收益。
+- `totals.net_pnl_usd`：已实现净收益（paper/live 成交口径）。
 - `totals.turnover_usd`：资金周转量。
 - `totals.execution_rate`：执行率（执行信号/发现信号）。
 - `totals.trade_conversion_rate`：交易转化率（交易数/执行信号）。
