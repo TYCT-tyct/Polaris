@@ -210,12 +210,90 @@ def _sanitize_run_tag(value: str) -> str:
 
 
 def _resolve_run_tag_filter(raw: str, current_tag: str) -> str | None:
+    """Resolve run_tag filter without DB access.
+
+    NOTE: CLI commands should prefer _resolve_run_tag_filter_db() so that
+    `--run-tag current` maps to the *latest* historical run_tag instead of the
+    ephemeral auto run_tag created for the current CLI process.
+    """
     value = (raw or "").strip().lower()
     if not value or value == "current":
         return current_tag
     if value == "all":
         return None
     return _sanitize_run_tag(raw)
+
+
+async def _resolve_run_tag_filter_db(
+    db: Database,
+    raw: str,
+    *,
+    mode_filter: str | None,
+    source_filter: str | None,
+    current_tag: str,
+) -> str | None:
+    """Resolve run_tag filter using DB data when needed.
+
+    Semantics:
+    - all -> no filter
+    - custom -> sanitized exact match
+    - current -> latest non-empty run_tag observed in DB for the given (mode, source)
+      (fallback to current_tag if it's not an ephemeral auto tag).
+    """
+    value = (raw or "").strip().lower()
+    if not value or value == "current":
+        # If we're running inside a long-lived process (paper/live), keep its run_tag.
+        if current_tag and not str(current_tag).startswith("auto-"):
+            return current_tag
+        # Otherwise, find the most recent run_tag from DB so "current" is useful.
+        latest = await _arb_find_latest_run_tag(db, mode_filter=mode_filter, source_filter=source_filter)
+        return latest or current_tag
+    if value == "all":
+        return None
+    return _sanitize_run_tag(raw)
+
+
+async def _arb_find_latest_run_tag(
+    db: Database,
+    *,
+    mode_filter: str | None,
+    source_filter: str | None,
+) -> str | None:
+    params = (
+        mode_filter,
+        mode_filter,
+        source_filter,
+        source_filter,
+    )
+    row = await db.fetch_one(
+        """
+        select coalesce(metadata->>'run_tag', '') as run_tag
+        from arb_trade_result
+        where (%s::text is null or mode = %s::text)
+          and (%s::text is null or source_code = %s::text)
+          and coalesce(metadata->>'run_tag', '') <> ''
+        order by created_at desc
+        limit 1
+        """,
+        params,
+    )
+    if row and row.get("run_tag"):
+        return str(row["run_tag"])
+    row = await db.fetch_one(
+        """
+        select coalesce(features->>'run_tag', '') as run_tag
+        from arb_signal
+        where (%s::text is null or mode = %s::text)
+          and (%s::text is null or source_code = %s::text)
+          and coalesce(features->>'run_tag', '') <> ''
+        order by created_at desc
+        limit 1
+        """,
+        params,
+    )
+    if row and row.get("run_tag"):
+        return str(row["run_tag"])
+    return None
 
 
 _PAPER_PROFILE_PRESETS: dict[str, dict[str, str]] = {
@@ -988,7 +1066,13 @@ def arb_report(
     async def _run() -> None:
         ctx = await create_arb_runtime(settings)
         try:
-            run_tag_filter = _resolve_run_tag_filter(run_tag, ctx.orchestrator.config.run_tag)
+            run_tag_filter = await _resolve_run_tag_filter_db(
+                ctx.db,
+                run_tag,
+                mode_filter=None,
+                source_filter=None,
+                current_tag=ctx.orchestrator.config.run_tag,
+            )
             rows = await ctx.reporter.report(group_by=group_by, run_tag=run_tag_filter)
             typer.echo(json.dumps(rows, ensure_ascii=False, indent=2, default=str))
         finally:
@@ -1023,7 +1107,13 @@ def arb_summary(
     async def _run() -> None:
         ctx = await create_arb_runtime(settings)
         try:
-            run_tag_filter = _resolve_run_tag_filter(run_tag, ctx.orchestrator.config.run_tag)
+            run_tag_filter = await _resolve_run_tag_filter_db(
+                ctx.db,
+                run_tag,
+                mode_filter=mode_filter,
+                source_filter=source_filter,
+                current_tag=ctx.orchestrator.config.run_tag,
+            )
             result = await ctx.reporter.summary(
                 since_hours=since_hours,
                 mode=mode_filter,
@@ -1067,7 +1157,13 @@ def arb_go_live_check(
     async def _run() -> int:
         ctx = await create_arb_runtime(settings)
         try:
-            run_tag_filter = _resolve_run_tag_filter(run_tag, ctx.orchestrator.config.run_tag)
+            run_tag_filter = await _resolve_run_tag_filter_db(
+                ctx.db,
+                run_tag,
+                mode_filter="paper_live",
+                source_filter=source_filter,
+                current_tag=ctx.orchestrator.config.run_tag,
+            )
             summary = await ctx.reporter.summary(
                 since_hours=since_hours,
                 mode="paper_live",
@@ -1200,7 +1296,13 @@ def arb_clean(
     async def _run() -> None:
         ctx = await create_arb_runtime(settings)
         try:
-            run_tag_filter = _resolve_run_tag_filter(run_tag, ctx.orchestrator.config.run_tag)
+            run_tag_filter = await _resolve_run_tag_filter_db(
+                ctx.db,
+                run_tag,
+                mode_filter=mode_filter,
+                source_filter=source_filter,
+                current_tag=ctx.orchestrator.config.run_tag,
+            )
             since_start = datetime.now(tz=UTC) - timedelta(hours=since_hours) if since_hours > 0 else None
 
             counts = await _arb_cleanup_counts(
