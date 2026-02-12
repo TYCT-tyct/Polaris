@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+from contextlib import suppress
 from datetime import datetime, timezone
+from time import monotonic
 from typing import Any
 
 import httpx
@@ -10,7 +13,7 @@ import httpx
 from polaris.config import RetryConfig
 from polaris.infra.rate_limiter import AsyncTokenBucket
 from polaris.infra.retry import with_retry
-from polaris.sources.models import ClobBook
+from polaris.sources.models import ClobBook, ClobLevel
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +28,12 @@ class ClobClient:
         max_connections: int = 80,
         max_keepalive_connections: int = 40,
         keepalive_expiry_seconds: float = 30.0,
+        ws_enabled: bool = False,
+        ws_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+        ws_book_max_age_sec: float = 2.5,
+        ws_max_subscribe_tokens: int = 3500,
+        ws_reconnect_min_sec: float = 0.5,
+        ws_reconnect_max_sec: float = 8.0,
     ) -> None:
         self._limiter = limiter
         self._retry = retry
@@ -41,7 +50,27 @@ class ClobClient:
             trust_env=False,
         )
 
+        self._ws_enabled = ws_enabled
+        self._ws_url = ws_url
+        self._ws_book_max_age_sec = max(0.2, ws_book_max_age_sec)
+        self._ws_max_subscribe_tokens = max(100, ws_max_subscribe_tokens)
+        self._ws_reconnect_min_sec = max(0.1, ws_reconnect_min_sec)
+        self._ws_reconnect_max_sec = max(self._ws_reconnect_min_sec, ws_reconnect_max_sec)
+        self._ws_task: asyncio.Task[None] | None = None
+        self._ws_stop = asyncio.Event()
+        self._ws_ready = asyncio.Event()
+        self._ws_lock = asyncio.Lock()
+        self._ws_desired_tokens: set[str] = set()
+        self._ws_subscribed_tokens: set[str] = set()
+        self._ws_cache: dict[str, tuple[ClobBook, float]] = {}
+
     async def close(self) -> None:
+        if self._ws_task is not None:
+            self._ws_stop.set()
+            self._ws_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._ws_task
+            self._ws_task = None
         await self._client.aclose()
 
     async def get_book(self, token_id: str) -> ClobBook:
@@ -54,19 +83,35 @@ class ClobClient:
         return await self._fetch_book(token_id, allow_missing=True)
 
     async def get_books(self, token_ids: list[str], batch_size: int = 500, max_concurrency: int = 4) -> list[ClobBook]:
+        token_ids = _unique_tokens(token_ids)
         if not token_ids:
             return []
-        batches = [token_ids[start : start + batch_size] for start in range(0, len(token_ids), batch_size)]
-        semaphore = asyncio.Semaphore(max(1, max_concurrency))
 
-        async def _run(batch: list[str]) -> list[ClobBook]:
-            async with semaphore:
-                return await self._get_books_batch_resilient(batch)
+        ws_books: dict[str, ClobBook] = {}
+        if self._ws_enabled and len(token_ids) <= self._ws_max_subscribe_tokens:
+            await self._ensure_ws_subscription(token_ids)
+            ws_books = await self._get_ws_books(token_ids)
 
-        results = await asyncio.gather(*[_run(batch) for batch in batches])
+        missing = [token_id for token_id in token_ids if token_id not in ws_books]
+        rest_books: dict[str, ClobBook] = {}
+        if missing:
+            batches = [missing[start : start + batch_size] for start in range(0, len(missing), batch_size)]
+            semaphore = asyncio.Semaphore(max(1, max_concurrency))
+
+            async def _run(batch: list[str]) -> list[ClobBook]:
+                async with semaphore:
+                    return await self._get_books_batch_resilient(batch)
+
+            results = await asyncio.gather(*[_run(batch) for batch in batches])
+            for rows in results:
+                for row in rows:
+                    rest_books[row.asset_id] = row
+
         books: list[ClobBook] = []
-        for rows in results:
-            books.extend(rows)
+        for token_id in token_ids:
+            book = ws_books.get(token_id) or rest_books.get(token_id)
+            if book is not None:
+                books.append(book)
         return books
 
     async def get_prices(
@@ -189,6 +234,100 @@ class ClobClient:
 
         return await with_retry(_do, self._retry)
 
+    async def _ensure_ws_subscription(self, token_ids: list[str]) -> None:
+        tokens = set(token_ids[: self._ws_max_subscribe_tokens])
+        async with self._ws_lock:
+            self._ws_desired_tokens.update(tokens)
+            if self._ws_task is None or self._ws_task.done():
+                self._ws_stop.clear()
+                self._ws_task = asyncio.create_task(self._ws_loop(), name="clob-ws-loop")
+        if not self._ws_ready.is_set():
+            with suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(self._ws_ready.wait(), timeout=0.35)
+
+    async def _get_ws_books(self, token_ids: list[str]) -> dict[str, ClobBook]:
+        now = monotonic()
+        out: dict[str, ClobBook] = {}
+        async with self._ws_lock:
+            for token_id in token_ids:
+                cached = self._ws_cache.get(token_id)
+                if cached is None:
+                    continue
+                book, ts = cached
+                if now - ts <= self._ws_book_max_age_sec:
+                    out[token_id] = book
+        return out
+
+    async def _ws_loop(self) -> None:
+        backoff = self._ws_reconnect_min_sec
+        while not self._ws_stop.is_set():
+            desired = await self._ws_desired_snapshot()
+            if not desired:
+                self._ws_ready.clear()
+                await asyncio.sleep(0.5)
+                continue
+            try:
+                import websockets
+
+                async with websockets.connect(
+                    self._ws_url,
+                    ping_interval=20,
+                    ping_timeout=20,
+                    close_timeout=5,
+                    max_queue=2048,
+                ) as websocket:
+                    self._ws_ready.set()
+                    async with self._ws_lock:
+                        self._ws_subscribed_tokens.clear()
+                    await self._ws_subscribe_new(websocket)
+                    backoff = self._ws_reconnect_min_sec
+
+                    while not self._ws_stop.is_set():
+                        await self._ws_subscribe_new(websocket)
+                        try:
+                            raw = await asyncio.wait_for(websocket.recv(), timeout=1.0)
+                        except asyncio.TimeoutError:
+                            continue
+                        books = _extract_ws_books(raw)
+                        if not books:
+                            continue
+                        now = monotonic()
+                        async with self._ws_lock:
+                            for book in books:
+                                self._ws_cache[book.asset_id] = (book, now)
+                            self._prune_ws_cache(now)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self._ws_ready.clear()
+                logger.warning("clob ws loop disconnected", exc_info=True)
+                await asyncio.sleep(backoff)
+                backoff = min(self._ws_reconnect_max_sec, backoff * 2)
+
+    async def _ws_desired_snapshot(self) -> list[str]:
+        async with self._ws_lock:
+            return sorted(self._ws_desired_tokens)[: self._ws_max_subscribe_tokens]
+
+    async def _ws_subscribe_new(self, websocket: Any) -> None:
+        async with self._ws_lock:
+            pending = sorted(self._ws_desired_tokens - self._ws_subscribed_tokens)
+        if not pending:
+            return
+
+        chunk_size = 180
+        for start in range(0, len(pending), chunk_size):
+            batch = pending[start : start + chunk_size]
+            payload = {"type": "market", "assets_ids": batch}
+            await websocket.send(json.dumps(payload, separators=(",", ":")))
+            async with self._ws_lock:
+                self._ws_subscribed_tokens.update(batch)
+
+    def _prune_ws_cache(self, now: float) -> None:
+        max_age = self._ws_book_max_age_sec * 12
+        stale_tokens = [token for token, (_, ts) in self._ws_cache.items() if now - ts > max_age]
+        for token in stale_tokens:
+            self._ws_cache.pop(token, None)
+
     @staticmethod
     def timestamp_to_datetime(raw_ts: str | None) -> datetime | None:
         if not raw_ts:
@@ -231,6 +370,17 @@ class ClobClient:
         for idx, level in enumerate(sorted(book.asks, key=lambda x: x.price)[:max_levels]):
             levels.append({"side": "ASK", "price": level.price, "size": level.size, "level_index": idx})
         return levels
+
+
+def _unique_tokens(token_ids: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for token in token_ids:
+        if not token or token in seen:
+            continue
+        seen.add(token)
+        out.append(token)
+    return out
 
 
 def _depth_by_pct(levels: list[Any], best: float | None, is_bid: bool) -> dict[str, float]:
@@ -276,6 +426,118 @@ def _parse_prices_response(
             ask = _to_float(item.get("BUY") or item.get("best_ask"))
             out[str(token_id)] = (bid, ask)
     return out
+
+
+def _extract_ws_books(raw_message: Any) -> list[ClobBook]:
+    data: Any = raw_message
+    if isinstance(raw_message, (bytes, bytearray)):
+        with suppress(Exception):
+            data = raw_message.decode("utf-8")
+    if isinstance(data, str):
+        with suppress(json.JSONDecodeError):
+            data = json.loads(data)
+    if not isinstance(data, (dict, list)):
+        return []
+
+    stack: list[Any] = [data]
+    books: list[ClobBook] = []
+    while stack:
+        item = stack.pop()
+        if isinstance(item, list):
+            stack.extend(item)
+            continue
+        if not isinstance(item, dict):
+            continue
+
+        parsed = _parse_ws_book(item)
+        if parsed is not None:
+            books.append(parsed)
+            continue
+
+        for key in ("book", "books", "payload", "data", "message"):
+            if key in item:
+                stack.append(item[key])
+    return books
+
+
+def _parse_ws_book(item: dict[str, Any]) -> ClobBook | None:
+    asset_id = (
+        item.get("asset_id")
+        or item.get("assetId")
+        or item.get("token_id")
+        or item.get("tokenId")
+        or item.get("asset")
+    )
+    if not isinstance(asset_id, str) or not asset_id:
+        return None
+
+    bids = _extract_ws_levels(item, is_bid=True)
+    asks = _extract_ws_levels(item, is_bid=False)
+    if not bids and not asks:
+        return None
+
+    payload = {
+        "market": item.get("market") or item.get("market_id") or item.get("condition_id"),
+        "asset_id": asset_id,
+        "timestamp": str(item.get("timestamp") or item.get("ts") or ""),
+        "bids": bids,
+        "asks": asks,
+        "min_order_size": _to_str(item.get("min_order_size") or item.get("minOrderSize")),
+        "tick_size": _to_str(item.get("tick_size") or item.get("tickSize")),
+        "neg_risk": _to_bool(item.get("neg_risk") or item.get("negRisk")),
+        "last_trade_price": _to_str(item.get("last_trade_price") or item.get("lastTradePrice")),
+    }
+    with suppress(Exception):
+        return ClobBook.model_validate(payload)
+    return None
+
+
+def _extract_ws_levels(item: dict[str, Any], is_bid: bool) -> list[ClobLevel]:
+    keys = ("bids", "buy", "buys") if is_bid else ("asks", "sell", "sells")
+    raw_levels: Any = None
+    for key in keys:
+        if key in item:
+            raw_levels = item[key]
+            break
+    if not isinstance(raw_levels, list):
+        return []
+
+    out: list[ClobLevel] = []
+    for level in raw_levels:
+        price: float | None = None
+        size: float | None = None
+        if isinstance(level, dict):
+            price = _to_float(level.get("price") or level.get("p"))
+            size = _to_float(level.get("size") or level.get("s") or level.get("quantity"))
+        elif isinstance(level, (list, tuple)) and len(level) >= 2:
+            price = _to_float(level[0])
+            size = _to_float(level[1])
+        if price is None or size is None or size < 0:
+            continue
+        out.append(ClobLevel(price=price, size=size))
+    return out
+
+
+def _to_bool(raw: Any) -> bool | None:
+    if raw is None:
+        return None
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, str):
+        value = raw.strip().lower()
+        if value in {"1", "true", "yes"}:
+            return True
+        if value in {"0", "false", "no"}:
+            return False
+    return None
+
+
+def _to_str(raw: Any) -> str | None:
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        return raw
+    return str(raw)
 
 
 def _to_float(raw: Any) -> float | None:

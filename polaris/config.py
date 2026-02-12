@@ -172,6 +172,12 @@ class PolarisSettings(BaseSettings):
     clob_max_connections: int = Field(default=80)
     clob_max_keepalive_connections: int = Field(default=40)
     clob_keepalive_expiry_sec: float = Field(default=30.0)
+    clob_ws_enabled: bool = Field(default=False)
+    clob_ws_url: str = Field(default="wss://ws-subscriptions-clob.polymarket.com/ws/market")
+    clob_ws_book_max_age_sec: float = Field(default=2.5)
+    clob_ws_max_subscribe_tokens: int = Field(default=3500)
+    clob_ws_reconnect_min_sec: float = Field(default=0.5)
+    clob_ws_reconnect_max_sec: float = Field(default=8.0)
 
     @property
     def handles(self) -> list[str]:

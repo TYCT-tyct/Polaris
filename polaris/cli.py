@@ -105,6 +105,12 @@ async def create_runtime(settings: PolarisSettings) -> RuntimeContext:
         max_connections=settings.clob_max_connections,
         max_keepalive_connections=settings.clob_max_keepalive_connections,
         keepalive_expiry_seconds=settings.clob_keepalive_expiry_sec,
+        ws_enabled=settings.clob_ws_enabled,
+        ws_url=settings.clob_ws_url,
+        ws_book_max_age_sec=settings.clob_ws_book_max_age_sec,
+        ws_max_subscribe_tokens=settings.clob_ws_max_subscribe_tokens,
+        ws_reconnect_min_sec=settings.clob_ws_reconnect_min_sec,
+        ws_reconnect_max_sec=settings.clob_ws_reconnect_max_sec,
     )
     market_collector = MarketCollector(
         db,
@@ -153,6 +159,12 @@ async def create_arb_runtime(settings: PolarisSettings) -> ArbRuntimeContext:
         max_connections=settings.clob_max_connections,
         max_keepalive_connections=settings.clob_max_keepalive_connections,
         keepalive_expiry_seconds=settings.clob_keepalive_expiry_sec,
+        ws_enabled=settings.clob_ws_enabled,
+        ws_url=settings.clob_ws_url,
+        ws_book_max_age_sec=settings.clob_ws_book_max_age_sec,
+        ws_max_subscribe_tokens=settings.clob_ws_max_subscribe_tokens,
+        ws_reconnect_min_sec=settings.clob_ws_reconnect_min_sec,
+        ws_reconnect_max_sec=settings.clob_ws_reconnect_max_sec,
     )
     arb_config = arb_config_from_settings(settings)
     ai_gate = AiGate.from_settings(settings, arb_config)
