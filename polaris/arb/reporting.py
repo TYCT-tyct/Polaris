@@ -82,7 +82,13 @@ class ArbReporter:
                     (
                         select sum(
                             case
-                                when coalesce(nullif(metadata->>'mark_to_book_net_pnl_usd', '')::numeric, net_pnl_usd) > 0
+                                when (
+                                    case
+                                        when strategy_code in ('A', 'B', 'C')
+                                        then coalesce(nullif(metadata->>'expected_net_pnl_usd', '')::numeric, 0)
+                                        else coalesce(nullif(metadata->>'mark_to_book_net_pnl_usd', '')::numeric, net_pnl_usd)
+                                    end
+                                ) > 0
                                 then 1
                                 else 0
                             end
@@ -95,7 +101,13 @@ class ArbReporter:
                     (
                         select sum(
                             case
-                                when coalesce(nullif(metadata->>'mark_to_book_net_pnl_usd', '')::numeric, net_pnl_usd) < 0
+                                when (
+                                    case
+                                        when strategy_code in ('A', 'B', 'C')
+                                        then coalesce(nullif(metadata->>'expected_net_pnl_usd', '')::numeric, 0)
+                                        else coalesce(nullif(metadata->>'mark_to_book_net_pnl_usd', '')::numeric, net_pnl_usd)
+                                    end
+                                ) < 0
                                 then 1
                                 else 0
                             end
@@ -124,6 +136,19 @@ class ArbReporter:
                     ),
                     0
                 ) as expected_net_pnl_usd,
+                coalesce(
+                    (
+                        select sum(
+                            case
+                                when strategy_code in ('A', 'B', 'C')
+                                then coalesce(nullif(metadata->>'expected_net_pnl_usd', '')::numeric, 0)
+                                else coalesce(nullif(metadata->>'mark_to_book_net_pnl_usd', '')::numeric, net_pnl_usd)
+                            end
+                        )
+                        from window_trades
+                    ),
+                    0
+                ) as evaluation_net_pnl_usd,
                 coalesce(
                     (
                         select sum(
@@ -196,12 +221,24 @@ class ArbReporter:
                     count(*) as trades,
                     sum(
                         (
-                            coalesce(nullif(metadata->>'mark_to_book_net_pnl_usd', '')::numeric, net_pnl_usd) > 0
+                            (
+                                case
+                                    when strategy_code in ('A', 'B', 'C')
+                                    then coalesce(nullif(metadata->>'expected_net_pnl_usd', '')::numeric, 0)
+                                    else coalesce(nullif(metadata->>'mark_to_book_net_pnl_usd', '')::numeric, net_pnl_usd)
+                                end
+                            ) > 0
                         )::int
                     ) as wins,
                     sum(
                         (
-                            coalesce(nullif(metadata->>'mark_to_book_net_pnl_usd', '')::numeric, net_pnl_usd) < 0
+                            (
+                                case
+                                    when strategy_code in ('A', 'B', 'C')
+                                    then coalesce(nullif(metadata->>'expected_net_pnl_usd', '')::numeric, 0)
+                                    else coalesce(nullif(metadata->>'mark_to_book_net_pnl_usd', '')::numeric, net_pnl_usd)
+                                end
+                            ) < 0
                         )::int
                     ) as losses,
                     coalesce(sum(gross_pnl_usd), 0) as gross_pnl_usd,
@@ -228,7 +265,13 @@ class ArbReporter:
                     coalesce(sum(slippage_usd), 0) as slippage_usd,
                     coalesce(sum(capital_used_usd), 0) as turnover_usd,
                     coalesce(
-                        avg(coalesce(nullif(metadata->>'mark_to_book_net_pnl_usd', '')::numeric, net_pnl_usd)),
+                        avg(
+                            case
+                                when strategy_code in ('A', 'B', 'C')
+                                then coalesce(nullif(metadata->>'expected_net_pnl_usd', '')::numeric, 0)
+                                else coalesce(nullif(metadata->>'mark_to_book_net_pnl_usd', '')::numeric, net_pnl_usd)
+                            end
+                        ),
                         0
                     ) as avg_trade_pnl_usd,
                     coalesce(avg(capital_used_usd), 0) as avg_capital_used_usd,
@@ -404,6 +447,13 @@ def _attach_summary_metrics(row: dict[str, Any]) -> dict[str, Any]:
     net_pnl_usd = float(row.get("net_pnl_usd", 0.0) or 0.0)
     mtm_net_pnl_usd = float(row.get("mark_to_book_net_pnl_usd", net_pnl_usd) or 0.0)
     expected_net_pnl_usd = float(row.get("expected_net_pnl_usd", 0.0) or 0.0)
+    strategy_code = str(row.get("strategy_code") or "").strip().upper()
+    if strategy_code in {"A", "B", "C"}:
+        evaluation_net_pnl_usd = expected_net_pnl_usd
+    elif strategy_code:
+        evaluation_net_pnl_usd = mtm_net_pnl_usd
+    else:
+        evaluation_net_pnl_usd = float(row.get("evaluation_net_pnl_usd", mtm_net_pnl_usd) or 0.0)
 
     row["win_rate"] = _safe_ratio(wins, trades)
     row["execution_rate"] = _safe_ratio(signals_executed, signals_found)
@@ -411,9 +461,9 @@ def _attach_summary_metrics(row: dict[str, Any]) -> dict[str, Any]:
     row["net_margin_on_turnover"] = _safe_ratio(net_pnl_usd, turnover_usd)
     row["mark_to_book_margin_on_turnover"] = _safe_ratio(mtm_net_pnl_usd, turnover_usd)
     row["expected_margin_on_turnover"] = _safe_ratio(expected_net_pnl_usd, turnover_usd)
-    row["evaluation_net_pnl_usd"] = mtm_net_pnl_usd
-    row["evaluation_margin_on_turnover"] = row["mark_to_book_margin_on_turnover"]
-    row["pnl_gap_vs_expected_usd"] = mtm_net_pnl_usd - expected_net_pnl_usd
+    row["evaluation_net_pnl_usd"] = evaluation_net_pnl_usd
+    row["evaluation_margin_on_turnover"] = _safe_ratio(evaluation_net_pnl_usd, turnover_usd)
+    row["pnl_gap_vs_expected_usd"] = evaluation_net_pnl_usd - expected_net_pnl_usd
     return row
 
 
