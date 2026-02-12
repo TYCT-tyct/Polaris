@@ -24,7 +24,7 @@ class MarketCollector:
         self.gamma_client = gamma_client
         self.market_scope = market_scope
         self.market_state = market_state
-        self.market_tweet_targets = market_tweet_targets or []
+        self.market_tweet_targets = [target.strip().lower() for target in (market_tweet_targets or []) if target.strip()]
         self.gamma_page_size = max(1, gamma_page_size)
         self.gamma_max_pages = gamma_max_pages
 
@@ -52,6 +52,61 @@ class MarketCollector:
         return len(markets), len(token_rows)
 
     async def list_active_tokens(self) -> list[dict[str, Any]]:
+        if self.market_scope in {"watchlist_tweet", "elon_tweet"}:
+            mapped = await self.db.fetch_all(
+                """
+                select distinct t.token_id, t.market_id, t.outcome_label, t.outcome_side
+                from dim_token t
+                join dim_market m on m.market_id = t.market_id
+                join bridge_market_tracking b on b.market_id = m.market_id
+                where m.active = true and m.closed = false
+                  and (
+                    m.question ilike '%%tweet%%'
+                    or m.slug ilike '%%tweet%%'
+                  )
+                order by t.market_id, t.token_id
+                """
+            )
+            candidates = await self.db.fetch_all(
+                """
+                select distinct
+                    t.token_id,
+                    t.market_id,
+                    t.outcome_label,
+                    t.outcome_side,
+                    m.question,
+                    m.slug
+                from dim_token t
+                join dim_market m on m.market_id = t.market_id
+                where m.active = true and m.closed = false
+                  and (
+                    m.question ilike '%%tweet%%'
+                    or m.slug ilike '%%tweet%%'
+                  )
+                order by t.market_id, t.token_id
+                """
+                    )
+            filtered: list[dict[str, Any]] = []
+            for row in candidates:
+                if _matches_watchlist_targets(
+                    row.get("question"),
+                    row.get("slug"),
+                    self.market_tweet_targets,
+                ):
+                    filtered.append(
+                        {
+                            "token_id": row["token_id"],
+                            "market_id": row["market_id"],
+                            "outcome_label": row["outcome_label"],
+                            "outcome_side": row["outcome_side"],
+                        }
+                    )
+            merged: dict[str, dict[str, Any]] = {}
+            for row in mapped:
+                merged[row["token_id"]] = row
+            for row in filtered:
+                merged[row["token_id"]] = row
+            return list(merged.values())
         return await self.db.fetch_all(
             """
             select t.token_id, t.market_id, t.outcome_label, t.outcome_side
@@ -254,3 +309,10 @@ class MarketCollector:
             """,
             rows,
         )
+
+
+def _matches_watchlist_targets(question: str | None, slug: str | None, targets: list[str]) -> bool:
+    if not targets:
+        return True
+    haystack = f"{question or ''} {slug or ''}".lower()
+    return any(target and target in haystack for target in targets)

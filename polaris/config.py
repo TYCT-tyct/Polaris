@@ -44,6 +44,8 @@ class PolarisSettings(BaseSettings):
     )
 
     database_url: str = Field(default="postgresql://postgres:postgres@localhost:55432/polaris")
+    db_pool_min_size: int = Field(default=1)
+    db_pool_max_size: int = Field(default=4)
     log_level: str = Field(default="INFO")
     default_handles: str = Field(default="elonmusk")
     market_discovery_scope: str = Field(default="all")

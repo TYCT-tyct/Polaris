@@ -87,8 +87,16 @@ class ArbRuntimeContext:
     reporter: ArbReporter
 
 
+def _create_database(settings: PolarisSettings) -> Database:
+    return Database(
+        settings.database_url,
+        min_size=settings.db_pool_min_size,
+        max_size=settings.db_pool_max_size,
+    )
+
+
 async def create_runtime(settings: PolarisSettings) -> RuntimeContext:
-    db = Database(settings.database_url)
+    db = _create_database(settings)
     await db.open()
     xtracker = XTrackerClient(
         limiter=AsyncTokenBucket(settings.xtracker_rate, settings.xtracker_burst),
@@ -151,7 +159,7 @@ async def create_runtime(settings: PolarisSettings) -> RuntimeContext:
 
 
 async def create_arb_runtime(settings: PolarisSettings) -> ArbRuntimeContext:
-    db = Database(settings.database_url)
+    db = _create_database(settings)
     await db.open()
     clob = ClobClient(
         limiter=AsyncTokenBucket(settings.clob_rate, settings.clob_burst),
@@ -217,7 +225,7 @@ def migrate() -> None:
     _ensure_windows_selector_loop()
 
     async def _run() -> None:
-        db = Database(settings.database_url)
+        db = _create_database(settings)
         await db.open()
         try:
             applied = await db.apply_migrations()
@@ -438,7 +446,7 @@ def export_data(
     out_path = Path(output).expanduser() if output else _default_export_path(table, fmt_typed)
 
     async def _run() -> None:
-        db = Database(settings.database_url)
+        db = _create_database(settings)
         await db.open()
         try:
             result = await export_table(
@@ -503,7 +511,7 @@ def backup(
     artifacts.append(BackupArtifact.from_path(dump_file))
 
     async def _run_exports() -> list[Path]:
-        db = Database(settings.database_url)
+        db = _create_database(settings)
         await db.open()
         try:
             return await export_backup_tables(
@@ -595,8 +603,10 @@ def arb_paper_matrix_start(
     run_dir = Path("run")
     run_dir.mkdir(parents=True, exist_ok=True)
 
+    bankroll_tag = str(int(bankroll_usd)) if float(bankroll_usd).is_integer() else f"{bankroll_usd:g}"
+
     def _spawn(scope: str) -> tuple[int, Path, str]:
-        source = f"{source_prefix}_{scope}10".lower()
+        source = f"{source_prefix}_{scope}{bankroll_tag}".lower()
         log_path = logs_dir / f"arb_paper_{scope}_{timestamp}.log"
         env = os.environ.copy()
         env["POLARIS_ARB_PAPER_INITIAL_BANKROLL_USD"] = f"{bankroll_usd:.4f}"
@@ -833,13 +843,13 @@ def arb_go_live_check(
         reasons: list[str] = []
 
         trades = int(totals.get("trades", 0) or 0)
-        net_pnl = float(totals.get("net_pnl_usd", 0.0) or 0.0)
+        net_pnl = float(totals.get("evaluation_net_pnl_usd", totals.get("net_pnl_usd", 0.0)) or 0.0)
         win_rate = float(totals.get("win_rate", 0.0) or 0.0)
 
         if trades < min_trades:
             reasons.append(f"trades<{min_trades} (actual={trades})")
         if net_pnl < min_net_pnl_usd:
-            reasons.append(f"net_pnl_usd<{min_net_pnl_usd} (actual={net_pnl:.6f})")
+            reasons.append(f"evaluation_net_pnl_usd<{min_net_pnl_usd} (actual={net_pnl:.6f})")
         if win_rate < min_win_rate:
             reasons.append(f"win_rate<{min_win_rate:.3f} (actual={win_rate:.3f})")
 
@@ -847,7 +857,7 @@ def arb_go_live_check(
         for row in by_strategy:
             s_code = str(row.get("strategy_code", ""))
             s_trades = int(row.get("trades", 0) or 0)
-            s_net = float(row.get("net_pnl_usd", 0.0) or 0.0)
+            s_net = float(row.get("evaluation_net_pnl_usd", row.get("net_pnl_usd", 0.0)) or 0.0)
             if s_trades >= strategy_min_trades and s_net < 0:
                 negative_strategies.append(f"{s_code}:{s_net:.6f}")
         if len(negative_strategies) > max_negative_strategies:

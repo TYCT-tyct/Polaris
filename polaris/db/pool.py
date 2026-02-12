@@ -11,8 +11,12 @@ MIGRATIONS_DIR = Path(__file__).resolve().parent / "migrations"
 
 
 class Database:
-    def __init__(self, dsn: str) -> None:
-        self._pool = AsyncConnectionPool(conninfo=dsn, open=False, min_size=1, max_size=8)
+    def __init__(self, dsn: str, *, min_size: int = 1, max_size: int = 4) -> None:
+        if min_size < 1:
+            raise ValueError("min_size must be >= 1")
+        if max_size < min_size:
+            raise ValueError("max_size must be >= min_size")
+        self._pool = AsyncConnectionPool(conninfo=dsn, open=False, min_size=min_size, max_size=max_size)
 
     async def open(self) -> None:
         await self._pool.open(wait=True)
@@ -89,4 +93,3 @@ def _to_json(payload: dict[str, Any]) -> str:
     import json
 
     return json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
-

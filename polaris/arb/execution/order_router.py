@@ -187,13 +187,16 @@ class OrderRouter:
             hold_minutes,
             realized_mode,
         )
+        expected_net = expected_gross - fees - slip
+        mark_to_book_net = mark_to_book - fees - slip
+        realized_net = gross - fees - slip
         return TradeResult(
             signal=plan.signal,
             status="filled" if fills else "rejected",
             gross_pnl_usd=gross,
             fees_usd=fees,
             slippage_usd=slip,
-            net_pnl_usd=gross - fees - slip,
+            net_pnl_usd=realized_net,
             capital_used_usd=total_notional,
             hold_minutes=hold_minutes,
             fills=fills,
@@ -204,6 +207,10 @@ class OrderRouter:
                 "expected_gross_pnl_usd": expected_gross,
                 "mark_to_book_gross_pnl_usd": mark_to_book,
                 "entry_gross_pnl_usd": gross,
+                "expected_net_pnl_usd": expected_net,
+                "mark_to_book_net_pnl_usd": mark_to_book_net,
+                "realized_net_pnl_usd": realized_net,
+                "pnl_gap_vs_expected_usd": realized_net - expected_net,
                 "run_tag": self.config.run_tag,
                 "execution_backend": self.config.execution_backend,
             },
@@ -454,13 +461,16 @@ class OrderRouter:
             hold_minutes,
             self.config.paper_realized_pnl_mode,
         )
+        expected_net = expected_gross - fees - slip
+        mark_to_book_net = gross - fees - slip
+        realized_net = realized_gross - fees - slip
         return TradeResult(
             signal=plan.signal,
             status="filled" if fills else ("submitted" if submitted > 0 else "error"),
             gross_pnl_usd=realized_gross,
             fees_usd=fees,
             slippage_usd=slip,
-            net_pnl_usd=realized_gross - fees - slip,
+            net_pnl_usd=realized_net,
             capital_used_usd=total_notional,
             hold_minutes=hold_minutes,
             fills=fills,
@@ -475,6 +485,10 @@ class OrderRouter:
                 "expected_gross_pnl_usd": expected_gross,
                 "mark_to_book_gross_pnl_usd": gross,
                 "entry_gross_pnl_usd": realized_gross,
+                "expected_net_pnl_usd": expected_net,
+                "mark_to_book_net_pnl_usd": mark_to_book_net,
+                "realized_net_pnl_usd": realized_net,
+                "pnl_gap_vs_expected_usd": realized_net - expected_net,
                 "run_tag": self.config.run_tag,
                 "execution_backend": self.config.execution_backend,
             },
@@ -851,10 +865,15 @@ def _resolve_realized_gross(
     mode = (realized_mode or "entry_only").strip().lower()
     if mode == "mark_to_book":
         return mark_to_book, "mark_to_book"
-    if hold_minutes > 1:
-        # 持有型策略在入场时只确认成本，不把浮盈亏计入已实现收益。
+    if mode == "hybrid":
+        if hold_minutes > 1:
+            return 0.0, "entry_only"
+        return mark_to_book, "mark_to_book"
+    if mode == "entry_only":
+        # 统一口径：paper 入场阶段不确认浮盈亏，避免被 bid/ask 即时回补噪声污染。
         return 0.0, "entry_only"
-    return mark_to_book, "mark_to_book"
+    # 未识别模式时默认保守，避免把错误配置当作 mark_to_book。
+    return 0.0, "entry_only"
 
 
 def _find_intent_id(plan: ExecutionPlan, token_id: str) -> str:

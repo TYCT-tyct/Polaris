@@ -17,6 +17,11 @@ class TweetCollector:
 
     async def sync_account(self, handle: str) -> XTrackerUser:
         user = await self.client.get_user(handle)
+        existing = await self.db.fetch_one(
+            "select account_id from dim_account where handle = %s",
+            (user.handle,),
+        )
+        canonical_account_id = existing["account_id"] if existing else user.account_id
         await self.db.execute(
             """
             insert into dim_account(
@@ -36,7 +41,7 @@ class TweetCollector:
                 updated_at = now()
             """,
             (
-                user.account_id,
+                canonical_account_id,
                 user.handle,
                 user.platform_id,
                 user.name,
@@ -47,14 +52,16 @@ class TweetCollector:
                 user.last_sync,
             ),
         )
+        if canonical_account_id != user.account_id:
+            return user.model_copy(update={"account_id": canonical_account_id})
         return user
 
-    async def sync_trackings(self, handle: str) -> list[XTrackerTracking]:
+    async def sync_trackings(self, handle: str, account_id: str | None = None) -> list[XTrackerTracking]:
         trackings = await self.client.get_trackings(handle, active_only=True)
         rows = [
             (
                 t.tracking_id,
-                t.account_id,
+                account_id or t.account_id,
                 t.title,
                 t.start_date,
                 t.end_date,
@@ -214,4 +221,3 @@ def _sha1(text: str) -> str:
 
 def _raw_payload_json(post: XTrackerPost) -> str:
     return post.model_dump_json(by_alias=True, exclude_none=True)
-

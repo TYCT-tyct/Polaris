@@ -82,6 +82,33 @@ class ArbReporter:
                 coalesce((select sum(case when net_pnl_usd < 0 then 1 else 0 end) from window_trades), 0) as losses,
                 coalesce((select sum(gross_pnl_usd) from window_trades), 0) as gross_pnl_usd,
                 coalesce((select sum(net_pnl_usd) from window_trades), 0) as net_pnl_usd,
+                coalesce(
+                    (
+                        select sum(
+                            coalesce(nullif(metadata->>'mark_to_book_net_pnl_usd', '')::numeric, net_pnl_usd)
+                        )
+                        from window_trades
+                    ),
+                    0
+                ) as mark_to_book_net_pnl_usd,
+                coalesce(
+                    (
+                        select sum(
+                            coalesce(nullif(metadata->>'expected_net_pnl_usd', '')::numeric, 0)
+                        )
+                        from window_trades
+                    ),
+                    0
+                ) as expected_net_pnl_usd,
+                coalesce(
+                    (
+                        select sum(
+                            coalesce(nullif(metadata->>'pnl_gap_vs_expected_usd', '')::numeric, 0)
+                        )
+                        from window_trades
+                    ),
+                    0
+                ) as pnl_gap_vs_expected_usd,
                 coalesce((select sum(fees_usd) from window_trades), 0) as fees_usd,
                 coalesce((select sum(slippage_usd) from window_trades), 0) as slippage_usd,
                 coalesce((select sum(capital_used_usd) from window_trades), 0) as turnover_usd,
@@ -147,6 +174,24 @@ class ArbReporter:
                     sum((net_pnl_usd < 0)::int) as losses,
                     coalesce(sum(gross_pnl_usd), 0) as gross_pnl_usd,
                     coalesce(sum(net_pnl_usd), 0) as net_pnl_usd,
+                    coalesce(
+                        sum(
+                            coalesce(nullif(metadata->>'mark_to_book_net_pnl_usd', '')::numeric, net_pnl_usd)
+                        ),
+                        0
+                    ) as mark_to_book_net_pnl_usd,
+                    coalesce(
+                        sum(
+                            coalesce(nullif(metadata->>'expected_net_pnl_usd', '')::numeric, 0)
+                        ),
+                        0
+                    ) as expected_net_pnl_usd,
+                    coalesce(
+                        sum(
+                            coalesce(nullif(metadata->>'pnl_gap_vs_expected_usd', '')::numeric, 0)
+                        ),
+                        0
+                    ) as pnl_gap_vs_expected_usd,
                     coalesce(sum(fees_usd), 0) as fees_usd,
                     coalesce(sum(slippage_usd), 0) as slippage_usd,
                     coalesce(sum(capital_used_usd), 0) as turnover_usd,
@@ -203,6 +248,9 @@ class ArbReporter:
                 end as win_rate,
                 coalesce(ts.gross_pnl_usd, 0) as gross_pnl_usd,
                 coalesce(ts.net_pnl_usd, 0) as net_pnl_usd,
+                coalesce(ts.mark_to_book_net_pnl_usd, 0) as mark_to_book_net_pnl_usd,
+                coalesce(ts.expected_net_pnl_usd, 0) as expected_net_pnl_usd,
+                coalesce(ts.pnl_gap_vs_expected_usd, 0) as pnl_gap_vs_expected_usd,
                 coalesce(ts.fees_usd, 0) as fees_usd,
                 coalesce(ts.slippage_usd, 0) as slippage_usd,
                 coalesce(ts.turnover_usd, 0) as turnover_usd,
@@ -319,11 +367,18 @@ def _attach_summary_metrics(row: dict[str, Any]) -> dict[str, Any]:
     wins = float(row.get("wins", 0.0) or 0.0)
     turnover_usd = float(row.get("turnover_usd", 0.0) or 0.0)
     net_pnl_usd = float(row.get("net_pnl_usd", 0.0) or 0.0)
+    mtm_net_pnl_usd = float(row.get("mark_to_book_net_pnl_usd", net_pnl_usd) or 0.0)
+    expected_net_pnl_usd = float(row.get("expected_net_pnl_usd", 0.0) or 0.0)
 
     row["win_rate"] = _safe_ratio(wins, trades)
     row["execution_rate"] = _safe_ratio(signals_executed, signals_found)
     row["trade_conversion_rate"] = _safe_ratio(trades, signals_executed)
     row["net_margin_on_turnover"] = _safe_ratio(net_pnl_usd, turnover_usd)
+    row["mark_to_book_margin_on_turnover"] = _safe_ratio(mtm_net_pnl_usd, turnover_usd)
+    row["expected_margin_on_turnover"] = _safe_ratio(expected_net_pnl_usd, turnover_usd)
+    row["evaluation_net_pnl_usd"] = mtm_net_pnl_usd
+    row["evaluation_margin_on_turnover"] = row["mark_to_book_margin_on_turnover"]
+    row["pnl_gap_vs_expected_usd"] = mtm_net_pnl_usd - expected_net_pnl_usd
     return row
 
 

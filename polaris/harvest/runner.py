@@ -48,7 +48,9 @@ class HarvestRunner:
             if user is None:
                 continue
             trackings = await self._run_job(
-                "sync_trackings", "xtracker", lambda h=handle: self.tweet_collector.sync_trackings(h)
+                "sync_trackings",
+                "xtracker",
+                lambda h=handle, account_id=user.account_id: self.tweet_collector.sync_trackings(h, account_id),
             )
             if trackings is None:
                 continue
@@ -144,7 +146,11 @@ class HarvestRunner:
         user = await self._run_job("sync_account", "xtracker", lambda: self.tweet_collector.sync_account(handle))
         if user is None:
             return
-        trackings = await self._run_job("sync_trackings", "xtracker", lambda: self.tweet_collector.sync_trackings(handle))
+        trackings = await self._run_job(
+            "sync_trackings",
+            "xtracker",
+            lambda: self.tweet_collector.sync_trackings(handle, user.account_id),
+        )
         if trackings is None:
             return
         await self._run_job(

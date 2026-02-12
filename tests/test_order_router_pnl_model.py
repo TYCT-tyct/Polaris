@@ -8,7 +8,7 @@ from polaris.arb.config import arb_config_from_settings
 from polaris.arb.contracts import ArbSignal, ExecutionPlan, OrderIntent, RunMode, StrategyCode
 from polaris.arb.execution.order_router import OrderRouter
 from polaris.arb.contracts import FillEvent, PriceLevel, TokenSnapshot
-from polaris.arb.execution.order_router import _estimate_trade_pnl
+from polaris.arb.execution.order_router import _estimate_trade_pnl, _resolve_realized_gross
 from polaris.config import PolarisSettings, RetryConfig
 from polaris.infra.rate_limiter import AsyncTokenBucket
 from polaris.sources.clob_client import ClobClient
@@ -105,6 +105,21 @@ def test_estimate_trade_pnl_missing_snapshot_keeps_expected_only() -> None:
     assert fees == pytest.approx(0.001, abs=1e-9)
     assert slip == 0.0
     assert expected_gross == pytest.approx(0.08, abs=1e-9)
+
+
+def test_resolve_realized_gross_entry_only_ignores_mark_to_book() -> None:
+    gross, mode = _resolve_realized_gross(mark_to_book=-0.35, hold_minutes=0.2, realized_mode="entry_only")
+    assert mode == "entry_only"
+    assert gross == pytest.approx(0.0, abs=1e-9)
+
+
+def test_resolve_realized_gross_hybrid_marks_only_short_hold() -> None:
+    gross_short, mode_short = _resolve_realized_gross(mark_to_book=-0.35, hold_minutes=0.2, realized_mode="hybrid")
+    gross_hold, mode_hold = _resolve_realized_gross(mark_to_book=-0.35, hold_minutes=5.0, realized_mode="hybrid")
+    assert mode_short == "mark_to_book"
+    assert gross_short == pytest.approx(-0.35, abs=1e-9)
+    assert mode_hold == "entry_only"
+    assert gross_hold == pytest.approx(0.0, abs=1e-9)
 
 
 class _NoopDb:

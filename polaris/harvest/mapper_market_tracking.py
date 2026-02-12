@@ -14,11 +14,16 @@ class MarketTrackingMapper:
         if not account:
             return 0
         account_id = account["account_id"]
+        handle_keywords = _handle_keywords(account_handle)
         markets = await self.db.fetch_all(
             """
             select market_id, question, start_date, end_date, slug
             from dim_market
-            where active = true or closed = false
+            where (active = true or closed = false)
+              and (
+                question ilike '%%tweet%%'
+                or slug ilike '%%tweet%%'
+              )
             """
         )
         trackings = await self.db.fetch_all(
@@ -31,6 +36,8 @@ class MarketTrackingMapper:
         )
         mapped_rows: list[tuple] = []
         for market in markets:
+            if not _market_matches_handle(market, handle_keywords):
+                continue
             best_tracking = None
             best_score = 0.0
             for tracking in trackings:
@@ -50,6 +57,7 @@ class MarketTrackingMapper:
                         f"window_overlap={best_score:.4f}",
                     )
                 )
+        await self.db.execute("delete from bridge_market_tracking where account_id = %s", (account_id,))
         if mapped_rows:
             await self.db.executemany(
                 """
@@ -86,3 +94,17 @@ def overlap_score(
         return 0.0
     return min(overlap / market_duration, 1.0)
 
+
+def _handle_keywords(account_handle: str) -> tuple[str, ...]:
+    handle = (account_handle or "").strip().lower()
+    mapping = {
+        "elonmusk": ("elon", "musk", "elon musk"),
+        "cobratate": ("andrew tate", "tate", "cobra tate"),
+        "realdonaldtrump": ("donald trump", "donald j. trump", "trump"),
+    }
+    return mapping.get(handle, (handle.replace("_", " "), handle))
+
+
+def _market_matches_handle(market: dict, keywords: tuple[str, ...]) -> bool:
+    haystack = f"{market.get('question', '')} {market.get('slug', '')}".lower()
+    return any(keyword and keyword in haystack for keyword in keywords)
