@@ -385,13 +385,26 @@ class ArbOrchestrator:
                     realized_pnl_usd=result.net_pnl_usd if filled else 0.0,
                 )
                 if filled:
+                    expected_gross = float(result.metadata.get("expected_gross_pnl_usd") or 0.0)
+                    expected_net = float(result.metadata.get("expected_net_pnl_usd") or 0.0)
+                    mtm_gross = float(result.metadata.get("mark_to_book_gross_pnl_usd") or 0.0)
+                    mtm_net = float(result.metadata.get("mark_to_book_net_pnl_usd") or 0.0)
+                    # 回放评分口径：
+                    # - A/B/C 属于“到期结算型套利”，用 expected 作为可锁定收益估计（更贴近真实持有到结算）。
+                    # - F/G 属于“回归/收敛型”，用 mark_to_book 作为保守估值（避免被启发式 expected 注水）。
+                    is_settlement_arb = signal.strategy_code in {StrategyCode.A, StrategyCode.B, StrategyCode.C}
+                    eval_gross = expected_gross if is_settlement_arb else mtm_gross
+                    eval_net = expected_net if is_settlement_arb else mtm_net
                     per_strategy[strategy]["trades"] += 1
-                    per_strategy[strategy]["gross"] += result.gross_pnl_usd
-                    per_strategy[strategy]["net"] += result.net_pnl_usd
+                    per_strategy[strategy]["gross"] += eval_gross
+                    per_strategy[strategy]["net"] += eval_net
+                    per_strategy[strategy]["expected_net"] += expected_net
+                    per_strategy[strategy]["mtm_net"] += mtm_net
+                    per_strategy[strategy]["realized_net"] += float(result.net_pnl_usd or 0.0)
                     per_strategy[strategy]["turnover"] += result.capital_used_usd
-                    if result.net_pnl_usd >= 0:
+                    if eval_net > 0:
                         per_strategy[strategy]["wins"] += 1
-                    else:
+                    if eval_net < 0:
                         per_strategy[strategy]["losses"] += 1
                 else:
                     per_strategy[strategy]["rejected"] += 1
@@ -441,7 +454,16 @@ class ArbOrchestrator:
             (sum(len(items) for items in buckets.values()), replay_run_id),
         )
         total_net = sum(metric.get("net", 0.0) for metric in per_strategy.values())
-        return {"strategies": float(len(per_strategy)), "net_pnl": total_net}
+        total_expected = sum(metric.get("expected_net", 0.0) for metric in per_strategy.values())
+        total_mtm = sum(metric.get("mtm_net", 0.0) for metric in per_strategy.values())
+        total_realized = sum(metric.get("realized_net", 0.0) for metric in per_strategy.values())
+        return {
+            "strategies": float(len(per_strategy)),
+            "net_pnl": float(total_net),
+            "expected_net_pnl": float(total_expected),
+            "mark_to_book_net_pnl": float(total_mtm),
+            "realized_net_pnl": float(total_realized),
+        }
 
     async def _load_live_snapshots(self) -> list[TokenSnapshot]:
         now = datetime.now(tz=UTC)
