@@ -21,13 +21,24 @@ class ClobClient:
         limiter: AsyncTokenBucket,
         retry: RetryConfig,
         timeout_seconds: float = 20.0,
+        http2_enabled: bool = True,
+        max_connections: int = 80,
+        max_keepalive_connections: int = 40,
+        keepalive_expiry_seconds: float = 30.0,
     ) -> None:
         self._limiter = limiter
         self._retry = retry
         self._client = httpx.AsyncClient(
             base_url="https://clob.polymarket.com",
+            http2=http2_enabled,
+            limits=httpx.Limits(
+                max_connections=max(4, max_connections),
+                max_keepalive_connections=max(2, max_keepalive_connections),
+                keepalive_expiry=max(5.0, keepalive_expiry_seconds),
+            ),
             timeout=timeout_seconds,
             headers={"accept": "application/json", "accept-encoding": "gzip"},
+            trust_env=False,
         )
 
     async def close(self) -> None:
@@ -57,6 +68,30 @@ class ClobClient:
         for rows in results:
             books.extend(rows)
         return books
+
+    async def get_prices(
+        self,
+        token_ids: list[str],
+        batch_size: int = 500,
+        max_concurrency: int = 4,
+    ) -> dict[str, tuple[float | None, float | None]]:
+        if not token_ids:
+            return {}
+        batches = [token_ids[start : start + batch_size] for start in range(0, len(token_ids), batch_size)]
+        semaphore = asyncio.Semaphore(max(1, max_concurrency))
+
+        async def _run(batch: list[str]) -> dict[str, tuple[float | None, float | None]]:
+            async with semaphore:
+                return await self._get_prices_batch_resilient(batch)
+
+        chunks = await asyncio.gather(*[_run(batch) for batch in batches], return_exceptions=True)
+        merged: dict[str, tuple[float | None, float | None]] = {}
+        for item in chunks:
+            if isinstance(item, Exception):
+                logger.warning("clob prices batch failed", exc_info=item)
+                continue
+            merged.update(item)
+        return merged
 
     async def _get_books_batch_resilient(self, token_ids: list[str]) -> list[ClobBook]:
         if not token_ids:
@@ -101,6 +136,33 @@ class ClobClient:
                 row["asset_id"] = asset_id or ""
                 result.append(ClobBook.model_validate(row))
             return result
+
+        return await with_retry(_do, self._retry)
+
+    async def _get_prices_batch_resilient(
+        self,
+        token_ids: list[str],
+    ) -> dict[str, tuple[float | None, float | None]]:
+        if not token_ids:
+            return {}
+        try:
+            return await self._get_prices_batch(token_ids)
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code in {400, 404, 413}:
+                logger.info(
+                    "clob /prices batch failed, fallback to empty",
+                    extra={"batch_size": len(token_ids), "status_code": exc.response.status_code},
+                )
+                return {}
+            raise
+
+    async def _get_prices_batch(self, token_ids: list[str]) -> dict[str, tuple[float | None, float | None]]:
+        async def _do() -> dict[str, tuple[float | None, float | None]]:
+            await self._limiter.acquire()
+            payload = [{"token_id": token_id, "side": "BUY"} for token_id in token_ids]
+            response = await self._client.post("/prices", json=payload)
+            response.raise_for_status()
+            return _parse_prices_response(response.json(), token_ids)
 
         return await with_retry(_do, self._retry)
 
@@ -189,3 +251,37 @@ def _depth_by_pct(levels: list[Any], best: float | None, is_bid: bool) -> dict[s
         if pct <= 5:
             totals["5"] += size
     return totals
+
+
+def _parse_prices_response(
+    payload: Any,
+    token_ids: list[str],
+) -> dict[str, tuple[float | None, float | None]]:
+    out: dict[str, tuple[float | None, float | None]] = {}
+    if isinstance(payload, dict):
+        for token_id, item in payload.items():
+            if isinstance(item, dict):
+                out[str(token_id)] = (_to_float(item.get("SELL")), _to_float(item.get("BUY")))
+        return out
+    if isinstance(payload, list):
+        for index, item in enumerate(payload):
+            if not isinstance(item, dict):
+                continue
+            token_id = item.get("token_id") or item.get("asset_id")
+            if not token_id and index < len(token_ids):
+                token_id = token_ids[index]
+            if not token_id:
+                continue
+            bid = _to_float(item.get("SELL") or item.get("best_bid"))
+            ask = _to_float(item.get("BUY") or item.get("best_ask"))
+            out[str(token_id)] = (bid, ask)
+    return out
+
+
+def _to_float(raw: Any) -> float | None:
+    if raw is None:
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None

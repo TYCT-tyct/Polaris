@@ -87,6 +87,8 @@ class PolarisSettings(BaseSettings):
     arb_max_signals_per_cycle: int = Field(default=48)
     arb_universe_max_hours: float = Field(default=72.0)
     arb_universe_token_limit: int = Field(default=2000)
+    arb_universe_refresh_sec: int = Field(default=180)
+    arb_universe_min_liquidity: float = Field(default=0.0)
     arb_clob_books_batch_size: int = Field(default=500)
     arb_clob_books_max_concurrency: int = Field(default=4)
     arb_execution_concurrency: int = Field(default=3)
@@ -164,6 +166,11 @@ class PolarisSettings(BaseSettings):
     arb_google_model: str = Field(default="gemini-2.0-flash")
     arb_minimax_model: str = Field(default="MiniMax-Text-01")
     arb_zhipu_model: str = Field(default="glm-4-flash")
+
+    clob_http2_enabled: bool = Field(default=True)
+    clob_max_connections: int = Field(default=80)
+    clob_max_keepalive_connections: int = Field(default=40)
+    clob_keepalive_expiry_sec: float = Field(default=30.0)
 
     @property
     def handles(self) -> list[str]:

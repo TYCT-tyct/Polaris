@@ -101,6 +101,10 @@ async def create_runtime(settings: PolarisSettings) -> RuntimeContext:
     clob = ClobClient(
         limiter=AsyncTokenBucket(settings.clob_rate, settings.clob_burst),
         retry=settings.retry,
+        http2_enabled=settings.clob_http2_enabled,
+        max_connections=settings.clob_max_connections,
+        max_keepalive_connections=settings.clob_max_keepalive_connections,
+        keepalive_expiry_seconds=settings.clob_keepalive_expiry_sec,
     )
     market_collector = MarketCollector(
         db,
@@ -145,6 +149,10 @@ async def create_arb_runtime(settings: PolarisSettings) -> ArbRuntimeContext:
     clob = ClobClient(
         limiter=AsyncTokenBucket(settings.clob_rate, settings.clob_burst),
         retry=settings.retry,
+        http2_enabled=settings.clob_http2_enabled,
+        max_connections=settings.clob_max_connections,
+        max_keepalive_connections=settings.clob_max_keepalive_connections,
+        keepalive_expiry_seconds=settings.clob_keepalive_expiry_sec,
     )
     arb_config = arb_config_from_settings(settings)
     ai_gate = AiGate.from_settings(settings, arb_config)

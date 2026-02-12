@@ -6,6 +6,7 @@ import logging
 from collections import defaultdict
 from datetime import UTC, datetime, timedelta
 from time import perf_counter
+from typing import Any
 from uuid import uuid4
 
 from polaris.arb.ai.gate import AiGate
@@ -55,6 +56,9 @@ class ArbOrchestrator:
         self._missing_token_resume_at: dict[str, datetime] = {}
         self._signal_dedupe_until: dict[str, datetime] = {}
         self._scope_block_until: dict[str, datetime] = {}
+        self._universe_cache_rows: list[dict[str, Any]] = []
+        self._universe_cache_until: datetime | None = None
+        self._last_snapshot_metrics: dict[str, int | float | bool] = {}
 
         self.strategy_a = StrategyA(config)
         self.strategy_b = StrategyB(config)
@@ -62,7 +66,7 @@ class ArbOrchestrator:
         self.strategy_f = StrategyF(config)
         self.strategy_g = StrategyG(config)
 
-    async def run_once(self, mode: RunMode, source_code: str = "polymarket") -> dict[str, int]:
+    async def run_once(self, mode: RunMode, source_code: str = "polymarket") -> dict[str, int | float | bool]:
         total_started = perf_counter()
         load_started = perf_counter()
         snapshots = await self._load_live_snapshots()
@@ -74,6 +78,7 @@ class ArbOrchestrator:
                 "processed": 0,
                 "executed": 0,
                 "snapshot_load_ms": load_ms,
+                **self._last_snapshot_metrics,
                 "scan_ms": 0,
                 "process_ms": 0,
                 "total_ms": total_ms,
@@ -261,6 +266,7 @@ class ArbOrchestrator:
             "processed": len(ordered),
             "executed": executed,
             "snapshot_load_ms": load_ms,
+            **self._last_snapshot_metrics,
             "scan_ms": scan_ms,
             "process_ms": process_ms,
             "total_ms": total_ms,
@@ -374,6 +380,152 @@ class ArbOrchestrator:
     async def _load_live_snapshots(self) -> list[TokenSnapshot]:
         now = datetime.now(tz=UTC)
         window_end = now + timedelta(hours=self.config.universe_max_hours)
+        db_started = perf_counter()
+        rows = await self._load_universe_rows(now, window_end)
+        db_ms = int((perf_counter() - db_started) * 1000)
+        if not rows:
+            self._last_snapshot_metrics = {
+                "snapshot_db_ms": db_ms,
+                "snapshot_books_ms": 0,
+                "snapshot_build_ms": 0,
+                "snapshot_token_count": 0,
+                "snapshot_book_count": 0,
+                "snapshot_prices_fallback": False,
+            }
+            return []
+
+        token_ids = []
+        for row in rows:
+            token_id = str(row["token_id"])
+            resume_at = self._missing_token_resume_at.get(token_id)
+            if resume_at and now < resume_at:
+                continue
+            token_ids.append(token_id)
+        if not token_ids:
+            self._last_snapshot_metrics = {
+                "snapshot_db_ms": db_ms,
+                "snapshot_books_ms": 0,
+                "snapshot_build_ms": 0,
+                "snapshot_token_count": 0,
+                "snapshot_book_count": 0,
+                "snapshot_prices_fallback": False,
+            }
+            return []
+
+        books_started = perf_counter()
+        books: list[Any] = []
+        used_price_fallback = False
+        try:
+            books = await self.clob_client.get_books(
+                token_ids,
+                batch_size=self.config.clob_books_batch_size,
+                max_concurrency=self.config.clob_books_max_concurrency,
+            )
+        except Exception:
+            logger.exception("clob books load failed, fallback to prices")
+        books_ms = int((perf_counter() - books_started) * 1000)
+        by_token = {book.asset_id: book for book in books if book.asset_id}
+        returned = set(by_token.keys())
+        if by_token:
+            for token_id in token_ids:
+                if token_id in returned:
+                    self._missing_token_resume_at.pop(token_id, None)
+                    continue
+                self._missing_token_resume_at[token_id] = now + timedelta(minutes=5)
+        else:
+            for token_id in token_ids:
+                self._missing_token_resume_at.pop(token_id, None)
+
+        build_started = perf_counter()
+        snapshots: list[TokenSnapshot] = []
+        if by_token:
+            for row in rows:
+                book = by_token.get(row["token_id"])
+                if not book:
+                    continue
+                best_bid, best_ask = self.clob_client.best_bid_ask(book)
+                snapshots.append(
+                    TokenSnapshot(
+                        token_id=row["token_id"],
+                        market_id=row["market_id"],
+                        event_id=row["event_id"],
+                        market_question=row["question"],
+                        market_end=row["end_date"],
+                        outcome_label=row["outcome_label"],
+                        outcome_side=row["outcome_side"],
+                        outcome_index=int(row["outcome_index"]),
+                        min_order_size=float(row["min_order_size"]) if row["min_order_size"] is not None else None,
+                        tick_size=float(row["tick_size"]) if row["tick_size"] is not None else None,
+                        best_bid=best_bid,
+                        best_ask=best_ask,
+                        condition_id=row["condition_id"],
+                        is_neg_risk=bool(row["is_neg_risk"]),
+                        is_other_outcome=bool(row["is_other_outcome"]),
+                        is_placeholder_outcome=bool(row["is_placeholder_outcome"]),
+                        bids=tuple(PriceLevel(price=float(level.price), size=float(level.size)) for level in book.bids),
+                        asks=tuple(PriceLevel(price=float(level.price), size=float(level.size)) for level in book.asks),
+                        captured_at=now,
+                    )
+                )
+        else:
+            used_price_fallback = True
+            prices = await self.clob_client.get_prices(
+                token_ids,
+                batch_size=self.config.clob_books_batch_size,
+                max_concurrency=self.config.clob_books_max_concurrency,
+            )
+            for row in rows:
+                price_pair = prices.get(row["token_id"])
+                if price_pair is None:
+                    continue
+                best_bid, best_ask = price_pair
+                if best_bid is None and best_ask is None:
+                    continue
+                bid_levels = (PriceLevel(price=best_bid, size=0.0),) if best_bid is not None else ()
+                ask_levels = (PriceLevel(price=best_ask, size=0.0),) if best_ask is not None else ()
+                snapshots.append(
+                    TokenSnapshot(
+                        token_id=row["token_id"],
+                        market_id=row["market_id"],
+                        event_id=row["event_id"],
+                        market_question=row["question"],
+                        market_end=row["end_date"],
+                        outcome_label=row["outcome_label"],
+                        outcome_side=row["outcome_side"],
+                        outcome_index=int(row["outcome_index"]),
+                        min_order_size=float(row["min_order_size"]) if row["min_order_size"] is not None else None,
+                        tick_size=float(row["tick_size"]) if row["tick_size"] is not None else None,
+                        best_bid=best_bid,
+                        best_ask=best_ask,
+                        condition_id=row["condition_id"],
+                        is_neg_risk=bool(row["is_neg_risk"]),
+                        is_other_outcome=bool(row["is_other_outcome"]),
+                        is_placeholder_outcome=bool(row["is_placeholder_outcome"]),
+                        bids=bid_levels,
+                        asks=ask_levels,
+                        captured_at=now,
+                    )
+                )
+        build_ms = int((perf_counter() - build_started) * 1000)
+        self._last_snapshot_metrics = {
+            "snapshot_db_ms": db_ms,
+            "snapshot_books_ms": books_ms,
+            "snapshot_build_ms": build_ms,
+            "snapshot_token_count": len(token_ids),
+            "snapshot_book_count": len(by_token),
+            "snapshot_prices_fallback": used_price_fallback,
+        }
+        return snapshots
+
+    async def _load_universe_rows(self, now: datetime, window_end: datetime) -> list[dict[str, Any]]:
+        refresh_sec = max(0, int(self.config.universe_refresh_sec))
+        if (
+            refresh_sec > 0
+            and self._universe_cache_rows
+            and self._universe_cache_until is not None
+            and now < self._universe_cache_until
+        ):
+            return self._universe_cache_rows
         rows = await self.db.fetch_all(
             """
             select
@@ -399,67 +551,15 @@ class ArbOrchestrator:
               and m.end_date is not null
               and m.end_date > %s
               and m.end_date <= %s
+              and coalesce(m.liquidity, 0) >= %s
             order by m.end_date asc, m.liquidity desc nulls last, t.outcome_index asc
             limit %s
             """,
-            (now, window_end, self.config.universe_token_limit),
+            (now, window_end, self.config.universe_min_liquidity, self.config.universe_token_limit),
         )
-        if not rows:
-            return []
-
-        token_ids = []
-        for row in rows:
-            token_id = str(row["token_id"])
-            resume_at = self._missing_token_resume_at.get(token_id)
-            if resume_at and now < resume_at:
-                continue
-            token_ids.append(token_id)
-        if not token_ids:
-            return []
-
-        books = await self.clob_client.get_books(
-            token_ids,
-            batch_size=self.config.clob_books_batch_size,
-            max_concurrency=self.config.clob_books_max_concurrency,
-        )
-        by_token = {book.asset_id: book for book in books if book.asset_id}
-        returned = set(by_token.keys())
-        for token_id in token_ids:
-            if token_id in returned:
-                self._missing_token_resume_at.pop(token_id, None)
-                continue
-            self._missing_token_resume_at[token_id] = now + timedelta(minutes=5)
-
-        snapshots: list[TokenSnapshot] = []
-        for row in rows:
-            book = by_token.get(row["token_id"])
-            if not book:
-                continue
-            best_bid, best_ask = self.clob_client.best_bid_ask(book)
-            snapshots.append(
-                TokenSnapshot(
-                    token_id=row["token_id"],
-                    market_id=row["market_id"],
-                    event_id=row["event_id"],
-                    market_question=row["question"],
-                    market_end=row["end_date"],
-                    outcome_label=row["outcome_label"],
-                    outcome_side=row["outcome_side"],
-                    outcome_index=int(row["outcome_index"]),
-                    min_order_size=float(row["min_order_size"]) if row["min_order_size"] is not None else None,
-                    tick_size=float(row["tick_size"]) if row["tick_size"] is not None else None,
-                    best_bid=best_bid,
-                    best_ask=best_ask,
-                    condition_id=row["condition_id"],
-                    is_neg_risk=bool(row["is_neg_risk"]),
-                    is_other_outcome=bool(row["is_other_outcome"]),
-                    is_placeholder_outcome=bool(row["is_placeholder_outcome"]),
-                    bids=tuple(PriceLevel(price=float(level.price), size=float(level.size)) for level in book.bids),
-                    asks=tuple(PriceLevel(price=float(level.price), size=float(level.size)) for level in book.asks),
-                    captured_at=now,
-                )
-            )
-        return snapshots
+        self._universe_cache_rows = rows
+        self._universe_cache_until = now + timedelta(seconds=refresh_sec) if refresh_sec > 0 else None
+        return rows
 
     async def _load_replay_buckets(self, window_start: datetime, window_end: datetime) -> dict[datetime, list[TokenSnapshot]]:
         rows = await self.db.fetch_all(

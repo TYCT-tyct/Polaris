@@ -75,3 +75,14 @@ def test_arb_config_auto_run_tag_is_generated() -> None:
     cfg = arb_config_from_settings(settings)
     assert cfg.run_tag.startswith("auto-")
     assert len(cfg.run_tag) <= 64
+
+
+def test_arb_config_maps_universe_cache_and_liquidity_floor() -> None:
+    settings = PolarisSettings(
+        database_url="postgresql://postgres:postgres@localhost:55432/polaris",
+        arb_universe_refresh_sec=90,
+        arb_universe_min_liquidity=250.0,
+    )
+    cfg = arb_config_from_settings(settings)
+    assert cfg.universe_refresh_sec == 90
+    assert cfg.universe_min_liquidity == 250.0

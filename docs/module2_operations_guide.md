@@ -113,9 +113,14 @@
 - `POLARIS_ARB_MAX_SIGNALS_PER_CYCLE=48`：限制每轮处理信号上限，避免队列过长。
 - `POLARIS_ARB_UNIVERSE_MAX_HOURS=72`：只扫描 72 小时内到期市场，提高周转效率。
 - `POLARIS_ARB_UNIVERSE_TOKEN_LIMIT=2000`：限制每轮 token 上限，控制请求体积。
+- `POLARIS_ARB_UNIVERSE_REFRESH_SEC=180`：Universe 元数据缓存秒数，降低每轮数据库压力。
+- `POLARIS_ARB_UNIVERSE_MIN_LIQUIDITY=0`：按流动性过滤低质量市场，建议实盘设为 `50~200`。
 - `POLARIS_ARB_C_MAX_CANDIDATES_PER_EVENT=1`：策略 C 每个事件只执行最优候选，减少重复腿。
 - `POLARIS_ARB_CLOB_BOOKS_BATCH_SIZE=500`：`/books` 批量大小，过大可能触发 400。
 - `POLARIS_ARB_CLOB_BOOKS_MAX_CONCURRENCY=4`：并发批次上限，过高会放大网络抖动。
+- `POLARIS_CLOB_HTTP2_ENABLED=true`：启用 HTTP/2 复用，降低连接抖动和握手开销。
+- `POLARIS_CLOB_MAX_CONNECTIONS=80`：CLOB 客户端连接池上限。
+- `POLARIS_CLOB_MAX_KEEPALIVE_CONNECTIONS=40`：保活连接上限，减少反复建连。
 - `POLARIS_ARB_EXECUTION_CONCURRENCY=3`：单轮并发执行信号数，提升多机会同时捕获能力。
 - `POLARIS_ARB_LIVE_PREFLIGHT_MAX_AGE_MS=2000`：Live 预检快照最大复用时长，过期才二次拉盘口。
 - `POLARIS_ARB_LIVE_PREFLIGHT_FORCE_REFRESH=false`：是否强制每单二次拉盘口，默认关闭以减少延迟。
