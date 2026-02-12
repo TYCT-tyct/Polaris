@@ -341,7 +341,7 @@ class ArbOrchestrator:
                 strategy = signal.strategy_code.value
                 per_strategy[strategy]["signals"] += 1
                 plan = self._build_plan(signal)
-                capital_required = plan.total_notional()
+                capital_required = _estimate_capital(signal)
                 state_key = self._state_scope_key_for_signal(signal)
                 state = replay_states.get(state_key)
                 if state is None:
