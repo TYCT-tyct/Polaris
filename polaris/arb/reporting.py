@@ -78,8 +78,32 @@ class ArbReporter:
                 coalesce((select count(*) from window_signals where status = 'expired'), 0) as signals_expired,
                 coalesce((select count(*) from window_signals where status = 'new'), 0) as signals_new,
                 coalesce((select count(*) from window_trades), 0) as trades,
-                coalesce((select sum(case when net_pnl_usd > 0 then 1 else 0 end) from window_trades), 0) as wins,
-                coalesce((select sum(case when net_pnl_usd < 0 then 1 else 0 end) from window_trades), 0) as losses,
+                coalesce(
+                    (
+                        select sum(
+                            case
+                                when coalesce(nullif(metadata->>'mark_to_book_net_pnl_usd', '')::numeric, net_pnl_usd) > 0
+                                then 1
+                                else 0
+                            end
+                        )
+                        from window_trades
+                    ),
+                    0
+                ) as wins,
+                coalesce(
+                    (
+                        select sum(
+                            case
+                                when coalesce(nullif(metadata->>'mark_to_book_net_pnl_usd', '')::numeric, net_pnl_usd) < 0
+                                then 1
+                                else 0
+                            end
+                        )
+                        from window_trades
+                    ),
+                    0
+                ) as losses,
                 coalesce((select sum(gross_pnl_usd) from window_trades), 0) as gross_pnl_usd,
                 coalesce((select sum(net_pnl_usd) from window_trades), 0) as net_pnl_usd,
                 coalesce(
@@ -170,8 +194,16 @@ class ArbReporter:
                 select
                     strategy_code,
                     count(*) as trades,
-                    sum((net_pnl_usd > 0)::int) as wins,
-                    sum((net_pnl_usd < 0)::int) as losses,
+                    sum(
+                        (
+                            coalesce(nullif(metadata->>'mark_to_book_net_pnl_usd', '')::numeric, net_pnl_usd) > 0
+                        )::int
+                    ) as wins,
+                    sum(
+                        (
+                            coalesce(nullif(metadata->>'mark_to_book_net_pnl_usd', '')::numeric, net_pnl_usd) < 0
+                        )::int
+                    ) as losses,
                     coalesce(sum(gross_pnl_usd), 0) as gross_pnl_usd,
                     coalesce(sum(net_pnl_usd), 0) as net_pnl_usd,
                     coalesce(
@@ -195,7 +227,10 @@ class ArbReporter:
                     coalesce(sum(fees_usd), 0) as fees_usd,
                     coalesce(sum(slippage_usd), 0) as slippage_usd,
                     coalesce(sum(capital_used_usd), 0) as turnover_usd,
-                    coalesce(avg(net_pnl_usd), 0) as avg_trade_pnl_usd,
+                    coalesce(
+                        avg(coalesce(nullif(metadata->>'mark_to_book_net_pnl_usd', '')::numeric, net_pnl_usd)),
+                        0
+                    ) as avg_trade_pnl_usd,
                     coalesce(avg(capital_used_usd), 0) as avg_capital_used_usd,
                     coalesce(avg(hold_minutes), 0) as avg_hold_minutes,
                     min(created_at) as first_trade_at,
