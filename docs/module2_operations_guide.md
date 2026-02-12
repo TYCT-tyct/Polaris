@@ -124,6 +124,7 @@
 - `POLARIS_CLOB_WS_ENABLED=true`：启用 CLOB WebSocket 市场流。
 - `POLARIS_CLOB_WS_URL=wss://ws-subscriptions-clob.polymarket.com/ws/market`：官方 market 订阅端点。
 - `POLARIS_CLOB_WS_BOOK_MAX_AGE_SEC=2.5`：WS 缓存最大年龄，超时自动回退 REST `/books`。
+- `POLARIS_CLOB_BOOK_CACHE_MAX_AGE_SEC=12`：WS+REST 合并热缓存寿命，减少 missing token 的重复回拉。
 - `POLARIS_CLOB_WS_MAX_SUBSCRIBE_TOKENS=3500`：单进程订阅上限，超过上限走 REST。
 - `POLARIS_CLOB_WS_RECONNECT_MIN_SEC=0.5` / `POLARIS_CLOB_WS_RECONNECT_MAX_SEC=8`：断线重连退避区间。
 - `POLARIS_ARB_EXECUTION_CONCURRENCY=3`：单轮并发执行信号数，提升多机会同时捕获能力。

@@ -31,6 +31,7 @@ class ClobClient:
         ws_enabled: bool = False,
         ws_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/market",
         ws_book_max_age_sec: float = 2.5,
+        book_cache_max_age_sec: float = 12.0,
         ws_max_subscribe_tokens: int = 3500,
         ws_reconnect_min_sec: float = 0.5,
         ws_reconnect_max_sec: float = 8.0,
@@ -53,6 +54,7 @@ class ClobClient:
         self._ws_enabled = ws_enabled
         self._ws_url = ws_url
         self._ws_book_max_age_sec = max(0.2, ws_book_max_age_sec)
+        self._book_cache_max_age_sec = max(self._ws_book_max_age_sec, book_cache_max_age_sec)
         self._ws_max_subscribe_tokens = max(100, ws_max_subscribe_tokens)
         self._ws_reconnect_min_sec = max(0.1, ws_reconnect_min_sec)
         self._ws_reconnect_max_sec = max(self._ws_reconnect_min_sec, ws_reconnect_max_sec)
@@ -63,6 +65,7 @@ class ClobClient:
         self._ws_desired_tokens: set[str] = set()
         self._ws_subscribed_tokens: set[str] = set()
         self._ws_cache: dict[str, tuple[ClobBook, float]] = {}
+        self._book_cache: dict[str, tuple[ClobBook, float]] = {}
 
     async def close(self) -> None:
         if self._ws_task is not None:
@@ -93,6 +96,8 @@ class ClobClient:
             ws_books = await self._get_ws_books(token_ids)
 
         missing = [token_id for token_id in token_ids if token_id not in ws_books]
+        cached_books = await self._get_cached_books(missing)
+        missing = [token_id for token_id in missing if token_id not in cached_books]
         rest_books: dict[str, ClobBook] = {}
         if missing:
             batches = [missing[start : start + batch_size] for start in range(0, len(missing), batch_size)]
@@ -103,13 +108,20 @@ class ClobClient:
                     return await self._get_books_batch_resilient(batch)
 
             results = await asyncio.gather(*[_run(batch) for batch in batches])
+            now = monotonic()
+            cache_updates: list[tuple[str, ClobBook, float]] = []
             for rows in results:
                 for row in rows:
                     rest_books[row.asset_id] = row
+                    cache_updates.append((row.asset_id, row, now))
+            if cache_updates:
+                async with self._ws_lock:
+                    for token_id, book, ts in cache_updates:
+                        self._book_cache[token_id] = (book, ts)
 
         books: list[ClobBook] = []
         for token_id in token_ids:
-            book = ws_books.get(token_id) or rest_books.get(token_id)
+            book = ws_books.get(token_id) or cached_books.get(token_id) or rest_books.get(token_id)
             if book is not None:
                 books.append(book)
         return books
@@ -258,6 +270,19 @@ class ClobClient:
                     out[token_id] = book
         return out
 
+    async def _get_cached_books(self, token_ids: list[str]) -> dict[str, ClobBook]:
+        now = monotonic()
+        out: dict[str, ClobBook] = {}
+        async with self._ws_lock:
+            for token_id in token_ids:
+                cached = self._book_cache.get(token_id)
+                if cached is None:
+                    continue
+                book, ts = cached
+                if now - ts <= self._book_cache_max_age_sec:
+                    out[token_id] = book
+        return out
+
     async def _ws_loop(self) -> None:
         backoff = self._ws_reconnect_min_sec
         while not self._ws_stop.is_set():
@@ -295,6 +320,7 @@ class ClobClient:
                         async with self._ws_lock:
                             for book in books:
                                 self._ws_cache[book.asset_id] = (book, now)
+                                self._book_cache[book.asset_id] = (book, now)
                             self._prune_ws_cache(now)
             except asyncio.CancelledError:
                 raise
@@ -327,6 +353,10 @@ class ClobClient:
         stale_tokens = [token for token, (_, ts) in self._ws_cache.items() if now - ts > max_age]
         for token in stale_tokens:
             self._ws_cache.pop(token, None)
+        cache_max_age = self._book_cache_max_age_sec * 8
+        stale_books = [token for token, (_, ts) in self._book_cache.items() if now - ts > cache_max_age]
+        for token in stale_books:
+            self._book_cache.pop(token, None)
 
     @staticmethod
     def timestamp_to_datetime(raw_ts: str | None) -> datetime | None:
