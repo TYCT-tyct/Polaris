@@ -220,7 +220,9 @@ class ArbOrchestrator:
 
                 success = result.status == "filled"
                 hold_minutes = float(result.hold_minutes or 0.0)
-                should_release_exposure = (not success) or hold_minutes <= 1.0
+                should_release_exposure = True
+                if signal.mode == RunMode.LIVE:
+                    should_release_exposure = (not success) or hold_minutes <= 1.0
                 self.risk_gate.settle_execution(
                     state=risk_state,
                     success=success,

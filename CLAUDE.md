@@ -115,6 +115,7 @@
    ├─ test_arb_replay_real.py
    ├─ test_arb_reporting.py
    ├─ test_arb_clean_compat.py
+   ├─ test_risk_gate_exposure.py
    ├─ test_order_router_preflight.py
    ├─ test_clob_prices_parser.py
    ├─ test_t2t_benchmark.py
@@ -172,3 +173,4 @@
 - 2026-02-12：新增 `0005_module2_run_tag_indexes.sql`、`arb-clean` 命令和 `run_tag` 报表过滤，修复旧配置混入历史报表问题。
 - 2026-02-12：新增 CLOB HTTP/2 连接参数、`/prices` 降级路径、Universe 缓存与流动性筛选，并补充 `test_clob_prices_parser.py`。
 - 2026-02-12：新增 `0006_module2_diag_and_cleanup.sql`、`arb-doctor`、`arb-paper-profile`、新版 `arb-paper-matrix-start`，并修复 `arb-clean` 字段兼容问题。
+- 2026-02-13：修复 Module2 paper/replay 暴露占用口径：风控暴露改为 `arb_position_lot(status='open')`，并在非 live 模式执行后立即释放运行态暴露；新增 `tests/test_risk_gate_exposure.py` 防回归。

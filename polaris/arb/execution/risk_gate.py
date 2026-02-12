@@ -38,15 +38,13 @@ class RiskGate:
             f"""
             select
                 coalesce((
-                    select sum(capital_used_usd)
-                    from arb_trade_result
+                    select sum(open_notional_usd)
+                    from arb_position_lot
                     where mode = %s
                       and source_code = %s
                       { "and strategy_code = %s" if strategy_filter else "" }
-                      and coalesce(metadata->>'run_tag', '') = %s
-                      and status in ('filled', 'submitted')
-                      and coalesce(hold_minutes, 0) > 1
-                      and created_at + (coalesce(hold_minutes, 0)::text || ' minutes')::interval > now()
+                      and run_tag = %s
+                      and status = 'open'
                 ), 0) as exposure,
                 coalesce((
                     select sum(net_pnl_usd)
@@ -177,14 +175,12 @@ class RiskGate:
     async def current_exposure_usd(self, mode: RunMode, source_code: str) -> float:
         row = await self.db.fetch_one(
             """
-            select coalesce(sum(capital_used_usd), 0) as exposure
-            from arb_trade_result
+            select coalesce(sum(open_notional_usd), 0) as exposure
+            from arb_position_lot
             where mode = %s
               and source_code = %s
-              and coalesce(metadata->>'run_tag', '') = %s
-              and status in ('filled', 'submitted')
-              and coalesce(hold_minutes, 0) > 1
-              and created_at + (coalesce(hold_minutes, 0)::text || ' minutes')::interval > now()
+              and run_tag = %s
+              and status = 'open'
             """,
             (mode.value, source_code, self.config.run_tag),
         )
