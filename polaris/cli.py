@@ -310,8 +310,35 @@ _PAPER_PROFILE_PRESETS: dict[str, dict[str, str]] = {
         "POLARIS_ARB_F_MIN_ANNUALIZED_RETURN": "0.02",
         "POLARIS_ARB_F_MAX_SPREAD": "0.03",
         "POLARIS_ARB_G_MAX_HOURS_TO_RESOLVE": "72",
-        "POLARIS_ARB_G_MIN_CONFIDENCE": "0.75",
-        "POLARIS_ARB_G_MIN_EXPECTED_EDGE_PCT": "0.005",
+        # G (尾部收敛) 非无风险套利：必须覆盖 bid/ask 与噪声，否则 paper 会稳定亏损。
+        "POLARIS_ARB_G_MIN_CONFIDENCE": "0.90",
+        "POLARIS_ARB_G_MIN_EXPECTED_EDGE_PCT": "0.02",
+        "POLARIS_ARB_SAFE_ARBITRAGE_ONLY": "false",
+        "POLARIS_ARB_ENABLE_STRATEGY_A": "true",
+        "POLARIS_ARB_ENABLE_STRATEGY_B": "true",
+        "POLARIS_ARB_ENABLE_STRATEGY_C": "true",
+        "POLARIS_ARB_ENABLE_STRATEGY_F": "true",
+        "POLARIS_ARB_ENABLE_STRATEGY_G": "true",
+    },
+    # 更保守且可触发：专门用来避免 G 过度交易拖垮组合（shared 口径）。
+    "trigger_safe_50_v2": {
+        "POLARIS_ARB_PAPER_INITIAL_BANKROLL_USD": "50",
+        "POLARIS_ARB_SINGLE_RISK_USD": "6",
+        "POLARIS_ARB_MAX_EXPOSURE_USD": "24",
+        "POLARIS_ARB_DAILY_STOP_LOSS_USD": "8",
+        # 限制每轮最大处理信号，避免行情噪声导致过度成交与 DB 写入压力。
+        "POLARIS_ARB_MAX_SIGNALS_PER_CYCLE": "4",
+        "POLARIS_ARB_A_MIN_EDGE_PCT": "0.005",
+        "POLARIS_ARB_B_MIN_EDGE_PCT": "0.004",
+        "POLARIS_ARB_C_MIN_EDGE_PCT": "0.008",
+        "POLARIS_ARB_F_MIN_PROB": "0.85",
+        "POLARIS_ARB_F_MAX_HOURS_TO_RESOLVE": "72",
+        "POLARIS_ARB_F_MIN_ANNUALIZED_RETURN": "0.02",
+        "POLARIS_ARB_F_MAX_SPREAD": "0.03",
+        # G 只在更短窗口、更高置信度、更高边际下触发：否则 mark-to-book 会稳定为负。
+        "POLARIS_ARB_G_MAX_HOURS_TO_RESOLVE": "12",
+        "POLARIS_ARB_G_MIN_CONFIDENCE": "0.95",
+        "POLARIS_ARB_G_MIN_EXPECTED_EDGE_PCT": "0.05",
         "POLARIS_ARB_SAFE_ARBITRAGE_ONLY": "false",
         "POLARIS_ARB_ENABLE_STRATEGY_A": "true",
         "POLARIS_ARB_ENABLE_STRATEGY_B": "true",
@@ -748,7 +775,7 @@ def arb_run(
 
 @app.command("arb-paper-profile")
 def arb_paper_profile(
-    name: Annotated[str, typer.Option("--name")] = "trigger_safe_50",
+    name: Annotated[str, typer.Option("--name")] = "trigger_safe_50_v2",
     env_file: Annotated[str, typer.Option("--env-file")] = ".env",
     apply: Annotated[bool, typer.Option("--apply/--print")] = True,
 ) -> None:
@@ -797,7 +824,7 @@ def arb_doctor(
 def arb_paper_matrix_start(
     duration_hours: Annotated[int, typer.Option("--duration-hours", min=1, max=72)] = 4,
     source_prefix: Annotated[str, typer.Option("--source-prefix")] = "polymarket",
-    profile: Annotated[str, typer.Option("--profile")] = "trigger_safe_50",
+    profile: Annotated[str, typer.Option("--profile")] = "trigger_safe_50_v2",
     bankroll_usd: Annotated[float, typer.Option("--bankroll-usd", min=1.0)] = 50.0,
     include_c: Annotated[bool, typer.Option("--include-c/--no-include-c")] = True,
 ) -> None:
@@ -883,7 +910,7 @@ def arb_paper_matrix_start(
 def arb_replay_matrix(
     start: Annotated[str, typer.Option("--start", help="ISO datetime")] = "",
     end: Annotated[str, typer.Option("--end", help="ISO datetime")] = "",
-    profile: Annotated[str, typer.Option("--profile")] = "trigger_safe_50",
+    profile: Annotated[str, typer.Option("--profile")] = "trigger_safe_50_v2",
     bankroll_usd: Annotated[float, typer.Option("--bankroll-usd", min=1.0)] = 50.0,
     source_prefix: Annotated[str, typer.Option("--source-prefix")] = "polymarket_replay",
     include_c: Annotated[bool, typer.Option("--include-c/--no-include-c")] = True,

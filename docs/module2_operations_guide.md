@@ -25,10 +25,10 @@
 `python -m polaris.cli arb-doctor --mode paper_live --source polymarket`
 
 应用“可触发但控风险”参数模板：
-`python -m polaris.cli arb-paper-profile --name trigger_safe_50`
+`python -m polaris.cli arb-paper-profile --name trigger_safe_50_v2`
 
 一键同时启动 6 组后台 paper（A/B/C/F/G 各自隔离 + ABCFG 共享）：
-`python -m polaris.cli arb-paper-matrix-start --profile trigger_safe_50 --duration-hours 4 --bankroll-usd 50 --source-prefix polymarket`
+`python -m polaris.cli arb-paper-matrix-start --profile trigger_safe_50_v2 --duration-hours 4 --bankroll-usd 50 --source-prefix polymarket`
 
 停止一键启动的全部后台 paper：
 `python -m polaris.cli arb-paper-matrix-stop`
@@ -74,7 +74,7 @@
 `python -m polaris.cli arb-replay --start 2026-02-10T00:00:00+00:00 --end 2026-02-10T06:00:00+00:00 --source polymarket_replay_shared50 --run-tag replay-shared50 --full`
 
 一键跑“单策略 50 + 共享 50”回放矩阵（A/B/C/F/G）：
-`python -m polaris.cli arb-replay-matrix --start 2026-02-10T00:00:00+00:00 --end 2026-02-10T06:00:00+00:00 --profile trigger_safe_50 --bankroll-usd 50 --source-prefix polymarket_replay --full`
+`python -m polaris.cli arb-replay-matrix --start 2026-02-10T00:00:00+00:00 --end 2026-02-10T06:00:00+00:00 --profile trigger_safe_50_v2 --bankroll-usd 50 --source-prefix polymarket_replay --full`
 
 手动触发参数进化：
 `python -m polaris.cli arb-optimize`
