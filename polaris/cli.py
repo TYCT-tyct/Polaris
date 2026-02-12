@@ -800,6 +800,98 @@ def arb_paper_matrix_start(
         typer.echo(f"{name}: pid={pid} source={source} log={log_path}")
 
 
+@app.command("arb-replay-matrix")
+def arb_replay_matrix(
+    start: Annotated[str, typer.Option("--start", help="ISO datetime")] = "",
+    end: Annotated[str, typer.Option("--end", help="ISO datetime")] = "",
+    profile: Annotated[str, typer.Option("--profile")] = "trigger_safe_50",
+    bankroll_usd: Annotated[float, typer.Option("--bankroll-usd", min=1.0)] = 50.0,
+    source_prefix: Annotated[str, typer.Option("--source-prefix")] = "polymarket_replay",
+    include_c: Annotated[bool, typer.Option("--include-c/--no-include-c")] = True,
+    fast: Annotated[
+        bool,
+        typer.Option("--fast/--full", help="Fast replay skips detailed signal/order/fill writes"),
+    ] = False,
+) -> None:
+    """Run replay matrix:
+    - A/B/C/F/G each isolated bankroll
+    - ABCFG shared bankroll
+    """
+    if not start or not end:
+        raise typer.BadParameter("start and end are required")
+    refresh_process_env_from_file(preserve_existing=True)
+    load_settings.cache_clear()
+    settings = load_settings()
+    setup_logging(settings.log_level)
+    profile_env = _resolve_paper_profile(profile)
+
+    strategies = ["A", "B", "F", "G"] + (["C"] if include_c else [])
+    timestamp = datetime.now(tz=UTC).strftime("%Y%m%d_%H%M%S")
+    matrix_tag = _sanitize_run_tag(f"replay-{profile}-{timestamp}")
+    logs_dir = Path("logs")
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    bankroll_tag = str(int(bankroll_usd)) if float(bankroll_usd).is_integer() else f"{bankroll_usd:g}"
+
+    cases: list[tuple[str, set[str], bool]] = [("shared_abcfg", set(strategies), False)]
+    for strategy in strategies:
+        cases.append((f"isolated_{strategy.lower()}", {strategy}, True))
+
+    rows: list[dict[str, object]] = []
+    for name, enabled, split_by_strategy in cases:
+        source = f"{source_prefix}_{profile}_{name}{bankroll_tag}".lower()
+        run_tag = _sanitize_run_tag(f"{matrix_tag}-{name}")
+        log_path = logs_dir / f"arb_replay_{name}_{timestamp}.log"
+
+        env = os.environ.copy()
+        env.update(profile_env)
+        env["POLARIS_ARB_RUN_TAG"] = run_tag
+        env["POLARIS_ARB_PAPER_INITIAL_BANKROLL_USD"] = f"{bankroll_usd:.4f}"
+        env["POLARIS_ARB_PAPER_SPLIT_BY_STRATEGY"] = "true" if split_by_strategy else "false"
+        env["POLARIS_ARB_ENABLE_STRATEGY_A"] = "true" if "A" in enabled else "false"
+        env["POLARIS_ARB_ENABLE_STRATEGY_B"] = "true" if "B" in enabled else "false"
+        env["POLARIS_ARB_ENABLE_STRATEGY_C"] = "true" if "C" in enabled else "false"
+        env["POLARIS_ARB_ENABLE_STRATEGY_F"] = "true" if "F" in enabled else "false"
+        env["POLARIS_ARB_ENABLE_STRATEGY_G"] = "true" if "G" in enabled else "false"
+
+        cmd: list[str] = [
+            sys.executable,
+            "-m",
+            "polaris.cli",
+            "arb-replay",
+            "--start",
+            start,
+            "--end",
+            end,
+            "--source",
+            source,
+            "--run-tag",
+            run_tag,
+        ]
+        cmd.append("--fast" if fast else "--full")
+        completed = subprocess.run(
+            cmd,
+            env=env,
+            cwd=str(Path.cwd()),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        log_path.write_text((completed.stdout or "") + (completed.stderr or ""), encoding="utf-8")
+        rows.append(
+            {
+                "name": name,
+                "source": source,
+                "run_tag": run_tag,
+                "split_by_strategy": split_by_strategy,
+                "enabled": sorted(enabled),
+                "exit_code": int(completed.returncode),
+                "log": str(log_path),
+            }
+        )
+
+    typer.echo(json.dumps({"matrix_tag": matrix_tag, "rows": rows}, ensure_ascii=False, indent=2))
+
+
 @app.command("arb-paper-matrix-stop")
 def arb_paper_matrix_stop() -> None:
     """Stop background matrix paper runs if pid files exist."""
@@ -825,6 +917,7 @@ def arb_paper_matrix_stop() -> None:
 def arb_replay(
     start: Annotated[str, typer.Option("--start", help="ISO datetime")] = "",
     end: Annotated[str, typer.Option("--end", help="ISO datetime")] = "",
+    source: Annotated[str, typer.Option("--source", help="Replay source code tag")] = "polymarket",
     run_tag: Annotated[str, typer.Option("--run-tag", help="auto|current|custom")] = "auto",
     fast: Annotated[
         bool,
@@ -850,7 +943,8 @@ def arb_replay(
     async def _run() -> None:
         ctx = await create_arb_runtime(settings)
         try:
-            stats = await ctx.orchestrator.run_replay(start_ts, end_ts, fast=fast)
+            source_code = source.strip().lower() or "polymarket"
+            stats = await ctx.orchestrator.run_replay(start_ts, end_ts, source_code=source_code, fast=fast)
             typer.echo(f"arb-replay completed: {stats}")
         finally:
             await close_arb_runtime(ctx)

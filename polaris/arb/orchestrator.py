@@ -331,21 +331,62 @@ class ArbOrchestrator:
         )
 
         per_strategy: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
+        replay_states: dict[str, RiskRuntimeState] = {}
         buckets = await self._load_replay_buckets(window_start, window_end)
         for bucket_rows in buckets.values():
             snapshots = list(bucket_rows)
             by_token = {item.token_id: item for item in snapshots}
             signals = self._scan_all(RunMode.PAPER_REPLAY, source_code, snapshots)
             for signal in signals:
+                strategy = signal.strategy_code.value
+                per_strategy[strategy]["signals"] += 1
                 plan = self._build_plan(signal)
+                capital_required = plan.total_notional()
+                state_key = self._state_scope_key_for_signal(signal)
+                state = replay_states.get(state_key)
+                if state is None:
+                    strategy_scope = (
+                        signal.strategy_code
+                        if self.config.paper_split_by_strategy and signal.mode in {RunMode.PAPER_LIVE, RunMode.PAPER_REPLAY}
+                        else None
+                    )
+                    state = await self.risk_gate.load_state(
+                        signal.mode,
+                        signal.source_code,
+                        strategy_code=strategy_scope,
+                    )
+                    replay_states[state_key] = state
+
+                decision = await self.risk_gate.assess(
+                    signal,
+                    capital_required_usd=capital_required,
+                    state=state,
+                )
+                if not decision.allowed:
+                    per_strategy[strategy]["rejected"] += 1
+                    if not fast:
+                        await self.risk_gate.record_risk_event(
+                            signal.mode,
+                            signal.strategy_code,
+                            signal.source_code,
+                            decision,
+                        )
+                    continue
+
+                self.risk_gate.reserve_exposure(state, capital_required)
                 if fast:
                     result = await self.order_router.simulate_paper(plan, by_token)
                 else:
                     await self._record_signal(signal, SignalStatus.NEW)
                     result = await self.order_router.execute(plan, by_token)
-                strategy = signal.strategy_code.value
-                per_strategy[strategy]["signals"] += 1
-                if result.status == "filled":
+                filled = result.status == "filled"
+                self.risk_gate.settle_execution(
+                    state,
+                    success=filled,
+                    capital_required_usd=capital_required,
+                    realized_pnl_usd=result.net_pnl_usd if filled else 0.0,
+                )
+                if filled:
                     per_strategy[strategy]["trades"] += 1
                     per_strategy[strategy]["gross"] += result.gross_pnl_usd
                     per_strategy[strategy]["net"] += result.net_pnl_usd
@@ -354,6 +395,20 @@ class ArbOrchestrator:
                         per_strategy[strategy]["wins"] += 1
                     else:
                         per_strategy[strategy]["losses"] += 1
+                else:
+                    per_strategy[strategy]["rejected"] += 1
+                    if not fast:
+                        await self.risk_gate.record_risk_event(
+                            signal.mode,
+                            signal.strategy_code,
+                            signal.source_code,
+                            RiskDecision(
+                                allowed=False,
+                                level=RiskLevel.WARN,
+                                reason=f"execution_{result.status}",
+                                payload={"run_tag": self.config.run_tag},
+                            ),
+                        )
 
         for strategy, metric in per_strategy.items():
             await self.db.execute(

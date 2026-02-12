@@ -70,6 +70,12 @@
 完整审计回放（会写入明细信号/订单/成交，速度更慢）：
 `python -m polaris.cli arb-replay --start 2026-02-10T00:00:00+00:00 --end 2026-02-10T06:00:00+00:00 --full`
 
+指定回放来源标签（便于分组统计）：
+`python -m polaris.cli arb-replay --start 2026-02-10T00:00:00+00:00 --end 2026-02-10T06:00:00+00:00 --source polymarket_replay_shared50 --run-tag replay-shared50 --full`
+
+一键跑“单策略 50 + 共享 50”回放矩阵（A/B/C/F/G）：
+`python -m polaris.cli arb-replay-matrix --start 2026-02-10T00:00:00+00:00 --end 2026-02-10T06:00:00+00:00 --profile trigger_safe_50 --bankroll-usd 50 --source-prefix polymarket_replay --full`
+
 手动触发参数进化：
 `python -m polaris.cli arb-optimize`
 
