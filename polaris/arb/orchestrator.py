@@ -342,14 +342,10 @@ class ArbOrchestrator:
                 per_strategy[strategy]["signals"] += 1
                 plan = self._build_plan(signal)
                 capital_required = _estimate_capital(signal)
-                state_key = self._state_scope_key_for_signal(signal)
+                state_key = self._state_scope_key(signal)
                 state = replay_states.get(state_key)
                 if state is None:
-                    strategy_scope = (
-                        signal.strategy_code
-                        if self.config.paper_split_by_strategy and signal.mode in {RunMode.PAPER_LIVE, RunMode.PAPER_REPLAY}
-                        else None
-                    )
+                    strategy_scope = signal.strategy_code if self._paper_strategy_split(signal.mode) else None
                     state = await self.risk_gate.load_state(
                         signal.mode,
                         signal.source_code,
