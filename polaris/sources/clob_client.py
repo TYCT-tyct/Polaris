@@ -66,6 +66,13 @@ class ClobClient:
         self._ws_subscribed_tokens: set[str] = set()
         self._ws_cache: dict[str, tuple[ClobBook, float]] = {}
         self._book_cache: dict[str, tuple[ClobBook, float]] = {}
+        self._last_books_metrics: dict[str, int] = {
+            "requested": 0,
+            "ws_hits": 0,
+            "cache_hits": 0,
+            "rest_fetch": 0,
+            "returned": 0,
+        }
 
     async def close(self) -> None:
         if self._ws_task is not None:
@@ -88,6 +95,7 @@ class ClobClient:
     async def get_books(self, token_ids: list[str], batch_size: int = 500, max_concurrency: int = 4) -> list[ClobBook]:
         token_ids = _unique_tokens(token_ids)
         if not token_ids:
+            self._last_books_metrics = {"requested": 0, "ws_hits": 0, "cache_hits": 0, "rest_fetch": 0, "returned": 0}
             return []
 
         ws_books: dict[str, ClobBook] = {}
@@ -124,7 +132,17 @@ class ClobClient:
             book = ws_books.get(token_id) or cached_books.get(token_id) or rest_books.get(token_id)
             if book is not None:
                 books.append(book)
+        self._last_books_metrics = {
+            "requested": len(token_ids),
+            "ws_hits": len(ws_books),
+            "cache_hits": len(cached_books),
+            "rest_fetch": len(missing),
+            "returned": len(books),
+        }
         return books
+
+    def last_books_metrics(self) -> dict[str, int]:
+        return dict(self._last_books_metrics)
 
     async def get_prices(
         self,

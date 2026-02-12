@@ -423,6 +423,7 @@ class ArbOrchestrator:
             )
         except Exception:
             logger.exception("clob books load failed, fallback to prices")
+        books_metrics = self.clob_client.last_books_metrics()
         books_ms = int((perf_counter() - books_started) * 1000)
         by_token = {book.asset_id: book for book in books if book.asset_id}
         returned = set(by_token.keys())
@@ -513,6 +514,10 @@ class ArbOrchestrator:
             "snapshot_build_ms": build_ms,
             "snapshot_token_count": len(token_ids),
             "snapshot_book_count": len(by_token),
+            "snapshot_requested_count": int(books_metrics.get("requested", len(token_ids))),
+            "snapshot_ws_hits": int(books_metrics.get("ws_hits", 0)),
+            "snapshot_cache_hits": int(books_metrics.get("cache_hits", 0)),
+            "snapshot_rest_fetch": int(books_metrics.get("rest_fetch", len(token_ids))),
             "snapshot_prices_fallback": used_price_fallback,
         }
         return snapshots
