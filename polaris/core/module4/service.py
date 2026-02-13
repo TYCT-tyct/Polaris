@@ -10,6 +10,7 @@ from polaris.db.pool import Database
 
 from polaris.agents.evidence_agent import EvidenceAgent, EvidenceAgentConfig
 from polaris.agents.evidence_tools import EvidenceTools
+from polaris.agents.llm_semantic_agent import LLMSemanticAgent, LLMSemanticAgentConfig
 
 from .collapse_filter import CollapseFilter, CollapseFilterConfig
 from .conductor import Conductor, ConductorConfig
@@ -17,6 +18,7 @@ from .prior_builder import MarketPriorBuilder, PriorBuilderConfig
 from .regime_engine import RegimeEngine, compute_progress
 from .rule_compiler import RuleCompiler
 from .scorer import M4ScoreConfig, M4Scorer
+from .semantic_adjuster import SemanticAdjuster, SemanticAdjusterConfig
 from .types import M4Evidence, M4Posterior, M4ScoreResult, M4Decision, RuleVersion
 
 
@@ -56,6 +58,20 @@ class Module4Service:
             )
         )
         self._regime = RegimeEngine(db)
+        semantic_api_key = settings.m4_semantic_api_key or settings.arb_openai_api_key
+        semantic_llm = LLMSemanticAgent(
+            LLMSemanticAgentConfig(
+                enabled=settings.m4_semantic_llm_enabled and settings.m4_agent_enabled,
+                provider=settings.m4_semantic_provider,
+                model=settings.m4_semantic_model,
+                api_key=semantic_api_key,
+                timeout_sec=settings.m4_semantic_timeout_sec,
+                max_calls=settings.m4_semantic_max_calls,
+                confidence_floor=settings.m4_semantic_confidence_floor,
+                json_strict=settings.m4_semantic_json_strict,
+                scope=settings.m4_semantic_scope,
+            )
+        )
         self._conductor = Conductor(
             ConductorConfig(
                 min_reliability=settings.m4_decision_min_reliability,
@@ -69,12 +85,26 @@ class Module4Service:
         )
         self._evidence = EvidenceAgent(
             EvidenceTools(db),
+            semantic_llm,
             EvidenceAgentConfig(
                 enabled=settings.m4_agent_enabled,
-                max_calls=settings.m4_agent_max_calls,
-                timeout_sec=settings.m4_agent_timeout_sec,
-                single_source_uncertainty=settings.m4_agent_single_source_uncertainty,
+                max_calls=settings.m4_semantic_max_calls,
+                timeout_sec=settings.m4_semantic_timeout_sec,
+                confidence_floor=settings.m4_semantic_confidence_floor,
+                fail_mode=settings.m4_semantic_fail_mode,
+                model=settings.m4_semantic_model,
+                provider=settings.m4_semantic_provider,
+                api_key=semantic_api_key,
+                json_strict=settings.m4_semantic_json_strict,
+                scope=settings.m4_semantic_scope,
             ),
+        )
+        self._semantic = SemanticAdjuster(
+            SemanticAdjusterConfig(
+                confidence_floor=settings.m4_semantic_confidence_floor,
+                mean_shift_cap=settings.m4_semantic_mean_shift_cap,
+                uncertainty_cap=settings.m4_semantic_uncertainty_cap,
+            )
         )
         self._scorer = M4Scorer(
             db,
@@ -142,6 +172,8 @@ class Module4Service:
                 market_id=market["market_id"],
                 window_code="fused",
                 run_tag=run_tag_norm,
+                observed_count=observed,
+                progress=progress,
                 as_of=now,
             )
 
@@ -169,13 +201,15 @@ class Module4Service:
                 markets_with_prior += 1
                 prior_reliabilities.append(prior.prior_reliability)
                 uncertainty = (evidence.uncertainty_delta if evidence else 0.0) + ((1.0 - prior.prior_reliability) * 0.15)
+                progress_effective = regime.progress_effective + (evidence.delta_progress if evidence else 0.0)
+                progress_effective = max(0.001, min(0.999, progress_effective))
                 posterior = self._collapse.update(
                     market_id=market["market_id"],
                     window_code=window_code,
                     prior_pmf=prior.pmf,
                     observed_count=observed,
                     progress=progress,
-                    progress_effective=regime.progress_effective,
+                    progress_effective=progress_effective,
                     uncertainty_boost=uncertainty,
                 )
                 posteriors.append(posterior)
@@ -201,19 +235,32 @@ class Module4Service:
                 continue
 
             fused = self._conductor.fuse_posteriors(posteriors)
+            baseline_decision = self._conductor.decide(
+                posterior=fused,
+                prior_reliability=(sum(prior_reliabilities) / len(prior_reliabilities)) if prior_reliabilities else 0.0,
+            )
+            adjusted, semantic_diag = self._semantic.apply(fused, evidence)
             prior_reliability = (sum(prior_reliabilities) / len(prior_reliabilities)) if prior_reliabilities else 0.0
-            decision = self._conductor.decide(posterior=fused, prior_reliability=prior_reliability)
+            decision = self._conductor.decide(posterior=adjusted, prior_reliability=prior_reliability)
             await self._persist_snapshot(
                 run_tag=run_tag_norm,
                 mode=mode,
                 source_code=source_code,
                 market=market,
                 rule_version=rule_version,
-                posterior=fused,
+                posterior=adjusted,
                 prior_reliability=prior_reliability,
                 metadata={
                     "component_windows": [p.window_code for p in posteriors],
                     "evidence_tags": list(evidence.event_tags) if evidence else [],
+                    "baseline_posterior_pmf": fused.pmf_posterior,
+                    "baseline_expected_count": fused.expected_count,
+                    "baseline_entropy": fused.entropy,
+                    "semantic_applied": semantic_diag.applied,
+                    "semantic_confidence": semantic_diag.confidence_used,
+                    "mean_shift_applied": semantic_diag.mean_shift_applied,
+                    "uncertainty_applied": semantic_diag.uncertainty_applied,
+                    "semantic_meta": semantic_diag.metadata,
                     "replay_as_of": now.isoformat(),
                 },
             )
@@ -225,10 +272,12 @@ class Module4Service:
                 market=market,
                 rule_version=rule_version,
                 decision=decision,
-                posterior=fused,
+                posterior=adjusted,
                 metadata={
                     "evidence_tags": list(evidence.event_tags) if evidence else [],
                     "evidence_confidence": evidence.confidence if evidence else 0.0,
+                    "semantic_delta_edge": decision.edge_expected - baseline_decision.edge_expected,
+                    "semantic_delta_es95": decision.es95_loss - baseline_decision.es95_loss,
                     "replay_as_of": now.isoformat(),
                 },
             )
@@ -434,6 +483,8 @@ class Module4Service:
         market_id: str,
         window_code: str,
         run_tag: str,
+        observed_count: int,
+        progress: float,
         as_of: datetime,
     ) -> M4Evidence | None:
         if not enabled:
@@ -443,6 +494,8 @@ class Module4Service:
             market_id=market_id,
             window_code=window_code,
             run_tag=run_tag,
+            observed_count=observed_count,
+            progress=progress,
             as_of=as_of,
         )
 
@@ -568,12 +621,16 @@ class Module4Service:
             insert into m4_evidence_log(
                 run_tag, mode, source_code, market_id, tracking_id, account_id,
                 agent_name, calls_used, timed_out, degraded, confidence, uncertainty_delta,
-                event_tags, sources, metadata, created_at
+                event_tags, sources, metadata,
+                llm_model, prompt_version, latency_ms, parse_ok, applied, error_code,
+                created_at
             )
             values (
                 %s, %s, %s, %s, %s, %s,
-                'evidence_agent', %s, %s, %s, %s, %s,
-                %s::text[], %s::jsonb, %s::jsonb, now()
+                'llm_semantic_agent', %s, %s, %s, %s, %s,
+                %s::text[], %s::jsonb, %s::jsonb,
+                %s, %s, %s, %s, %s, %s,
+                now()
             )
             """,
             (
@@ -591,6 +648,12 @@ class Module4Service:
                 list(evidence.event_tags),
                 _to_json(list(evidence.sources)),
                 _to_json(evidence.metadata),
+                evidence.llm_model,
+                evidence.prompt_version,
+                evidence.latency_ms,
+                evidence.parse_ok,
+                not evidence.degraded,
+                evidence.error_code,
             ),
         )
 

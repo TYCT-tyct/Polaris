@@ -1421,6 +1421,359 @@ def m4_stage_report(
     asyncio.run(_run())
 
 
+@app.command("m4-semantic-dryrun")
+def m4_semantic_dryrun(
+    market_id: Annotated[str, typer.Option("--market-id", help="Target market_id")],
+    mode: Annotated[str, typer.Option("--mode", help="paper_live|paper_replay|shadow|live")] = "paper_live",
+    source: Annotated[str, typer.Option("--source", help="source_code")] = "module4",
+    run_tag: Annotated[str, typer.Option("--run-tag", help="auto|custom")] = "auto",
+    as_of: Annotated[str, typer.Option("--as-of", help="ISO datetime (optional)")] = "",
+) -> None:
+    """Run one semantic cycle and show before/after posterior plus semantic diagnostics."""
+    refresh_process_env_from_file(preserve_existing=True)
+    load_settings.cache_clear()
+    settings = load_settings()
+    setup_logging(settings.log_level)
+    _ensure_windows_selector_loop()
+
+    mode_norm = mode.strip().lower()
+    if mode_norm not in {"paper_live", "paper_replay", "shadow", "live"}:
+        raise typer.BadParameter("mode must be one of: paper_live, paper_replay, shadow, live")
+    as_of_ts = None
+    if as_of.strip():
+        as_of_ts = parse_iso_datetime(as_of.strip())
+
+    async def _run() -> None:
+        db = _create_database(settings)
+        await db.open()
+        try:
+            service = Module4Service(db, settings)
+            await service.compile_rules(market_id=market_id, force=False)
+            tag_value = run_tag.strip() or "auto"
+            summary = await service.run_once(
+                mode=mode_norm,
+                source_code=source.strip().lower() or "module4",
+                run_tag=tag_value,
+                market_id=market_id.strip(),
+                use_agent=True,
+                as_of=as_of_ts,
+                include_closed=True,
+                require_count_buckets=False,
+            )
+            rows = await db.fetch_all(
+                """
+                select
+                    ps.snapshot_id,
+                    ps.run_tag,
+                    ps.market_id,
+                    ps.window_code,
+                    ps.posterior_pmf,
+                    ps.metadata,
+                    ps.created_at
+                from m4_posterior_snapshot ps
+                where ps.run_tag = %s
+                  and ps.market_id = %s
+                  and ps.window_code = 'fused'
+                order by ps.created_at desc
+                limit 1
+                """,
+                (summary.run_tag, market_id.strip()),
+            )
+            evidence = await db.fetch_one(
+                """
+                select
+                    confidence, delta_uncertainty, event_tags, timed_out, degraded,
+                    llm_model, prompt_version, latency_ms, parse_ok, applied, error_code, metadata, created_at
+                from m4_evidence_log
+                where run_tag = %s
+                  and market_id = %s
+                order by created_at desc
+                limit 1
+                """,
+                (summary.run_tag, market_id.strip()),
+            )
+            decision = await db.fetch_one(
+                """
+                select action, reason_codes, edge_expected, es95_loss, net_edge, size_usd, metadata, created_at
+                from m4_decision_log
+                where run_tag = %s
+                  and market_id = %s
+                  and window_code = 'fused'
+                order by created_at desc
+                limit 1
+                """,
+                (summary.run_tag, market_id.strip()),
+            )
+
+            fused = rows[0] if rows else None
+            after_pmf = _parse_pmf(fused.get("posterior_pmf")) if fused else {}
+            metadata = fused.get("metadata") if fused else {}
+            baseline_pmf = _parse_pmf((metadata or {}).get("baseline_posterior_pmf")) if isinstance(metadata, dict) else {}
+            payload = {
+                "summary": {
+                    "run_tag": summary.run_tag,
+                    "mode": summary.mode,
+                    "source_code": summary.source_code,
+                    "markets_total": summary.markets_total,
+                    "decisions_written": summary.decisions_written,
+                    "snapshots_written": summary.snapshots_written,
+                    "skipped": summary.skipped,
+                },
+                "market_id": market_id.strip(),
+                "as_of": as_of_ts.isoformat() if isinstance(as_of_ts, datetime) else datetime.now(tz=UTC).isoformat(),
+                "baseline_posterior": baseline_pmf,
+                "semantic_posterior": after_pmf,
+                "semantic_metadata": metadata if isinstance(metadata, dict) else {},
+                "latest_evidence": evidence,
+                "latest_decision": decision,
+            }
+            typer.echo(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
+        finally:
+            await db.close()
+
+    asyncio.run(_run())
+
+
+@app.command("m4-semantic-eval")
+def m4_semantic_eval(
+    mode: Annotated[str, typer.Option("--mode", help="paper_replay|paper_live|shadow|live")] = "paper_replay",
+    source: Annotated[str, typer.Option("--source", help="source_code")] = "module4",
+    run_tag: Annotated[str, typer.Option("--run-tag", help="current|all|custom")] = "all",
+    since_hours: Annotated[int, typer.Option("--since-hours", min=1, max=24 * 120)] = 24 * 14,
+    ece_bins: Annotated[int, typer.Option("--ece-bins", min=5, max=30)] = 10,
+) -> None:
+    """Evaluate baseline vs semantic-adjusted posterior quality on settled windows."""
+    refresh_process_env_from_file(preserve_existing=True)
+    load_settings.cache_clear()
+    settings = load_settings()
+    setup_logging(settings.log_level)
+    _ensure_windows_selector_loop()
+
+    mode_norm = mode.strip().lower()
+    if mode_norm not in {"paper_replay", "paper_live", "shadow", "live"}:
+        raise typer.BadParameter("mode must be one of: paper_replay, paper_live, shadow, live")
+    source_norm = source.strip().lower() or "module4"
+    since_start = datetime.now(tz=UTC) - timedelta(hours=since_hours)
+
+    async def _run() -> None:
+        db = _create_database(settings)
+        await db.open()
+        try:
+            service = Module4Service(db, settings)
+            run_tag_filter = await service.resolve_run_tag_filter(raw=run_tag, mode=mode_norm, source_code=source_norm)
+            params: list[object] = [since_start, mode_norm, source_norm]
+            run_clause = ""
+            if run_tag_filter:
+                run_clause = "and ps.run_tag = %s"
+                params.append(run_tag_filter)
+            rows = await db.fetch_all(
+                f"""
+                select
+                    ps.run_tag,
+                    ps.market_id,
+                    ps.posterior_pmf,
+                    ps.metadata,
+                    tw.end_date,
+                    coalesce((ps.metadata->>'replay_as_of')::timestamptz, ps.created_at) as as_of_ts,
+                    coalesce(
+                        (
+                            select fm.cumulative_count_est
+                            from fact_tweet_metric_1m fm
+                            where fm.account_id = ps.account_id
+                              and fm.tracking_id = ps.tracking_id
+                              and fm.minute_bucket <= tw.end_date
+                            order by fm.minute_bucket desc
+                            limit 1
+                        ),
+                        (
+                            select max(fd.cumulative_count)::int
+                            from fact_tweet_metric_daily fd
+                            where fd.account_id = ps.account_id
+                              and fd.tracking_id = ps.tracking_id
+                              and fd.metric_date <= tw.end_date::date
+                        ),
+                        0
+                    ) as final_count
+                from m4_posterior_snapshot ps
+                join dim_tracking_window tw
+                  on tw.tracking_id = ps.tracking_id
+                 and tw.account_id = ps.account_id
+                where ps.created_at >= %s
+                  and ps.mode = %s
+                  and ps.source_code = %s
+                  and ps.window_code = 'fused'
+                  {run_clause}
+                  and tw.end_date is not null
+                order by ps.created_at asc
+                """,
+                tuple(params),
+            )
+
+            baseline_log: list[float] = []
+            semantic_log: list[float] = []
+            baseline_points: list[tuple[float, int]] = []
+            semantic_points: list[tuple[float, int]] = []
+            applied_count = 0
+            skipped = 0
+            skipped_by_reason: Counter[str] = Counter()
+            for row in rows:
+                end_date = row.get("end_date")
+                as_of_ts = row.get("as_of_ts")
+                if not isinstance(end_date, datetime) or not isinstance(as_of_ts, datetime):
+                    skipped += 1
+                    skipped_by_reason["invalid_time"] += 1
+                    continue
+                if (end_date - as_of_ts).total_seconds() <= 0:
+                    skipped += 1
+                    skipped_by_reason["non_positive_hours_to_close"] += 1
+                    continue
+                metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+                semantic = _parse_pmf(row.get("posterior_pmf"))
+                baseline = _parse_pmf((metadata or {}).get("baseline_posterior_pmf"))
+                if not baseline or not semantic:
+                    skipped += 1
+                    skipped_by_reason["pmf_missing"] += 1
+                    continue
+                final_count = int(row.get("final_count") or 0)
+                true_label = infer_true_bucket_label(final_count, semantic.keys())
+                if true_label is None:
+                    skipped += 1
+                    skipped_by_reason["true_label_not_in_bucket_space"] += 1
+                    continue
+                p_base = max(1e-9, float(baseline.get(true_label, 0.0)))
+                p_sem = max(1e-9, float(semantic.get(true_label, 0.0)))
+                baseline_log.append(math.log(p_base))
+                semantic_log.append(math.log(p_sem))
+                pred_base = _argmax_label(baseline)
+                pred_sem = _argmax_label(semantic)
+                baseline_points.append((float(baseline.get(pred_base, 0.0)), 1 if pred_base == true_label else 0))
+                semantic_points.append((float(semantic.get(pred_sem, 0.0)), 1 if pred_sem == true_label else 0))
+                if _to_bool((metadata or {}).get("semantic_applied")):
+                    applied_count += 1
+
+            base_log_score = (sum(baseline_log) / len(baseline_log)) if baseline_log else None
+            sem_log_score = (sum(semantic_log) / len(semantic_log)) if semantic_log else None
+            base_ece = expected_calibration_error(baseline_points, bins=ece_bins) if baseline_points else None
+            sem_ece = expected_calibration_error(semantic_points, bins=ece_bins) if semantic_points else None
+            gain_pct = None
+            if base_log_score is not None and sem_log_score is not None:
+                gain_pct = ((sem_log_score - base_log_score) / max(1e-9, abs(base_log_score))) * 100.0
+            payload = {
+                "mode": mode_norm,
+                "source_code": source_norm,
+                "run_tag": run_tag_filter or "all",
+                "since_hours": since_hours,
+                "rows_loaded": len(rows),
+                "points_total": len(semantic_log),
+                "semantic_applied_points": applied_count,
+                "baseline_log_score": base_log_score,
+                "semantic_log_score": sem_log_score,
+                "log_score_gain_pct": gain_pct,
+                "baseline_ece": base_ece,
+                "semantic_ece": sem_ece,
+                "ece_delta": (sem_ece - base_ece) if (sem_ece is not None and base_ece is not None) else None,
+                "skipped": skipped,
+                "skipped_by_reason": dict(skipped_by_reason),
+            }
+            typer.echo(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
+        finally:
+            await db.close()
+
+    asyncio.run(_run())
+
+
+@app.command("m4-semantic-health")
+def m4_semantic_health(
+    mode: Annotated[str, typer.Option("--mode", help="paper_replay|paper_live|shadow|live|all")] = "all",
+    source: Annotated[str, typer.Option("--source", help="source_code|all")] = "module4",
+    run_tag: Annotated[str, typer.Option("--run-tag", help="current|all|custom")] = "all",
+    since_hours: Annotated[int, typer.Option("--since-hours", min=1, max=24 * 120)] = 24 * 7,
+) -> None:
+    """Show semantic LLM runtime health: timeout/parse-fail/applied rates and latency p95."""
+    refresh_process_env_from_file(preserve_existing=True)
+    load_settings.cache_clear()
+    settings = load_settings()
+    setup_logging(settings.log_level)
+    _ensure_windows_selector_loop()
+
+    mode_norm = mode.strip().lower()
+    if mode_norm not in {"paper_replay", "paper_live", "shadow", "live", "all"}:
+        raise typer.BadParameter("mode must be one of: paper_replay, paper_live, shadow, live, all")
+    source_norm = source.strip().lower() or "module4"
+    source_filter = None if source_norm == "all" else source_norm
+    mode_filter = None if mode_norm == "all" else mode_norm
+    since_start = datetime.now(tz=UTC) - timedelta(hours=since_hours)
+
+    async def _run() -> None:
+        db = _create_database(settings)
+        await db.open()
+        try:
+            service = Module4Service(db, settings)
+            run_tag_filter: str | None
+            if run_tag.strip().lower() in {"", "all"}:
+                run_tag_filter = None
+            elif run_tag.strip().lower() == "current":
+                if mode_filter is None or source_filter is None:
+                    raise typer.BadParameter("--run-tag current requires --mode and --source to be specific (not 'all')")
+                run_tag_filter = await service.resolve_run_tag_filter(raw=run_tag, mode=mode_filter, source_code=source_filter)
+            else:
+                run_tag_filter = _sanitize_run_tag(run_tag)
+
+            where = ["created_at >= %s"]
+            params: list[object] = [since_start]
+            if mode_filter is not None:
+                where.append("mode = %s")
+                params.append(mode_filter)
+            if source_filter is not None:
+                where.append("source_code = %s")
+                params.append(source_filter)
+            if run_tag_filter:
+                where.append("run_tag = %s")
+                params.append(run_tag_filter)
+            row = await db.fetch_one(
+                f"""
+                select
+                    count(*)::int as total,
+                    coalesce(avg(case when timed_out then 1.0 else 0.0 end), 0) as timeout_rate,
+                    coalesce(avg(case when coalesce(parse_ok, false) then 0.0 else 1.0 end), 0) as parse_fail_rate,
+                    coalesce(avg(case when coalesce(applied, false) then 1.0 else 0.0 end), 0) as applied_rate,
+                    percentile_cont(0.50) within group (order by coalesce(latency_ms, 0)) as p50_latency_ms,
+                    percentile_cont(0.95) within group (order by coalesce(latency_ms, 0)) as p95_latency_ms
+                from m4_evidence_log
+                where {' and '.join(where)}
+                """,
+                tuple(params),
+            )
+            model_rows = await db.fetch_all(
+                f"""
+                select llm_model, count(*)::int as c
+                from m4_evidence_log
+                where {' and '.join(where)}
+                group by llm_model
+                order by c desc, llm_model asc
+                """,
+                tuple(params),
+            )
+            payload = {
+                "mode": mode_filter or "all",
+                "source_code": source_filter or "all",
+                "run_tag": run_tag_filter or "all",
+                "since_hours": since_hours,
+                "total": int(row["total"] if row else 0),
+                "timeout_rate": float(row["timeout_rate"] if row and row["timeout_rate"] is not None else 0.0),
+                "parse_fail_rate": float(row["parse_fail_rate"] if row and row["parse_fail_rate"] is not None else 0.0),
+                "applied_rate": float(row["applied_rate"] if row and row["applied_rate"] is not None else 0.0),
+                "p50_latency_ms": float(row["p50_latency_ms"] if row and row["p50_latency_ms"] is not None else 0.0),
+                "p95_latency_ms": float(row["p95_latency_ms"] if row and row["p95_latency_ms"] is not None else 0.0),
+                "model_distribution": [{str(r["llm_model"]): int(r["c"])} for r in model_rows],
+            }
+            typer.echo(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
+        finally:
+            await db.close()
+
+    asyncio.run(_run())
+
+
 @app.command("m4-dataset-audit")
 def m4_dataset_audit(
     mode: Annotated[str, typer.Option("--mode", help="paper_replay|paper_live|shadow|live|all")] = "paper_replay",

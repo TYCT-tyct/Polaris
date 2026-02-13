@@ -57,10 +57,17 @@ class RegimeAdjustment:
 class M4Evidence:
     event_tags: tuple[str, ...]
     confidence: float
+    delta_progress: float
     uncertainty_delta: float
+    mean_shift_hint: float
     calls_used: int
     timed_out: bool
     degraded: bool
+    parse_ok: bool = False
+    llm_model: str = ""
+    prompt_version: str = ""
+    error_code: str | None = None
+    latency_ms: float = 0.0
     sources: tuple[dict[str, Any], ...] = ()
     metadata: dict[str, Any] = field(default_factory=dict)
 
