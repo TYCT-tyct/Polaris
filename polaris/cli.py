@@ -1580,6 +1580,7 @@ def m4_semantic_eval(
                     ps.run_tag,
                     ps.market_id,
                     m.slug,
+                    ps.prior_pmf,
                     ps.posterior_pmf,
                     coalesce(ps.metadata->'baseline_posterior_pmf', ps.prior_pmf, '{{}}'::jsonb) as baseline_pmf,
                     ps.metadata,
