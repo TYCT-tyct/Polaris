@@ -386,11 +386,10 @@ class Module4Service:
             state_clause = "and m.closed = false and m.active = true"
         if require_count_buckets:
             bucket_clause = """
-              and exists (
-                    select 1
-                    from dim_token tk
-                    where tk.market_id = m.market_id
-                      and tk.outcome_label ~ '[0-9]'
+              and (
+                    m.slug ~ '-[0-9]+-[0-9]+$'
+                 or m.slug ~ '-[0-9]+(plus|\\+)$'
+                 or m.slug ~ '-[0-9]+-plus$'
               )
             """
         if market_id:

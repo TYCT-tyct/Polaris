@@ -10,6 +10,9 @@ _RANGE = re.compile(r"^\s*(\d+)\s*[-~]\s*(\d+)\s*$")
 _LT = re.compile(r"^\s*(?:<|<=)\s*(\d+)\s*$")
 _GT = re.compile(r"^\s*(\d+)\s*(?:\+|or more|以上)\s*$", re.IGNORECASE)
 _NUM = re.compile(r"^\s*(\d+)\s*$")
+_SLUG_RANGE_SUFFIX = re.compile(r"^(?P<family>.+)-(?P<low>\d+)-(?P<high>\d+)$")
+_SLUG_PLUS_SUFFIX = re.compile(r"^(?P<family>.+)-(?P<low>\d+)(?:\+|plus)$", re.IGNORECASE)
+_SLUG_PLUS_SUFFIX_ALT = re.compile(r"^(?P<family>.+)-(?P<low>\d+)-plus$", re.IGNORECASE)
 
 
 def parse_bucket_label(label: str) -> BucketRange:
@@ -62,3 +65,21 @@ def _bucket_order_key(item: BucketRange) -> tuple[int, int]:
     low = item.lower if item.lower is not None else -1
     up = item.upper if item.upper is not None else 10**9
     return low, up
+
+
+def split_count_bucket_from_slug(slug: str) -> tuple[str | None, str | None]:
+    text = (slug or "").strip().lower()
+    if not text:
+        return None, None
+    m = _SLUG_RANGE_SUFFIX.match(text)
+    if m:
+        low = int(m.group("low"))
+        high = int(m.group("high"))
+        if high < low:
+            low, high = high, low
+        return m.group("family"), f"{low}-{high}"
+    m = _SLUG_PLUS_SUFFIX.match(text) or _SLUG_PLUS_SUFFIX_ALT.match(text)
+    if m:
+        low = int(m.group("low"))
+        return m.group("family"), f"{low}+"
+    return None, None

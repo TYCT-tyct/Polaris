@@ -36,6 +36,7 @@ from polaris.arb.reporting import ArbReporter
 from polaris.config import PolarisSettings, load_settings, refresh_process_env_from_file
 from polaris.core.module4 import Module4Service, expected_calibration_error, multiclass_brier
 from polaris.core.module4.buckets import infer_true_bucket_label
+from polaris.core.module4.family import aggregate_market_family_rows
 from polaris.db.pool import Database
 from polaris.harvest.collector_markets import MarketCollector
 from polaris.harvest.collector_quotes import QuoteCollector
@@ -1273,7 +1274,9 @@ def m4_stage_report(
             rows = await db.fetch_all(
                 f"""
                 select
+                    ps.run_tag,
                     ps.market_id,
+                    m.slug,
                     ps.tracking_id,
                     ps.account_id,
                     ps.prior_pmf,
@@ -1301,6 +1304,8 @@ def m4_stage_report(
                         0
                     ) as final_count
                 from m4_posterior_snapshot ps
+                join dim_market m
+                  on m.market_id = ps.market_id
                 join dim_tracking_window tw
                   on tw.tracking_id = ps.tracking_id
                  and tw.account_id = ps.account_id
@@ -1314,6 +1319,7 @@ def m4_stage_report(
                 """,
                 tuple(params),
             )
+            prepared = aggregate_market_family_rows(rows, include_baseline=False)
 
             grouped: dict[str, dict[str, list[float] | list[tuple[float, int]] | int]] = {
                 name: {
@@ -1330,7 +1336,7 @@ def m4_stage_report(
             total_points = 0
             skipped = 0
             skipped_by_reason: Counter[str] = Counter()
-            for row in rows:
+            for row in prepared.rows:
                 end_date = row.get("end_date")
                 as_of_ts = row.get("as_of_ts")
                 if not isinstance(end_date, datetime) or not isinstance(as_of_ts, datetime):
@@ -1410,8 +1416,10 @@ def m4_stage_report(
                 "ece_bins": ece_bins,
                 "points_total": total_points,
                 "rows_loaded": len(rows),
+                "rows_after_aggregation": len(prepared.rows),
                 "skipped": skipped,
                 "skipped_by_reason": dict(skipped_by_reason),
+                "aggregation": prepared.stats,
                 "stage_report": report_rows,
             }
             typer.echo(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
@@ -1571,7 +1579,9 @@ def m4_semantic_eval(
                 select
                     ps.run_tag,
                     ps.market_id,
+                    m.slug,
                     ps.posterior_pmf,
+                    coalesce(ps.metadata->'baseline_posterior_pmf', '{{}}'::jsonb) as baseline_pmf,
                     ps.metadata,
                     tw.end_date,
                     coalesce((ps.metadata->>'replay_as_of')::timestamptz, ps.created_at) as as_of_ts,
@@ -1595,6 +1605,8 @@ def m4_semantic_eval(
                         0
                     ) as final_count
                 from m4_posterior_snapshot ps
+                join dim_market m
+                  on m.market_id = ps.market_id
                 join dim_tracking_window tw
                   on tw.tracking_id = ps.tracking_id
                  and tw.account_id = ps.account_id
@@ -1608,6 +1620,7 @@ def m4_semantic_eval(
                 """,
                 tuple(params),
             )
+            prepared = aggregate_market_family_rows(rows, include_baseline=True)
 
             baseline_log: list[float] = []
             semantic_log: list[float] = []
@@ -1616,7 +1629,7 @@ def m4_semantic_eval(
             applied_count = 0
             skipped = 0
             skipped_by_reason: Counter[str] = Counter()
-            for row in rows:
+            for row in prepared.rows:
                 end_date = row.get("end_date")
                 as_of_ts = row.get("as_of_ts")
                 if not isinstance(end_date, datetime) or not isinstance(as_of_ts, datetime):
@@ -1627,9 +1640,8 @@ def m4_semantic_eval(
                     skipped += 1
                     skipped_by_reason["non_positive_hours_to_close"] += 1
                     continue
-                metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
                 semantic = _parse_pmf(row.get("posterior_pmf"))
-                baseline = _parse_pmf((metadata or {}).get("baseline_posterior_pmf"))
+                baseline = _parse_pmf(row.get("baseline_pmf"))
                 if not baseline or not semantic:
                     skipped += 1
                     skipped_by_reason["pmf_missing"] += 1
@@ -1648,7 +1660,7 @@ def m4_semantic_eval(
                 pred_sem = _argmax_label(semantic)
                 baseline_points.append((float(baseline.get(pred_base, 0.0)), 1 if pred_base == true_label else 0))
                 semantic_points.append((float(semantic.get(pred_sem, 0.0)), 1 if pred_sem == true_label else 0))
-                if _to_bool((metadata or {}).get("semantic_applied")):
+                if bool(row.get("semantic_applied")):
                     applied_count += 1
 
             base_log_score = (sum(baseline_log) / len(baseline_log)) if baseline_log else None
@@ -1664,6 +1676,7 @@ def m4_semantic_eval(
                 "run_tag": run_tag_filter or "all",
                 "since_hours": since_hours,
                 "rows_loaded": len(rows),
+                "rows_after_aggregation": len(prepared.rows),
                 "points_total": len(semantic_log),
                 "semantic_applied_points": applied_count,
                 "baseline_log_score": base_log_score,
@@ -1674,6 +1687,7 @@ def m4_semantic_eval(
                 "ece_delta": (sem_ece - base_ece) if (sem_ece is not None and base_ece is not None) else None,
                 "skipped": skipped,
                 "skipped_by_reason": dict(skipped_by_reason),
+                "aggregation": prepared.stats,
             }
             typer.echo(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
         finally:
@@ -1827,11 +1841,10 @@ def m4_dataset_audit(
             if require_count_buckets:
                 where_clauses.append(
                     """
-                    exists (
-                        select 1
-                        from dim_token tk
-                        where tk.market_id = ps.market_id
-                          and tk.outcome_label ~ '[0-9]'
+                    (
+                        m.slug ~ '-[0-9]+-[0-9]+$'
+                        or m.slug ~ '-[0-9]+(plus|\\+)$'
+                        or m.slug ~ '-[0-9]+-plus$'
                     )
                     """
                 )
@@ -1841,6 +1854,7 @@ def m4_dataset_audit(
                 select
                     ps.run_tag,
                     ps.market_id,
+                    m.slug,
                     ps.prior_pmf,
                     ps.posterior_pmf,
                     coalesce((ps.metadata->>'replay_as_of')::timestamptz, ps.created_at) as as_of_ts,
@@ -1865,6 +1879,8 @@ def m4_dataset_audit(
                         0
                     ) as final_count
                 from m4_posterior_snapshot ps
+                join dim_market m
+                  on m.market_id = ps.market_id
                 join dim_tracking_window tw
                   on tw.tracking_id = ps.tracking_id
                  and tw.account_id = ps.account_id
@@ -1874,13 +1890,15 @@ def m4_dataset_audit(
                 tuple(params),
             )
 
-            audit = _audit_m4_dataset_rows(rows)
+            prepared = aggregate_market_family_rows(rows, include_baseline=False)
+            audit = _audit_m4_dataset_rows(prepared.rows)
             payload = {
                 "mode": mode_filter or "all",
                 "source_code": source_filter or "all",
                 "run_tag": run_tag_filter or "all",
                 "since_hours": since_hours,
                 "require_count_buckets": require_count_buckets,
+                "aggregation": prepared.stats,
                 **audit,
             }
             typer.echo(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
