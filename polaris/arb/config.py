@@ -73,6 +73,13 @@ class ArbConfig:
     paper_exit_g_take_profit_pct: float
     paper_exit_g_stop_loss_pct: float
     paper_exit_g_max_hold_minutes: int
+    paper_exit_g_trailing_enabled: bool
+    paper_exit_g_trailing_activate_profit_pct: float
+    paper_exit_g_trailing_drawdown_pct: float
+
+    paper_settle_enabled: bool
+    paper_settle_check_interval_sec: int
+    paper_settle_grace_minutes: int
 
     enable_strategy_a: bool
     enable_strategy_b: bool
@@ -169,6 +176,13 @@ def arb_config_from_settings(settings: PolarisSettings) -> ArbConfig:
         paper_exit_g_take_profit_pct=settings.arb_paper_exit_g_take_profit_pct,
         paper_exit_g_stop_loss_pct=settings.arb_paper_exit_g_stop_loss_pct,
         paper_exit_g_max_hold_minutes=settings.arb_paper_exit_g_max_hold_minutes,
+        paper_exit_g_trailing_enabled=bool(settings.arb_paper_exit_g_trailing_enabled),
+        paper_exit_g_trailing_activate_profit_pct=float(settings.arb_paper_exit_g_trailing_activate_profit_pct),
+        paper_exit_g_trailing_drawdown_pct=float(settings.arb_paper_exit_g_trailing_drawdown_pct),
+
+        paper_settle_enabled=bool(settings.arb_paper_settle_enabled),
+        paper_settle_check_interval_sec=int(settings.arb_paper_settle_check_interval_sec),
+        paper_settle_grace_minutes=int(settings.arb_paper_settle_grace_minutes),
         enable_strategy_a=settings.arb_enable_strategy_a,
         enable_strategy_b=settings.arb_enable_strategy_b,
         enable_strategy_c=settings.arb_enable_strategy_c,

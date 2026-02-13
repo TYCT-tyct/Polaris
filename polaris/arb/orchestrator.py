@@ -34,6 +34,8 @@ from polaris.arb.strategies.strategy_c import StrategyC
 from polaris.arb.strategies.strategy_f import StrategyF
 from polaris.arb.strategies.strategy_g import StrategyG
 from polaris.arb.paper.exit_rules import decide_exit_reason, exit_rule_for_strategy
+from polaris.arb.paper.trailing_stop import TrailingStopConfig, update_peak_and_check_trigger
+from polaris.arb.paper.settlement import build_settlement_bundle, is_locked_full_set_bundle
 from polaris.db.pool import Database
 from polaris.sources.clob_client import ClobClient
 
@@ -63,6 +65,8 @@ class ArbOrchestrator:
         self._last_snapshot_metrics: dict[str, int | float | bool] = {}
         self._last_portfolio_snapshot_at: dict[str, datetime] = {}
         self._last_exit_check_at: datetime | None = None
+        self._last_settle_check_at: datetime | None = None
+        self._paper_g_trailing_peak_pct: dict[str, float] = {}
 
         self.strategy_a = StrategyA(config)
         self.strategy_b = StrategyB(config)
@@ -344,6 +348,8 @@ class ArbOrchestrator:
         if scan_diag:
             await self._record_scan_diag(mode, source_code, scan_diag)
         if mode in {RunMode.PAPER_LIVE, RunMode.PAPER_REPLAY}:
+            await self._maybe_settle_paper_positions(mode, source_code, risk_states, cash_balances, now=datetime.now(tz=UTC))
+        if mode in {RunMode.PAPER_LIVE, RunMode.PAPER_REPLAY}:
             await self._maybe_exit_paper_positions(mode, source_code, risk_states, cash_balances, snapshot_map)
         if mode in {RunMode.PAPER_LIVE, RunMode.PAPER_REPLAY}:
             await self._maybe_record_portfolio_snapshots(mode, source_code, risk_states, cash_balances, snapshot_map)
@@ -380,6 +386,316 @@ class ArbOrchestrator:
             return 0
         self._last_exit_check_at = now
         return await self._exit_paper_positions(mode, source_code, risk_states, cash_balances, snapshot_map, now=now)
+
+    async def _maybe_settle_paper_positions(
+        self,
+        mode: RunMode,
+        source_code: str,
+        risk_states: dict[str, RiskRuntimeState],
+        cash_balances: dict[str, float],
+        *,
+        now: datetime,
+    ) -> int:
+        if not self.config.paper_settle_enabled:
+            return 0
+        interval = max(1, int(self.config.paper_settle_check_interval_sec))
+        if self._last_settle_check_at is not None and (now - self._last_settle_check_at).total_seconds() < interval:
+            return 0
+        self._last_settle_check_at = now
+        return await self._settle_paper_positions(mode, source_code, risk_states, cash_balances, now=now)
+
+    async def _settle_paper_positions(
+        self,
+        mode: RunMode,
+        source_code: str,
+        risk_states: dict[str, RiskRuntimeState],
+        cash_balances: dict[str, float],
+        *,
+        now: datetime,
+        limit: int = 200,
+    ) -> int:
+        """
+        到期结算模拟（Settlement Simulation）：
+        - 仅对 A/B 的“锁定收益组合”生效
+        - C 属于转换型，不具备锁定收益，默认不做结算模拟（避免用假设污染结果）
+        """
+        run_tag = self.config.run_tag
+        grace = timedelta(minutes=max(0, int(self.config.paper_settle_grace_minutes)))
+
+        lots = await self.db.fetch_all(
+            """
+            select
+                position_id,
+                strategy_code,
+                market_id,
+                token_id,
+                side,
+                open_price,
+                open_size,
+                open_notional_usd,
+                remaining_size,
+                opened_at,
+                open_intent_id
+            from arb_position_lot
+            where mode = %s
+              and source_code = %s
+              and run_tag = %s
+              and status = 'open'
+              and coalesce(remaining_size, 0) > 0
+              and upper(strategy_code) in ('A','B')
+            order by opened_at asc
+            limit %s
+            """,
+            (mode.value, source_code, run_tag, int(limit)),
+        )
+        if not lots:
+            return 0
+
+        intent_ids = [str(row["open_intent_id"]) for row in lots if row.get("open_intent_id")]
+        if not intent_ids:
+            return 0
+
+        intent_rows = await self.db.fetch_all(
+            "select intent_id, signal_id from arb_order_intent where intent_id = any(%s)",
+            (intent_ids,),
+        )
+        intent_to_signal = {str(r["intent_id"]): (str(r["signal_id"]) if r.get("signal_id") else None) for r in intent_rows}
+
+        by_signal: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for lot in lots:
+            sig = intent_to_signal.get(str(lot.get("open_intent_id"))) if lot.get("open_intent_id") else None
+            if not sig:
+                continue
+            by_signal[sig].append(lot)
+
+        if not by_signal:
+            return 0
+
+        settled = 0
+        for signal_id, group in by_signal.items():
+            strategy_code = str(group[0]["strategy_code"] or "").strip().upper()
+            if strategy_code not in {"A", "B"}:
+                continue
+            if any(str(lot.get("side") or "").upper() != "BUY" for lot in group):
+                continue
+
+            market_ids = sorted({str(lot["market_id"]) for lot in group if lot.get("market_id")})
+            token_ids = sorted({str(lot["token_id"]) for lot in group if lot.get("token_id")})
+            if not market_ids or not token_ids:
+                continue
+
+            market_rows = await self.db.fetch_all(
+                "select market_id, closed, end_date, neg_risk, event_id from dim_market where market_id = any(%s)",
+                (market_ids,),
+            )
+            if len(market_rows) != len(market_ids):
+                continue
+            by_market = {str(r["market_id"]): r for r in market_rows}
+            ready = True
+            for mid in market_ids:
+                r = by_market[mid]
+                if bool(r.get("closed")):
+                    continue
+                end_date = r.get("end_date")
+                if end_date is None:
+                    ready = False
+                    break
+                if now < (end_date + grace):
+                    ready = False
+                    break
+            if not ready:
+                continue
+
+            # Strategy A：需要验证事件组完整性（否则会把“半套”当锁定收益，结果会非常假）。
+            if strategy_code == "A":
+                # 从 dim_market.event_id 做强校验：同 event_id 的 neg_risk market 数必须等于本次 legs 数。
+                event_ids = {str(by_market[m]["event_id"]) for m in market_ids if by_market[m].get("event_id")}
+                if len(event_ids) != 1:
+                    continue
+                event_id = next(iter(event_ids))
+                expected_cnt_row = await self.db.fetch_one(
+                    "select count(*) as c from dim_market where event_id=%s and neg_risk=true",
+                    (event_id,),
+                )
+                expected_cnt = int(expected_cnt_row["c"]) if expected_cnt_row and expected_cnt_row.get("c") is not None else 0
+                if expected_cnt <= 0 or expected_cnt != len(market_ids):
+                    continue
+
+            token_rows = await self.db.fetch_all(
+                "select token_id, outcome_side from dim_token where token_id = any(%s)",
+                (token_ids,),
+            )
+            outcome_sides = {str(r["token_id"]): str(r.get("outcome_side") or "") for r in token_rows}
+
+            shares_by_token: dict[str, float] = {}
+            open_cost_by_token: dict[str, float] = {}
+            opened_at_min: datetime | None = None
+            open_total_cost = 0.0
+            for lot in group:
+                token_id = str(lot["token_id"])
+                open_size = float(lot["open_size"] or 0.0)
+                remaining = float(lot["remaining_size"] or 0.0)
+                if open_size <= 0 or remaining <= 0:
+                    continue
+                shares_by_token[token_id] = remaining
+                open_notional = float(lot["open_notional_usd"] or 0.0)
+                # 按 remaining 比例估算还未结算部分的成本。
+                cost = open_notional * min(1.0, remaining / max(open_size, 1e-9))
+                open_cost_by_token[token_id] = cost
+                open_total_cost += cost
+                oa = lot.get("opened_at")
+                if oa and (opened_at_min is None or oa < opened_at_min):
+                    opened_at_min = oa
+
+            if not is_locked_full_set_bundle(
+                strategy_code=strategy_code,
+                outcome_sides=outcome_sides,
+                shares_by_token=shares_by_token,
+            ):
+                continue
+
+            bundle = build_settlement_bundle(
+                strategy_code=strategy_code,
+                token_ids=list(shares_by_token.keys()),
+                shares_by_token=shares_by_token,
+            )
+            if bundle is None:
+                continue
+
+            payout = float(bundle.gross_payout_usd)
+            gross_pnl = payout - float(open_total_cost)
+            net_pnl = gross_pnl
+
+            ledger_strategy = strategy_code if self._paper_strategy_split(mode) else "shared"
+            scope_key = (
+                f"{mode.value}:{source_code}:{strategy_code}"
+                if self._paper_strategy_split(mode)
+                else f"{mode.value}:{source_code}:shared"
+            )
+            state = risk_states.get(scope_key)
+            if state is None:
+                state = await self.risk_gate.load_state(
+                    mode,
+                    source_code,
+                    strategy_code=StrategyCode(strategy_code) if self._paper_strategy_split(mode) else None,
+                )
+                risk_states[scope_key] = state
+                cash_balances[scope_key] = await self._load_latest_cash_balance(
+                    mode,
+                    source_code,
+                    StrategyCode(strategy_code) if self._paper_strategy_split(mode) else None,
+                )
+
+            before = float(cash_balances.get(scope_key, state.cash_balance_usd))
+            after = before + payout
+            await self.db.execute(
+                """
+                insert into arb_cash_ledger(
+                    mode, strategy_code, source_code, entry_type, amount_usd,
+                    balance_before_usd, balance_after_usd, ref_signal_id, ref_intent_id, payload, created_at
+                )
+                values (%s, %s, %s, 'settlement_payout', %s, %s, %s, %s, null, %s::jsonb, %s)
+                """,
+                (
+                    mode.value,
+                    ledger_strategy,
+                    source_code,
+                    payout,
+                    before,
+                    after,
+                    signal_id,
+                    json.dumps(
+                        {
+                            "run_tag": run_tag,
+                            "execution_backend": self.config.execution_backend,
+                            "trade_kind": "settlement",
+                            "signal_id": signal_id,
+                            "strategy_code": strategy_code,
+                            "legs": len(group),
+                            "payout_usd": payout,
+                            "winner_token_id": bundle.winner_token_id,
+                            "note": "settlement_winner_is_bookkeeping_only",
+                        },
+                        ensure_ascii=True,
+                    ),
+                    now,
+                ),
+            )
+            cash_balances[scope_key] = after
+            state.cash_balance_usd = after
+            state.exposure_usd = max(0.0, float(state.exposure_usd) - float(open_total_cost))
+
+            winner = bundle.winner_token_id
+            for lot in group:
+                token_id = str(lot["token_id"])
+                open_cost = float(open_cost_by_token.get(token_id) or 0.0)
+                remaining = float(lot["remaining_size"] or 0.0)
+                close_price = 1.0 if token_id == winner else 0.0
+                close_notional = remaining * close_price
+                realized = close_notional - open_cost
+                await self.db.execute(
+                    """
+                    update arb_position_lot
+                    set status = 'closed',
+                        remaining_size = 0,
+                        closed_at = %s,
+                        close_price = %s,
+                        realized_pnl_usd = %s
+                    where position_id = %s
+                    """,
+                    (now, close_price, realized, str(lot["position_id"])),
+                )
+                # 释放追踪止损缓存（虽然这里只有 A/B，但保持一致性）。
+                self._paper_g_trailing_peak_pct.pop(str(lot["position_id"]), None)
+
+            hold_minutes = (
+                max(0.0, (now - opened_at_min).total_seconds() / 60.0) if opened_at_min is not None else None
+            )
+            await self.db.execute(
+                """
+                insert into arb_trade_result(
+                    signal_id, mode, strategy_code, source_code, status,
+                    gross_pnl_usd, fees_usd, slippage_usd, net_pnl_usd, capital_used_usd,
+                    hold_minutes, opened_at, closed_at, metadata, created_at
+                )
+                values (
+                    %s, %s, %s, %s, 'closed',
+                    %s, 0, 0, %s, %s,
+                    %s, %s, %s, %s::jsonb, %s
+                )
+                """,
+                (
+                    signal_id,
+                    mode.value,
+                    strategy_code,
+                    source_code,
+                    gross_pnl,
+                    net_pnl,
+                    float(open_total_cost),
+                    hold_minutes,
+                    opened_at_min,
+                    now,
+                    json.dumps(
+                        {
+                            "run_tag": run_tag,
+                            "execution_backend": self.config.execution_backend,
+                            "trade_kind": "settlement",
+                            "legs": len(group),
+                            "payout_usd": payout,
+                            "winner_token_id": winner,
+                            "note": "settlement_winner_is_bookkeeping_only",
+                            "market_ids": market_ids,
+                            "token_ids": token_ids,
+                        },
+                        ensure_ascii=True,
+                    ),
+                    now,
+                ),
+            )
+
+            settled += 1
+
+        return settled
 
     async def _exit_paper_positions(
         self,
@@ -473,6 +789,22 @@ class ArbOrchestrator:
                 unrealized_pnl_usd=unrealized,
                 open_notional_usd=open_notional,
             )
+            position_id = str(lot["position_id"])
+            if strategy_code == "G":
+                cfg = TrailingStopConfig(
+                    enabled=bool(getattr(self.config, "paper_exit_g_trailing_enabled", False)),
+                    activate_profit_pct=float(getattr(self.config, "paper_exit_g_trailing_activate_profit_pct", 0.0)),
+                    drawdown_pct=float(getattr(self.config, "paper_exit_g_trailing_drawdown_pct", 0.0)),
+                )
+                prev_peak = self._paper_g_trailing_peak_pct.get(position_id)
+                new_peak, triggered = update_peak_and_check_trigger(
+                    cfg=cfg,
+                    current_pnl_pct=pnl_pct,
+                    prev_peak_pct=prev_peak,
+                )
+                self._paper_g_trailing_peak_pct[position_id] = new_peak
+                if reason is None and triggered and hold_minutes >= float(rule.min_hold_minutes):
+                    reason = "trailing_stop"
             if reason is None:
                 continue
             if sim is None or close_notional <= 0:
@@ -676,7 +1008,7 @@ class ArbOrchestrator:
                     realized_pnl_usd = %s
                 where position_id = %s
                 """,
-                (now, close_price, net_pnl, str(lot["position_id"])),
+                (now, close_price, net_pnl, position_id),
             )
             await self.db.execute(
                 """
@@ -723,6 +1055,7 @@ class ArbOrchestrator:
                 ),
             )
             closed += 1
+            self._paper_g_trailing_peak_pct.pop(position_id, None)
 
         return closed
 

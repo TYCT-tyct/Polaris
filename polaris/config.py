@@ -140,6 +140,13 @@ class PolarisSettings(BaseSettings):
     arb_paper_exit_g_take_profit_pct: float = Field(default=0.015)
     arb_paper_exit_g_stop_loss_pct: float = Field(default=0.025)
     arb_paper_exit_g_max_hold_minutes: int = Field(default=180)
+    arb_paper_exit_g_trailing_enabled: bool = Field(default=True)
+    arb_paper_exit_g_trailing_activate_profit_pct: float = Field(default=0.01)
+    arb_paper_exit_g_trailing_drawdown_pct: float = Field(default=0.012)
+
+    arb_paper_settle_enabled: bool = Field(default=True)
+    arb_paper_settle_check_interval_sec: int = Field(default=120)
+    arb_paper_settle_grace_minutes: int = Field(default=15)
 
     # module2: strategy switches
     arb_enable_strategy_a: bool = Field(default=True)
