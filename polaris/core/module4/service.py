@@ -58,13 +58,20 @@ class Module4Service:
             )
         )
         self._regime = RegimeEngine(db)
-        semantic_api_key = settings.m4_semantic_api_key or settings.arb_openai_api_key
+        semantic_provider = (settings.m4_semantic_provider or "").strip().lower()
+        semantic_api_key = settings.m4_semantic_api_key
+        if not semantic_api_key:
+            if semantic_provider == "minimax":
+                semantic_api_key = settings.arb_minimax_api_key
+            elif semantic_provider == "openai":
+                semantic_api_key = settings.arb_openai_api_key
         semantic_llm = LLMSemanticAgent(
             LLMSemanticAgentConfig(
                 enabled=settings.m4_semantic_llm_enabled and settings.m4_agent_enabled,
                 provider=settings.m4_semantic_provider,
                 model=settings.m4_semantic_model,
                 api_key=semantic_api_key,
+                base_url=settings.m4_semantic_base_url,
                 timeout_sec=settings.m4_semantic_timeout_sec,
                 max_calls=settings.m4_semantic_max_calls,
                 confidence_floor=settings.m4_semantic_confidence_floor,

@@ -1,3 +1,7 @@
+from __future__ import annotations
+
+from importlib import import_module
+
 from .collapse_filter import CollapseFilter, CollapseFilterConfig
 from .conductor import Conductor, ConductorConfig
 from .prior_builder import MarketPriorBuilder, PriorBuilderConfig
@@ -6,7 +10,6 @@ from .rule_compiler import RuleCompiler, RuleVersion, compile_rule_policy, compu
 from .scorer import M4ScoreConfig, M4Scorer, expected_calibration_error, multiclass_brier
 from .semantic_adjuster import SemanticAdjuster, SemanticAdjusterConfig
 from .semantic_types import M4SemanticDiagnostics, M4SemanticSignal
-from .service import Module4RunSummary, Module4Service
 from .types import (
     BucketRange,
     M4Decision,
@@ -54,3 +57,10 @@ __all__ = [
     "expected_calibration_error",
     "multiclass_brier",
 ]
+
+
+def __getattr__(name: str):
+    if name in {"Module4RunSummary", "Module4Service"}:
+        service = import_module("polaris.core.module4.service")
+        return getattr(service, name)
+    raise AttributeError(f"module 'polaris.core.module4' has no attribute '{name}'")

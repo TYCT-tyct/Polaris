@@ -19,6 +19,7 @@ class LLMSemanticAgentConfig:
     provider: str = "openai"
     model: str = "gpt-5-mini"
     api_key: str | None = None
+    base_url: str | None = None
     timeout_sec: float = 3.0
     max_calls: int = 1
     confidence_floor: float = 0.55
@@ -40,11 +41,12 @@ class LLMSemanticAgent:
         progress: float,
         posts: list[dict[str, Any]],
     ) -> M4SemanticSignal:
+        provider = (self._cfg.provider or "").strip().lower()
         if not self._cfg.enabled:
             return self._disabled("semantic_disabled")
         if not self._cfg.api_key:
             return self._disabled("missing_api_key")
-        if self._cfg.provider != "openai":
+        if provider not in {"openai", "minimax"}:
             return self._disabled("unsupported_provider")
         if not posts:
             return self._disabled("no_recent_posts")
@@ -66,6 +68,7 @@ class LLMSemanticAgent:
                     system_prompt=SYSTEM_PROMPT,
                     user_prompt=prompt,
                     timeout_sec=self._cfg.timeout_sec,
+                    base_url=self._cfg.base_url or _default_base_url(provider),
                 )
         except TimeoutError:
             return self._error("timeout", raw_text="")
@@ -141,6 +144,7 @@ async def _call_openai_chat(
     system_prompt: str,
     user_prompt: str,
     timeout_sec: float,
+    base_url: str = "https://api.openai.com/v1",
 ) -> tuple[str, dict[str, Any]]:
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     payload = {
@@ -153,7 +157,7 @@ async def _call_openai_chat(
         "response_format": {"type": "json_object"},
     }
     async with httpx.AsyncClient(timeout=timeout_sec) as client:
-        resp = await client.post("https://api.openai.com/v1/chat/completions", headers=headers, json=payload)
+        resp = await client.post(f"{base_url.rstrip('/')}/chat/completions", headers=headers, json=payload)
         resp.raise_for_status()
         data = resp.json()
     content = str(data["choices"][0]["message"]["content"])
@@ -217,3 +221,9 @@ def _normalize_regime_probs(values: dict[str, float]) -> dict[str, float]:
 def _clip(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
 
+
+def _default_base_url(provider: str) -> str:
+    if provider == "minimax":
+        # CN endpoint by default for domestic routing.
+        return "https://api.minimaxi.com/v1"
+    return "https://api.openai.com/v1"

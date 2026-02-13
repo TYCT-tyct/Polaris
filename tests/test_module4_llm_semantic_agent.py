@@ -109,3 +109,42 @@ async def test_llm_semantic_agent_parse_failure_returns_error(monkeypatch: pytes
     assert out.parse_ok is False
     assert out.error_code == "json_parse_failed"
 
+
+@pytest.mark.asyncio
+async def test_llm_semantic_agent_minimax_uses_cn_base_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+
+    async def _fake_call(**kwargs: object) -> tuple[str, dict]:
+        captured.update(kwargs)
+        return (
+            '{"regime_probs":{"quiet":0.2,"active":0.3,"burst":0.5},'
+            '"delta_progress":0.01,"delta_uncertainty":0.01,"mean_shift_hint":0.1,'
+            '"confidence":0.8,"evidence_span":[],"reason_codes":["ok"]}',
+            {},
+        )
+
+    monkeypatch.setattr(llm_mod, "_call_openai_chat", _fake_call)
+    cfg = _cfg()
+    cfg = LLMSemanticAgentConfig(
+        enabled=cfg.enabled,
+        provider="minimax",
+        model="MiniMax-M2.5",
+        api_key=cfg.api_key,
+        timeout_sec=cfg.timeout_sec,
+        max_calls=cfg.max_calls,
+        confidence_floor=cfg.confidence_floor,
+        json_strict=cfg.json_strict,
+        scope=cfg.scope,
+    )
+    agent = LLMSemanticAgent(cfg)
+    out = await agent.analyze_posts(
+        market_id="m1",
+        window_code="short",
+        as_of=None,
+        observed_count=4,
+        progress=0.4,
+        posts=_posts(),
+    )
+
+    assert out.error_code is None
+    assert captured.get("base_url") == "https://api.minimaxi.com/v1"
