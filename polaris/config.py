@@ -105,6 +105,8 @@ class PolarisSettings(BaseSettings):
     arb_c_force_entry_only_in_paper: bool = Field(default=True)
     arb_run_tag: str = Field(default="auto")
     arb_signal_dedupe_ttl_sec: int = Field(default=30)
+    # 风控事件去重窗口：避免 max_exposure_exceeded 等在高频拒单场景下刷爆表/刷爆磁盘。
+    arb_risk_event_dedupe_sec: int = Field(default=60)
     arb_scope_block_cooldown_sec: int = Field(default=300)
     arb_safe_arbitrage_only: bool = Field(default=True)
     arb_strategy_health_gate_enabled: bool = Field(default=True)

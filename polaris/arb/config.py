@@ -39,6 +39,7 @@ class ArbConfig:
     c_force_entry_only_in_paper: bool
     run_tag: str
     signal_dedupe_ttl_sec: int
+    risk_event_dedupe_sec: int
     scope_block_cooldown_sec: int
     safe_arbitrage_only: bool
     strategy_health_gate_enabled: bool
@@ -139,6 +140,7 @@ def arb_config_from_settings(settings: PolarisSettings) -> ArbConfig:
         c_force_entry_only_in_paper=settings.arb_c_force_entry_only_in_paper,
         run_tag=resolve_run_tag(settings),
         signal_dedupe_ttl_sec=settings.arb_signal_dedupe_ttl_sec,
+        risk_event_dedupe_sec=settings.arb_risk_event_dedupe_sec,
         scope_block_cooldown_sec=settings.arb_scope_block_cooldown_sec,
         safe_arbitrage_only=settings.arb_safe_arbitrage_only,
         strategy_health_gate_enabled=settings.arb_strategy_health_gate_enabled,

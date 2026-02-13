@@ -26,6 +26,7 @@ class RiskGate:
         self.db = db
         self.config = config
         self._consecutive_failures_by_scope: dict[str, int] = {}
+        self._risk_event_last_at: dict[str, datetime] = {}
 
     async def load_state(
         self,
@@ -266,6 +267,24 @@ class RiskGate:
         source_code: str,
         decision: RiskDecision,
     ) -> None:
+        # 高频拒单会导致风险事件刷爆（尤其 max_exposure_exceeded），影响磁盘与 DB 性能，
+        # 也会干扰你对“真实风险”的判断。这里做轻量去重：同一原因在短窗口内只记一次。
+        dedupe_reasons = {
+            "max_exposure_exceeded",
+            "insufficient_bankroll",
+            "single_trade_risk_exceeded",
+            "paper_exit_missing_snapshot",
+            "paper_exit_insufficient_liquidity",
+        }
+        now = datetime.now(tz=UTC)
+        if decision.reason in dedupe_reasons and self.config.risk_event_dedupe_sec > 0:
+            strategy_part = strategy_code.value if strategy_code else "shared"
+            key = f"{mode.value}:{source_code}:{strategy_part}:{decision.reason}"
+            last = self._risk_event_last_at.get(key)
+            if last and (now - last).total_seconds() < float(self.config.risk_event_dedupe_sec):
+                return
+            self._risk_event_last_at[key] = now
+
         payload = dict(decision.payload)
         payload["run_tag"] = self.config.run_tag
         payload["execution_backend"] = self.config.execution_backend
@@ -284,7 +303,7 @@ class RiskGate:
                 decision.level.value,
                 decision.reason,
                 json.dumps(payload, ensure_ascii=True),
-                datetime.now(tz=UTC),
+                now,
             ),
         )
 

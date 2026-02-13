@@ -27,7 +27,7 @@ from polaris.arb.contracts import (
 from polaris.arb.execution.order_router import OrderRouter
 from polaris.arb.execution.risk_gate import RiskGate, RiskRuntimeState
 from polaris.arb.execution.sizer import capped_notional
-from polaris.arb.execution.fill_simulator import simulate_buy_fill, simulate_sell_fill
+from polaris.arb.execution.fill_simulator import SimFill, simulate_buy_fill, simulate_sell_fill
 from polaris.arb.strategies.strategy_a import StrategyA
 from polaris.arb.strategies.strategy_b import StrategyB
 from polaris.arb.strategies.strategy_c import StrategyC
@@ -67,6 +67,8 @@ class ArbOrchestrator:
         self._last_exit_check_at: datetime | None = None
         self._last_settle_check_at: datetime | None = None
         self._paper_g_trailing_peak_pct: dict[str, float] = {}
+        # paper 的平仓/估值需要覆盖 universe 外 token；用最近快照做兜底，并支持按 open lots 定向补齐。
+        self._snapshot_cache_by_token: dict[str, TokenSnapshot] = {}
 
         self.strategy_a = StrategyA(config)
         self.strategy_b = StrategyB(config)
@@ -116,6 +118,7 @@ class ArbOrchestrator:
         process_started = perf_counter()
         executed = 0
         snapshot_map = {item.token_id: item for item in snapshots}
+        self._snapshot_cache_by_token.update(snapshot_map)
         risk_states: dict[str, RiskRuntimeState] = {}
         health_decisions: dict[str, tuple[bool, dict[str, float]]] = {}
         cash_balances: dict[str, float] = {}
@@ -370,6 +373,148 @@ class ArbOrchestrator:
             "total_ms": total_ms,
         }
 
+    async def _load_latest_top_quotes(
+        self, token_ids: list[str]
+    ) -> dict[str, tuple[float | None, float | None, datetime | None]]:
+        if not token_ids:
+            return {}
+        rows = await self.db.fetch_all(
+            """
+            select distinct on (token_id)
+                token_id,
+                best_bid,
+                best_ask,
+                captured_at
+            from fact_quote_top_raw
+            where token_id = any(%s)
+              and captured_at >= now() - interval '30 minutes'
+            order by token_id, captured_at desc
+            """,
+            (token_ids,),
+        )
+        out: dict[str, tuple[float | None, float | None, datetime | None]] = {}
+        for row in rows:
+            tid = str(row.get("token_id") or "")
+            if not tid:
+                continue
+            bid = float(row["best_bid"]) if row.get("best_bid") is not None else None
+            ask = float(row["best_ask"]) if row.get("best_ask") is not None else None
+            out[tid] = (bid, ask, row.get("captured_at"))
+        return out
+
+    async def _load_snapshots_for_token_ids(self, token_ids: list[str]) -> dict[str, TokenSnapshot]:
+        token_ids = [str(tid) for tid in token_ids if str(tid).strip()]
+        if not token_ids:
+            return {}
+        rows = await self.db.fetch_all(
+            """
+            select
+                t.token_id,
+                t.market_id,
+                t.outcome_label,
+                t.outcome_side,
+                t.outcome_index,
+                t.min_order_size,
+                t.tick_size,
+                t.is_other_outcome,
+                t.is_placeholder_outcome,
+                m.event_id,
+                m.condition_id,
+                (m.neg_risk or m.neg_risk_augmented) as is_neg_risk,
+                m.question,
+                m.end_date
+            from dim_token t
+            join dim_market m on m.market_id = t.market_id
+            where t.token_id = any(%s)
+            """,
+            (token_ids,),
+        )
+        if not rows:
+            return {}
+        now = datetime.now(tz=UTC)
+        books: list[Any] = []
+        try:
+            books = await self.clob_client.get_books(
+                [str(row["token_id"]) for row in rows],
+                batch_size=self.config.clob_books_batch_size,
+                max_concurrency=self.config.clob_books_max_concurrency,
+            )
+        except Exception:
+            logger.exception("clob books load failed for open lots")
+        by_token = {book.asset_id: book for book in books if getattr(book, "asset_id", None)}
+        out: dict[str, TokenSnapshot] = {}
+        for row in rows:
+            token_id = str(row["token_id"])
+            book = by_token.get(token_id)
+            if not book:
+                continue
+            best_bid, best_ask = self.clob_client.best_bid_ask(book)
+            out[token_id] = TokenSnapshot(
+                token_id=token_id,
+                market_id=str(row["market_id"]),
+                event_id=str(row["event_id"]) if row.get("event_id") is not None else None,
+                market_question=str(row.get("question") or ""),
+                market_end=row.get("end_date"),
+                outcome_label=str(row.get("outcome_label") or ""),
+                outcome_side=str(row.get("outcome_side") or ""),
+                outcome_index=int(row.get("outcome_index") or 0),
+                min_order_size=float(row["min_order_size"]) if row.get("min_order_size") is not None else None,
+                tick_size=float(row["tick_size"]) if row.get("tick_size") is not None else None,
+                best_bid=best_bid,
+                best_ask=best_ask,
+                condition_id=str(row["condition_id"]) if row.get("condition_id") is not None else None,
+                is_neg_risk=bool(row.get("is_neg_risk")),
+                is_other_outcome=bool(row.get("is_other_outcome")),
+                is_placeholder_outcome=bool(row.get("is_placeholder_outcome")),
+                bids=tuple(PriceLevel(price=float(level.price), size=float(level.size)) for level in getattr(book, "bids", [])),
+                asks=tuple(PriceLevel(price=float(level.price), size=float(level.size)) for level in getattr(book, "asks", [])),
+                captured_at=now,
+            )
+        return out
+
+    async def _ensure_open_lot_snapshots(
+        self,
+        snapshot_map: dict[str, TokenSnapshot],
+        mode: RunMode,
+        source_code: str,
+    ) -> None:
+        if mode not in {RunMode.PAPER_LIVE, RunMode.PAPER_REPLAY}:
+            return
+        run_tag = self.config.run_tag
+        rows = await self.db.fetch_all(
+            """
+            select distinct token_id
+            from arb_position_lot
+            where mode = %s
+              and source_code = %s
+              and run_tag = %s
+              and status = 'open'
+              and coalesce(remaining_size, 0) > 0
+            """,
+            (mode.value, source_code, run_tag),
+        )
+        if not rows:
+            return
+        token_ids = [str(row["token_id"]) for row in rows if row.get("token_id")]
+        missing = [tid for tid in token_ids if tid not in snapshot_map]
+        if not missing:
+            return
+        # 1) 先用本机缓存兜底
+        still_missing: list[str] = []
+        for tid in missing:
+            cached = self._snapshot_cache_by_token.get(tid)
+            if cached is not None:
+                snapshot_map[tid] = cached
+                continue
+            still_missing.append(tid)
+        if not still_missing:
+            return
+        # 2) 对 open lots 定向补齐
+        loaded = await self._load_snapshots_for_token_ids(still_missing)
+        if loaded:
+            snapshot_map.update(loaded)
+            self._snapshot_cache_by_token.update(loaded)
+
     async def _maybe_exit_paper_positions(
         self,
         mode: RunMode,
@@ -385,6 +530,7 @@ class ArbOrchestrator:
         if self._last_exit_check_at is not None and (now - self._last_exit_check_at).total_seconds() < interval:
             return 0
         self._last_exit_check_at = now
+        await self._ensure_open_lot_snapshots(snapshot_map, mode, source_code)
         return await self._exit_paper_positions(mode, source_code, risk_states, cash_balances, snapshot_map, now=now)
 
     async def _maybe_settle_paper_positions(
@@ -737,6 +883,8 @@ class ArbOrchestrator:
         )
         if not lots:
             return 0
+        token_ids = [str(lot.get("token_id") or "") for lot in lots if lot.get("token_id")]
+        top_quotes = await self._load_latest_top_quotes(token_ids)
 
         closed = 0
         for lot in lots:
@@ -746,20 +894,43 @@ class ArbOrchestrator:
                 continue
 
             token_id = str(lot["token_id"])
-            snap = snapshot_map.get(token_id)
+            snap = snapshot_map.get(token_id) or self._snapshot_cache_by_token.get(token_id)
             if snap is None:
-                await self.risk_gate.record_risk_event(
-                    mode,
-                    StrategyCode(strategy_code) if strategy_code in {"A", "B", "C", "F", "G"} else None,
-                    source_code,
-                    RiskDecision(
-                        allowed=False,
-                        level=RiskLevel.WARN,
-                        reason="paper_exit_missing_snapshot",
-                        payload={"run_tag": run_tag, "token_id": token_id, "position_id": str(lot["position_id"])},
-                    ),
-                )
-                continue
+                db_bid, db_ask, _db_ts = top_quotes.get(token_id, (None, None, None))
+                if db_bid is not None or db_ask is not None:
+                    # 只用作退出决策的兜底报价；无深度时平仓会更保守（仍可能触发 liquidity 风险事件）。
+                    snap = TokenSnapshot(
+                        token_id=token_id,
+                        market_id=str(lot.get("market_id") or ""),
+                        event_id=None,
+                        market_question="",
+                        market_end=None,
+                        outcome_label="",
+                        outcome_side="",
+                        outcome_index=0,
+                        min_order_size=None,
+                        tick_size=None,
+                        best_bid=db_bid,
+                        best_ask=db_ask,
+                        bids=(PriceLevel(price=float(db_bid), size=0.0),) if db_bid is not None else (),
+                        asks=(PriceLevel(price=float(db_ask), size=0.0),) if db_ask is not None else (),
+                        captured_at=now,
+                    )
+                    snapshot_map[token_id] = snap
+                    self._snapshot_cache_by_token[token_id] = snap
+                else:
+                    await self.risk_gate.record_risk_event(
+                        mode,
+                        StrategyCode(strategy_code) if strategy_code in {"A", "B", "C", "F", "G"} else None,
+                        source_code,
+                        RiskDecision(
+                            allowed=False,
+                            level=RiskLevel.WARN,
+                            reason="paper_exit_missing_snapshot",
+                            payload={"run_tag": run_tag, "token_id": token_id, "position_id": str(lot["position_id"])},
+                        ),
+                    )
+                    continue
 
             open_notional = float(lot["open_notional_usd"] or 0.0)
             if open_notional <= 0:
@@ -777,10 +948,16 @@ class ArbOrchestrator:
             if close_side == "SELL":
                 sim = simulate_sell_fill(snap.bids, remaining, allow_partial=False)
                 close_notional = sim.notional if sim is not None else 0.0
+                if sim is None and snap.best_bid is not None:
+                    close_notional = float(snap.best_bid) * remaining
+                    sim = SimFill(avg_price=float(snap.best_bid), filled_size=remaining, notional=close_notional)
                 unrealized = close_notional - open_notional
             else:
                 sim = simulate_buy_fill(snap.asks, remaining, allow_partial=False)
                 close_notional = sim.notional if sim is not None else 0.0
+                if sim is None and snap.best_ask is not None:
+                    close_notional = float(snap.best_ask) * remaining
+                    sim = SimFill(avg_price=float(snap.best_ask), filled_size=remaining, notional=close_notional)
                 unrealized = open_notional - close_notional
 
             reason, pnl_pct = decide_exit_reason(
@@ -1886,6 +2063,7 @@ class ArbOrchestrator:
     ) -> None:
         interval = max(1, int(self.config.paper_portfolio_snapshot_interval_sec))
         now = datetime.now(tz=UTC)
+        await self._ensure_open_lot_snapshots(snapshot_map, mode, source_code)
         for scope_key, state in risk_states.items():
             last = self._last_portfolio_snapshot_at.get(scope_key)
             if last and (now - last).total_seconds() < interval:
@@ -1895,7 +2073,7 @@ class ArbOrchestrator:
             scope = state.strategy_code.value if state.strategy_code else "shared"
             strategy_filter = state.strategy_code.value if state.strategy_code else None
             sql = """
-                select token_id, remaining_size, open_notional_usd
+                select token_id, side, remaining_size, open_notional_usd
                 from arb_position_lot
                 where mode = %s
                   and source_code = %s
@@ -1908,18 +2086,91 @@ class ArbOrchestrator:
                 params.append(strategy_filter)
             lots = await self.db.fetch_all(sql, tuple(params))
 
+            token_ids = [str(row.get("token_id") or "") for row in lots if row.get("token_id")]
+            top_quotes = await self._load_latest_top_quotes(token_ids)
             exposure = 0.0
-            mtm_value = 0.0
+            mtm_value_gross = 0.0
+            mtm_value_net = 0.0
+            mtm_mid_est = 0.0
+            priced_depth = 0
+            priced_l1 = 0
+            priced_db = 0
+            missing_price = 0
+            partial_liq = 0
             for row in lots:
                 exposure += float(row.get("open_notional_usd") or 0.0)
                 token_id = str(row.get("token_id") or "")
                 size = float(row.get("remaining_size") or 0.0)
-                snap = snapshot_map.get(token_id)
-                bid = float(snap.best_bid) if snap and snap.best_bid is not None else 0.0
-                mtm_value += bid * size
+                if not token_id or size <= 0:
+                    continue
+                snap = snapshot_map.get(token_id) or self._snapshot_cache_by_token.get(token_id)
+                db_bid, db_ask, _db_ts = top_quotes.get(token_id, (None, None, None))
+
+                open_side = str(row.get("side") or "BUY").upper()
+                liq_gross = 0.0
+                filled_ratio = 0.0
+                # 以“当前盘口立即平仓”为估值基准：
+                # - BUY 持仓：按 bids 模拟卖出（越保守）
+                # - SELL 持仓：按 asks 模拟买回（作为负资产）
+                if open_side == "BUY":
+                    sim = None
+                    if snap and snap.bids:
+                        sim = simulate_sell_fill(snap.bids, size, allow_partial=True)
+                        if sim is not None:
+                            liq_gross = float(sim.notional)
+                            filled_ratio = float(sim.filled_size) / size if size > 0 else 0.0
+                            priced_depth += 1
+                    if liq_gross <= 0:
+                        best_bid = float(snap.best_bid) if snap and snap.best_bid is not None else None
+                        if best_bid is not None:
+                            liq_gross = best_bid * size
+                            priced_l1 += 1
+                        elif db_bid is not None:
+                            liq_gross = float(db_bid) * size
+                            priced_db += 1
+                else:
+                    sim = None
+                    if snap and snap.asks:
+                        sim = simulate_buy_fill(snap.asks, size, allow_partial=True)
+                        if sim is not None:
+                            liq_gross = -float(sim.notional)
+                            filled_ratio = float(sim.filled_size) / size if size > 0 else 0.0
+                            priced_depth += 1
+                    if liq_gross == 0:
+                        best_ask = float(snap.best_ask) if snap and snap.best_ask is not None else None
+                        if best_ask is not None:
+                            liq_gross = -(best_ask * size)
+                            priced_l1 += 1
+                        elif db_ask is not None:
+                            liq_gross = -(float(db_ask) * size)
+                            priced_db += 1
+
+                if filled_ratio > 0 and filled_ratio + 1e-12 < 0.999:
+                    partial_liq += 1
+                if liq_gross == 0.0:
+                    missing_price += 1
+
+                mtm_value_gross += liq_gross
+                # 估算立即平仓的手续费（paper 里费率是配置项；默认可为 0）
+                fee_est = abs(liq_gross) * (float(self.config.fee_bps) / 10000.0)
+                liq_net = liq_gross - fee_est if liq_gross >= 0 else liq_gross + fee_est
+                mtm_value_net += liq_net
+
+                # mid 估值只做“参考线”，不参与 nav_mtm_usd 主口径
+                bid = float(snap.best_bid) if snap and snap.best_bid is not None else db_bid
+                ask = float(snap.best_ask) if snap and snap.best_ask is not None else db_ask
+                mid = None
+                if bid is not None and ask is not None:
+                    mid = (float(bid) + float(ask)) / 2.0
+                elif bid is not None:
+                    mid = float(bid)
+                elif ask is not None:
+                    mid = float(ask)
+                if mid is not None:
+                    mtm_mid_est += (mid * size) if open_side == "BUY" else -(mid * size)
 
             cash = float(cash_balances.get(scope_key, self.config.paper_initial_bankroll_usd))
-            nav = cash + mtm_value
+            nav = cash + mtm_value_net
             await self.db.execute(
                 """
                 insert into arb_portfolio_snapshot(
@@ -1937,7 +2188,22 @@ class ArbOrchestrator:
                     exposure,
                     nav,
                     int(len(lots)),
-                    json.dumps({"execution_backend": self.config.execution_backend}, ensure_ascii=True),
+                    json.dumps(
+                        {
+                            "execution_backend": self.config.execution_backend,
+                            "mtm_gross_value_usd": float(mtm_value_gross),
+                            "mtm_net_value_usd": float(mtm_value_net),
+                            "mtm_mid_est_value_usd": float(mtm_mid_est),
+                            "pricing": {
+                                "priced_depth": int(priced_depth),
+                                "priced_l1": int(priced_l1),
+                                "priced_db": int(priced_db),
+                                "missing_price": int(missing_price),
+                                "partial_liq": int(partial_liq),
+                            },
+                        },
+                        ensure_ascii=True,
+                    ),
                 ),
             )
 
