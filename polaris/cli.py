@@ -1324,29 +1324,35 @@ def m4_stage_report(
             }
             total_points = 0
             skipped = 0
+            skipped_by_reason: Counter[str] = Counter()
             for row in rows:
                 end_date = row.get("end_date")
                 as_of_ts = row.get("as_of_ts")
                 if not isinstance(end_date, datetime) or not isinstance(as_of_ts, datetime):
                     skipped += 1
+                    skipped_by_reason["invalid_time"] += 1
                     continue
                 hours_to_close = (end_date - as_of_ts).total_seconds() / 3600.0
                 if hours_to_close <= 0:
                     skipped += 1
+                    skipped_by_reason["non_positive_hours_to_close"] += 1
                     continue
                 stage_name = _pick_stage(stage_bins, hours_to_close)
                 if stage_name is None:
                     skipped += 1
+                    skipped_by_reason["stage_not_mapped"] += 1
                     continue
                 prior = _parse_pmf(row.get("prior_pmf"))
                 posterior = _parse_pmf(row.get("posterior_pmf"))
                 if not prior or not posterior:
                     skipped += 1
+                    skipped_by_reason["pmf_missing"] += 1
                     continue
                 final_count = int(row.get("final_count") or 0)
                 true_label = infer_true_bucket_label(final_count, posterior.keys())
                 if true_label is None:
                     skipped += 1
+                    skipped_by_reason["true_label_not_in_bucket_space"] += 1
                     continue
                 p_prior = max(1e-9, float(prior.get(true_label, 0.0)))
                 p_post = max(1e-9, float(posterior.get(true_label, 0.0)))
@@ -1400,6 +1406,7 @@ def m4_stage_report(
                 "points_total": total_points,
                 "rows_loaded": len(rows),
                 "skipped": skipped,
+                "skipped_by_reason": dict(skipped_by_reason),
                 "stage_report": report_rows,
             }
             typer.echo(json.dumps(payload, ensure_ascii=False, indent=2, default=str))

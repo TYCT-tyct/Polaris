@@ -263,23 +263,6 @@ class Module4Service:
             persist=persist,
         )
 
-    async def score_staged(
-        self,
-        *,
-        mode: str,
-        source_code: str,
-        run_tag: str | None,
-        window_code: str = "fused",
-        since_hours: int | None = None,
-    ) -> dict[str, M4ScoreResult]:
-        return await self._scorer.score_staged(
-            mode=mode,
-            source_code=source_code,
-            run_tag=run_tag,
-            window_code=window_code,
-            since_hours=since_hours,
-        )
-
     async def top_candidates(
         self,
         *,
@@ -377,6 +360,12 @@ class Module4Service:
               and (
                     m.question ilike '%%tweet%%'
                  or m.slug ilike '%%tweet%%'
+              )
+              and exists (
+                    select 1
+                    from dim_token tk
+                    where tk.market_id = m.market_id
+                      and tk.outcome_label ~ '[0-9]'
               )
               {market_clause}
             order by coalesce(m.end_date, tw.end_date) asc, m.market_id asc
