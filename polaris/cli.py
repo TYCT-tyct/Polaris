@@ -826,6 +826,7 @@ def arb_paper_matrix_start(
     source_prefix: Annotated[str, typer.Option("--source-prefix")] = "polymarket",
     profile: Annotated[str, typer.Option("--profile")] = "trigger_safe_50_v2",
     bankroll_usd: Annotated[float, typer.Option("--bankroll-usd", min=1.0)] = 50.0,
+    strategies: Annotated[str, typer.Option("--strategies", help="Comma separated: A,B,C,F,G (default: A,B,F,G + optional C)")] = "",
     include_c: Annotated[bool, typer.Option("--include-c/--no-include-c")] = True,
 ) -> None:
     """Start paper matrix:
@@ -838,7 +839,14 @@ def arb_paper_matrix_start(
     setup_logging(settings.log_level)
     profile_env = _resolve_paper_profile(profile)
 
-    strategies = ["A", "B", "F", "G"] + (["C"] if include_c else [])
+    if strategies.strip():
+        selected = [part.strip().upper() for part in strategies.split(",") if part.strip()]
+    else:
+        selected = ["A", "B", "F", "G"] + (["C"] if include_c else [])
+    allowed = {"A", "B", "C", "F", "G"}
+    selected = [s for s in selected if s in allowed]
+    if not selected:
+        raise typer.BadParameter("strategies resolved to empty; allowed: A,B,C,F,G")
     timestamp = datetime.now(tz=UTC).strftime("%Y%m%d_%H%M%S")
     matrix_tag = _sanitize_run_tag(f"paper-{profile}-{timestamp}")
     logs_dir = Path("logs")
@@ -894,9 +902,9 @@ def arb_paper_matrix_start(
         return proc.pid, log_path, source
 
     started: list[tuple[str, int, Path, str]] = []
-    shared_name = "shared_abcfg"
-    started.append((shared_name, *_spawn(shared_name, set(strategies), False)))
-    for strategy in strategies:
+    shared_name = "shared_" + "".join(s.lower() for s in selected)
+    started.append((shared_name, *_spawn(shared_name, set(selected), False)))
+    for strategy in selected:
         name = f"isolated_{strategy.lower()}"
         started.append((name, *_spawn(name, {strategy}, True)))
 
@@ -913,6 +921,7 @@ def arb_replay_matrix(
     profile: Annotated[str, typer.Option("--profile")] = "trigger_safe_50_v2",
     bankroll_usd: Annotated[float, typer.Option("--bankroll-usd", min=1.0)] = 50.0,
     source_prefix: Annotated[str, typer.Option("--source-prefix")] = "polymarket_replay",
+    strategies: Annotated[str, typer.Option("--strategies", help="Comma separated: A,B,C,F,G (default: A,B,F,G + optional C)")] = "",
     include_c: Annotated[bool, typer.Option("--include-c/--no-include-c")] = True,
     fast: Annotated[
         bool,
@@ -931,15 +940,22 @@ def arb_replay_matrix(
     setup_logging(settings.log_level)
     profile_env = _resolve_paper_profile(profile)
 
-    strategies = ["A", "B", "F", "G"] + (["C"] if include_c else [])
+    if strategies.strip():
+        selected = [part.strip().upper() for part in strategies.split(",") if part.strip()]
+    else:
+        selected = ["A", "B", "F", "G"] + (["C"] if include_c else [])
+    allowed = {"A", "B", "C", "F", "G"}
+    selected = [s for s in selected if s in allowed]
+    if not selected:
+        raise typer.BadParameter("strategies resolved to empty; allowed: A,B,C,F,G")
     timestamp = datetime.now(tz=UTC).strftime("%Y%m%d_%H%M%S")
     matrix_tag = _sanitize_run_tag(f"replay-{profile}-{timestamp}")
     logs_dir = Path("logs")
     logs_dir.mkdir(parents=True, exist_ok=True)
     bankroll_tag = str(int(bankroll_usd)) if float(bankroll_usd).is_integer() else f"{bankroll_usd:g}"
 
-    cases: list[tuple[str, set[str], bool]] = [("shared_abcfg", set(strategies), False)]
-    for strategy in strategies:
+    cases: list[tuple[str, set[str], bool]] = [("shared_" + "".join(s.lower() for s in selected), set(selected), False)]
+    for strategy in selected:
         cases.append((f"isolated_{strategy.lower()}", {strategy}, True))
 
     rows: list[dict[str, object]] = []
