@@ -52,8 +52,11 @@ class TweetCollector:
                     post_count, last_sync, created_at, updated_at
                 )
                 values (%s, %s, %s, %s, %s, %s, %s, %s, %s, now(), now())
-                on conflict (handle) do update
-                set platform_id = excluded.platform_id,
+                -- 并发场景下更常见的是 account_id 主键冲突（两个 worker 同时 insert 同一用户）。
+                -- 用 account_id 做 upsert 可以避免偶发 unique violation。
+                on conflict (account_id) do update
+                set handle = excluded.handle,
+                    platform_id = excluded.platform_id,
                     display_name = excluded.display_name,
                     avatar_url = excluded.avatar_url,
                     bio = excluded.bio,
