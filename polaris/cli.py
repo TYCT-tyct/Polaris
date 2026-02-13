@@ -9,6 +9,7 @@ import signal
 import subprocess
 import sys
 import os
+from uuid import uuid4
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -28,6 +29,7 @@ from polaris.arb.ai.gate import AiGate
 from polaris.arb.cli import parse_iso_datetime, parse_run_mode
 from polaris.arb.config import arb_config_from_settings
 from polaris.arb.contracts import RunMode
+from polaris.arb.experiments import ExperimentScoreInput, compute_experiment_score, parse_experiment_dimensions
 from polaris.arb.orchestrator import ArbOrchestrator
 from polaris.arb.reporting import ArbReporter
 from polaris.config import PolarisSettings, load_settings, refresh_process_env_from_file
@@ -370,6 +372,35 @@ _PAPER_PROFILE_PRESETS: dict[str, dict[str, str]] = {
     },
 }
 
+# 并行实验的标准层级（Strict / Balanced / Aggressive）
+_PAPER_PROFILE_PRESETS["strict_50"] = dict(_PAPER_PROFILE_PRESETS["conservative_50"])
+_PAPER_PROFILE_PRESETS["strict_50"].update(
+    {
+        "POLARIS_ARB_MAX_SIGNALS_PER_CYCLE": "2",
+        "POLARIS_ARB_G_MIN_CONFIDENCE": "0.97",
+        "POLARIS_ARB_G_MIN_EXPECTED_EDGE_PCT": "0.06",
+        "POLARIS_ARB_G_MAX_HOURS_TO_RESOLVE": "8",
+    }
+)
+_PAPER_PROFILE_PRESETS["balanced_50"] = dict(_PAPER_PROFILE_PRESETS["trigger_safe_50_v2"])
+_PAPER_PROFILE_PRESETS["balanced_50"].update(
+    {
+        "POLARIS_ARB_MAX_SIGNALS_PER_CYCLE": "4",
+        "POLARIS_ARB_G_MIN_CONFIDENCE": "0.95",
+        "POLARIS_ARB_G_MIN_EXPECTED_EDGE_PCT": "0.05",
+        "POLARIS_ARB_G_MAX_HOURS_TO_RESOLVE": "12",
+    }
+)
+_PAPER_PROFILE_PRESETS["aggressive_50"] = dict(_PAPER_PROFILE_PRESETS["trigger_safe_50"])
+_PAPER_PROFILE_PRESETS["aggressive_50"].update(
+    {
+        "POLARIS_ARB_MAX_SIGNALS_PER_CYCLE": "8",
+        "POLARIS_ARB_G_MIN_CONFIDENCE": "0.90",
+        "POLARIS_ARB_G_MIN_EXPECTED_EDGE_PCT": "0.03",
+        "POLARIS_ARB_G_MAX_HOURS_TO_RESOLVE": "24",
+    }
+)
+
 
 def _resolve_paper_profile(name: str) -> dict[str, str]:
     key = name.strip().lower()
@@ -377,6 +408,169 @@ def _resolve_paper_profile(name: str) -> dict[str, str]:
         available = ", ".join(sorted(_PAPER_PROFILE_PRESETS.keys()))
         raise typer.BadParameter(f"unknown profile={name!r}, available: {available}")
     return dict(_PAPER_PROFILE_PRESETS[key])
+
+
+def _resolve_profile_list(profiles: str, fallback_profile: str) -> list[str]:
+    raw = [part.strip().lower() for part in profiles.split(",") if part.strip()]
+    resolved = raw or [fallback_profile.strip().lower()]
+    unique: list[str] = []
+    seen: set[str] = set()
+    for item in resolved:
+        if item in seen:
+            continue
+        _resolve_paper_profile(item)
+        unique.append(item)
+        seen.add(item)
+    return unique
+
+
+def _canonical_strategy_set(enabled: set[str]) -> str:
+    order = ["A", "B", "C", "F", "G"]
+    return "".join(code for code in order if code in enabled)
+
+
+def _apply_variant_overrides(env: dict[str, str], variant: str) -> None:
+    if variant != "g_low":
+        return
+    g_conf = float(env.get("POLARIS_ARB_G_MIN_CONFIDENCE", "0.90") or 0.90)
+    g_edge = float(env.get("POLARIS_ARB_G_MIN_EXPECTED_EDGE_PCT", "0.02") or 0.02)
+    g_hours = float(env.get("POLARIS_ARB_G_MAX_HOURS_TO_RESOLVE", "24") or 24.0)
+    env["POLARIS_ARB_G_MIN_CONFIDENCE"] = f"{min(0.99, g_conf + 0.03):.6f}"
+    env["POLARIS_ARB_G_MIN_EXPECTED_EDGE_PCT"] = f"{g_edge * 1.5:.6f}"
+    env["POLARIS_ARB_G_MAX_HOURS_TO_RESOLVE"] = f"{max(4.0, min(g_hours, 12.0)):.6f}"
+    max_signals = int(float(env.get("POLARIS_ARB_MAX_SIGNALS_PER_CYCLE", "6") or 6))
+    env["POLARIS_ARB_MAX_SIGNALS_PER_CYCLE"] = str(max(1, min(max_signals, 3)))
+
+
+def _parse_strategy_case_token(token: str) -> tuple[str, set[str], bool, str]:
+    allowed = {"A", "B", "C", "F", "G"}
+    value = token.strip().upper()
+    if not value:
+        raise typer.BadParameter("strategy set token cannot be empty")
+
+    split_by_strategy = False
+    variant = "base"
+    payload = value
+
+    if ":" in value:
+        scope, payload = value.split(":", 1)
+        scope = scope.strip()
+        payload = payload.strip()
+        if scope not in {"SHARED", "ISOLATED"}:
+            raise typer.BadParameter(f"invalid scope in strategy set token={token!r}")
+        split_by_strategy = scope == "ISOLATED"
+
+    if payload.endswith("_G_LOW"):
+        variant = "g_low"
+        payload = payload[: -len("_G_LOW")]
+
+    payload_codes = [ch for ch in payload if ch in allowed]
+    enabled = set(payload_codes)
+    if variant == "g_low":
+        enabled.add("G")
+    if not enabled:
+        raise typer.BadParameter(f"strategy set token={token!r} has no valid strategies")
+
+    if len(enabled) == 1 and ":" not in value:
+        split_by_strategy = True
+    if split_by_strategy and len(enabled) != 1:
+        raise typer.BadParameter(f"isolated strategy set must contain exactly one strategy: token={token!r}")
+
+    strategy_set = _canonical_strategy_set(enabled)
+    if split_by_strategy:
+        name = f"isolated_{strategy_set.lower()}"
+    else:
+        suffix = "_g_low" if variant == "g_low" else ""
+        name = f"shared_{strategy_set.lower()}{suffix}"
+    return name, enabled, split_by_strategy, variant
+
+
+def _resolve_matrix_cases(
+    *,
+    strategy_sets: str,
+    strategies: str,
+    include_c: bool,
+) -> list[tuple[str, set[str], bool, str]]:
+    tokens: list[str] = []
+    if strategy_sets.strip():
+        tokens = [part.strip() for part in strategy_sets.split(";") if part.strip()]
+    elif strategies.strip():
+        selected = [part.strip().upper() for part in strategies.split(",") if part.strip()]
+        selected = [s for s in selected if s in {"A", "B", "C", "F", "G"}]
+        if selected:
+            tokens = ["SHARED:" + "".join(selected)] + [f"ISOLATED:{s}" for s in selected]
+    else:
+        selected = ["A", "B", "F", "G"] + (["C"] if include_c else [])
+        selected_token = "".join(selected)
+        no_g_selected = [s for s in selected if s != "G"]
+        no_g_token = "".join(no_g_selected)
+        g_low_token = f"{no_g_token}_G_LOW" if "G" in selected else no_g_token
+        # 默认并行：主组合 + G降权组合 + 无G对照 + 单策略隔离
+        tokens = [
+            f"SHARED:{selected_token}",
+            f"SHARED:{g_low_token}",
+            f"SHARED:{no_g_token}",
+        ]
+        for strategy in selected:
+            tokens.append(f"ISOLATED:{strategy}")
+
+    cases: list[tuple[str, set[str], bool, str]] = []
+    seen_names: set[str] = set()
+    for token in tokens:
+        name, enabled, split, variant = _parse_strategy_case_token(token)
+        if name in seen_names:
+            continue
+        seen_names.add(name)
+        cases.append((name, enabled, split, variant))
+    return cases
+
+
+async def _upsert_experiment_runs(
+    db: Database,
+    *,
+    mode: str,
+    run_tag: str,
+    rows: list[dict[str, object]],
+    started_at: datetime,
+) -> None:
+    for row in rows:
+        run_tag_value = str(row.get("run_tag") or run_tag)
+        params_json = json.dumps(row.get("params", {}), ensure_ascii=True)
+        metadata_json = json.dumps(row.get("metadata", {}), ensure_ascii=True)
+        await db.execute(
+            """
+            insert into arb_experiment_run(
+                experiment_run_id, mode, run_tag, source_code, profile, strategy_set, scope, variant,
+                bankroll_usd, status, params, metadata, started_at, created_at, updated_at
+            )
+            values (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'running', %s::jsonb, %s::jsonb, %s, now(), now())
+            on conflict (mode, run_tag, source_code) do update
+            set profile = excluded.profile,
+                strategy_set = excluded.strategy_set,
+                scope = excluded.scope,
+                variant = excluded.variant,
+                bankroll_usd = excluded.bankroll_usd,
+                status = 'running',
+                params = excluded.params,
+                metadata = excluded.metadata,
+                started_at = excluded.started_at,
+                updated_at = now()
+            """,
+            (
+                str(row.get("experiment_run_id") or str(uuid4())),
+                mode,
+                run_tag_value,
+                str(row.get("source_code") or ""),
+                str(row.get("profile") or "unknown"),
+                str(row.get("strategy_set") or "unknown"),
+                str(row.get("scope") or "shared"),
+                str(row.get("variant") or "base"),
+                float(row.get("bankroll_usd") or 50.0),
+                params_json,
+                metadata_json,
+                started_at,
+            ),
+        )
 
 
 def _apply_profile_to_env_file(env_path: Path, profile: dict[str, str]) -> int:
@@ -825,30 +1019,32 @@ def arb_paper_matrix_start(
     duration_hours: Annotated[int, typer.Option("--duration-hours", min=1, max=72)] = 4,
     source_prefix: Annotated[str, typer.Option("--source-prefix")] = "polymarket",
     profile: Annotated[str, typer.Option("--profile")] = "trigger_safe_50_v2",
+    profiles: Annotated[str, typer.Option("--profiles", help="Comma separated profiles: strict_50,balanced_50,aggressive_50")] = "",
+    strategy_sets: Annotated[
+        str,
+        typer.Option(
+            "--strategy-sets",
+            help="Semicolon separated tokens. Examples: SHARED:ABCFG;SHARED:ABCF_G_LOW;ISOLATED:A",
+        ),
+    ] = "",
     bankroll_usd: Annotated[float, typer.Option("--bankroll-usd", min=1.0)] = 50.0,
     strategies: Annotated[str, typer.Option("--strategies", help="Comma separated: A,B,C,F,G (default: A,B,F,G + optional C)")] = "",
     include_c: Annotated[bool, typer.Option("--include-c/--no-include-c")] = True,
 ) -> None:
-    """Start paper matrix:
-    - A/B/C/F/G each isolated bankroll
-    - ABCFG shared bankroll
-    """
+    """Start paper matrix with cartesian runs (profiles x strategy sets)."""
     refresh_process_env_from_file(preserve_existing=True)
     load_settings.cache_clear()
     settings = load_settings()
     setup_logging(settings.log_level)
-    profile_env = _resolve_paper_profile(profile)
 
-    if strategies.strip():
-        selected = [part.strip().upper() for part in strategies.split(",") if part.strip()]
-    else:
-        selected = ["A", "B", "F", "G"] + (["C"] if include_c else [])
-    allowed = {"A", "B", "C", "F", "G"}
-    selected = [s for s in selected if s in allowed]
-    if not selected:
-        raise typer.BadParameter("strategies resolved to empty; allowed: A,B,C,F,G")
+    profile_names = _resolve_profile_list(profiles, profile)
+    cases = _resolve_matrix_cases(strategy_sets=strategy_sets, strategies=strategies, include_c=include_c)
+    if not cases:
+        raise typer.BadParameter("strategy-sets resolved to empty")
+
     timestamp = datetime.now(tz=UTC).strftime("%Y%m%d_%H%M%S")
-    matrix_tag = _sanitize_run_tag(f"paper-{profile}-{timestamp}")
+    profile_suffix = "multi" if len(profile_names) > 1 else profile_names[0]
+    matrix_tag = _sanitize_run_tag(f"paper-{profile_suffix}-{timestamp}")
     logs_dir = Path("logs")
     logs_dir.mkdir(parents=True, exist_ok=True)
     run_dir = Path("run")
@@ -856,11 +1052,18 @@ def arb_paper_matrix_start(
 
     bankroll_tag = str(int(bankroll_usd)) if float(bankroll_usd).is_integer() else f"{bankroll_usd:g}"
 
-    def _spawn(name: str, enabled: set[str], split_by_strategy: bool) -> tuple[int, Path, str]:
-        source = f"{source_prefix}_{profile}_{name}{bankroll_tag}".lower()
-        log_path = logs_dir / f"arb_paper_{name}_{timestamp}.log"
+    def _spawn(
+        *,
+        case_name: str,
+        profile_name: str,
+        enabled: set[str],
+        split_by_strategy: bool,
+        variant: str,
+    ) -> tuple[int, Path, str]:
+        source = f"{source_prefix}_{profile_name}_{case_name}{bankroll_tag}".lower()
+        log_path = logs_dir / f"arb_paper_{profile_name}_{case_name}_{timestamp}.log"
         env = os.environ.copy()
-        env.update(profile_env)
+        env.update(_resolve_paper_profile(profile_name))
         env["POLARIS_ARB_RUN_TAG"] = matrix_tag
         env["POLARIS_ARB_PAPER_INITIAL_BANKROLL_USD"] = f"{bankroll_usd:.4f}"
         env["POLARIS_ARB_PAPER_SPLIT_BY_STRATEGY"] = "true" if split_by_strategy else "false"
@@ -869,6 +1072,7 @@ def arb_paper_matrix_start(
         env["POLARIS_ARB_ENABLE_STRATEGY_C"] = "true" if "C" in enabled else "false"
         env["POLARIS_ARB_ENABLE_STRATEGY_F"] = "true" if "F" in enabled else "false"
         env["POLARIS_ARB_ENABLE_STRATEGY_G"] = "true" if "G" in enabled else "false"
+        _apply_variant_overrides(env, variant)
 
         cmd: list[str] = [
             sys.executable,
@@ -897,21 +1101,76 @@ def arb_paper_matrix_start(
             start_new_session=True,
         )
         log_handle.close()
-        pid_path = run_dir / f"arb_paper_{name}_{timestamp}.pid"
+        pid_path = run_dir / f"arb_paper_{profile_name}_{case_name}_{timestamp}.pid"
         pid_path.write_text(str(proc.pid), encoding="utf-8")
         return proc.pid, log_path, source
 
-    started: list[tuple[str, int, Path, str]] = []
-    shared_name = "shared_" + "".join(s.lower() for s in selected)
-    started.append((shared_name, *_spawn(shared_name, set(selected), False)))
-    for strategy in selected:
-        name = f"isolated_{strategy.lower()}"
-        started.append((name, *_spawn(name, {strategy}, True)))
+    started: list[tuple[str, int, Path, str, str, str, str]] = []
+    experiment_rows: list[dict[str, object]] = []
+    started_at = datetime.now(tz=UTC)
+    for profile_name in profile_names:
+        for case_name, enabled, split_by_strategy, variant in cases:
+            pid, log_path, source = _spawn(
+                case_name=case_name,
+                profile_name=profile_name,
+                enabled=enabled,
+                split_by_strategy=split_by_strategy,
+                variant=variant,
+            )
+            strategy_set = _canonical_strategy_set(enabled)
+            scope = "isolated" if split_by_strategy else "shared"
+            started.append((f"{profile_name}:{case_name}", pid, log_path, source, profile_name, strategy_set, scope))
+            experiment_rows.append(
+                {
+                    "experiment_run_id": str(uuid4()),
+                    "run_tag": matrix_tag,
+                    "source_code": source,
+                    "profile": profile_name,
+                    "strategy_set": strategy_set,
+                    "scope": scope,
+                    "variant": variant,
+                    "bankroll_usd": bankroll_usd,
+                    "params": {
+                        "duration_hours": duration_hours,
+                        "source_prefix": source_prefix,
+                        "profile": profile_name,
+                        "strategy_set": strategy_set,
+                        "variant": variant,
+                        "split_by_strategy": split_by_strategy,
+                    },
+                    "metadata": {
+                        "launcher": "arb-paper-matrix-start",
+                        "enabled_strategies": sorted(enabled),
+                        "pid": pid,
+                        "log_path": str(log_path),
+                    },
+                }
+            )
+
+    async def _record_runs() -> None:
+        db = _create_database(settings)
+        await db.open()
+        try:
+            await _upsert_experiment_runs(
+                db,
+                mode=RunMode.PAPER_LIVE.value,
+                run_tag=matrix_tag,
+                rows=experiment_rows,
+                started_at=started_at,
+            )
+        finally:
+            await db.close()
+
+    asyncio.run(_record_runs())
 
     typer.echo("arb-paper-matrix started")
-    typer.echo(f"profile={profile} run_tag={matrix_tag} bankroll={bankroll_usd:g}")
-    for name, pid, log_path, source in started:
-        typer.echo(f"{name}: pid={pid} source={source} log={log_path}")
+    typer.echo(
+        f"profiles={','.join(profile_names)} cases={len(cases)} run_tag={matrix_tag} bankroll={bankroll_usd:g}"
+    )
+    for name, pid, log_path, source, profile_name, strategy_set, scope in started:
+        typer.echo(
+            f"{name}: pid={pid} source={source} profile={profile_name} strategy_set={strategy_set} scope={scope} log={log_path}"
+        )
 
 
 @app.command("arb-replay-matrix")
@@ -919,6 +1178,14 @@ def arb_replay_matrix(
     start: Annotated[str, typer.Option("--start", help="ISO datetime")] = "",
     end: Annotated[str, typer.Option("--end", help="ISO datetime")] = "",
     profile: Annotated[str, typer.Option("--profile")] = "trigger_safe_50_v2",
+    profiles: Annotated[str, typer.Option("--profiles", help="Comma separated profiles")] = "",
+    strategy_sets: Annotated[
+        str,
+        typer.Option(
+            "--strategy-sets",
+            help="Semicolon separated tokens. Examples: SHARED:ABCFG;SHARED:ABCF_G_LOW;ISOLATED:A",
+        ),
+    ] = "",
     bankroll_usd: Annotated[float, typer.Option("--bankroll-usd", min=1.0)] = 50.0,
     source_prefix: Annotated[str, typer.Option("--source-prefix")] = "polymarket_replay",
     strategies: Annotated[str, typer.Option("--strategies", help="Comma separated: A,B,C,F,G (default: A,B,F,G + optional C)")] = "",
@@ -938,78 +1205,135 @@ def arb_replay_matrix(
     load_settings.cache_clear()
     settings = load_settings()
     setup_logging(settings.log_level)
-    profile_env = _resolve_paper_profile(profile)
+    profile_names = _resolve_profile_list(profiles, profile)
+    cases = _resolve_matrix_cases(strategy_sets=strategy_sets, strategies=strategies, include_c=include_c)
+    if not cases:
+        raise typer.BadParameter("strategy-sets resolved to empty")
 
-    if strategies.strip():
-        selected = [part.strip().upper() for part in strategies.split(",") if part.strip()]
-    else:
-        selected = ["A", "B", "F", "G"] + (["C"] if include_c else [])
-    allowed = {"A", "B", "C", "F", "G"}
-    selected = [s for s in selected if s in allowed]
-    if not selected:
-        raise typer.BadParameter("strategies resolved to empty; allowed: A,B,C,F,G")
     timestamp = datetime.now(tz=UTC).strftime("%Y%m%d_%H%M%S")
-    matrix_tag = _sanitize_run_tag(f"replay-{profile}-{timestamp}")
+    profile_suffix = "multi" if len(profile_names) > 1 else profile_names[0]
+    matrix_tag = _sanitize_run_tag(f"replay-{profile_suffix}-{timestamp}")
     logs_dir = Path("logs")
     logs_dir.mkdir(parents=True, exist_ok=True)
     bankroll_tag = str(int(bankroll_usd)) if float(bankroll_usd).is_integer() else f"{bankroll_usd:g}"
 
-    cases: list[tuple[str, set[str], bool]] = [("shared_" + "".join(s.lower() for s in selected), set(selected), False)]
-    for strategy in selected:
-        cases.append((f"isolated_{strategy.lower()}", {strategy}, True))
-
     rows: list[dict[str, object]] = []
-    for name, enabled, split_by_strategy in cases:
-        source = f"{source_prefix}_{profile}_{name}{bankroll_tag}".lower()
-        run_tag = _sanitize_run_tag(f"{matrix_tag}-{name}")
-        log_path = logs_dir / f"arb_replay_{name}_{timestamp}.log"
+    experiment_rows: list[dict[str, object]] = []
+    started_at = datetime.now(tz=UTC)
+    for profile_name in profile_names:
+        for name, enabled, split_by_strategy, variant in cases:
+            source = f"{source_prefix}_{profile_name}_{name}{bankroll_tag}".lower()
+            run_tag_case = _sanitize_run_tag(f"{matrix_tag}-{profile_name}-{name}")
+            log_path = logs_dir / f"arb_replay_{profile_name}_{name}_{timestamp}.log"
 
-        env = os.environ.copy()
-        env.update(profile_env)
-        env["POLARIS_ARB_RUN_TAG"] = run_tag
-        env["POLARIS_ARB_PAPER_INITIAL_BANKROLL_USD"] = f"{bankroll_usd:.4f}"
-        env["POLARIS_ARB_PAPER_SPLIT_BY_STRATEGY"] = "true" if split_by_strategy else "false"
-        env["POLARIS_ARB_ENABLE_STRATEGY_A"] = "true" if "A" in enabled else "false"
-        env["POLARIS_ARB_ENABLE_STRATEGY_B"] = "true" if "B" in enabled else "false"
-        env["POLARIS_ARB_ENABLE_STRATEGY_C"] = "true" if "C" in enabled else "false"
-        env["POLARIS_ARB_ENABLE_STRATEGY_F"] = "true" if "F" in enabled else "false"
-        env["POLARIS_ARB_ENABLE_STRATEGY_G"] = "true" if "G" in enabled else "false"
+            env = os.environ.copy()
+            env.update(_resolve_paper_profile(profile_name))
+            env["POLARIS_ARB_RUN_TAG"] = run_tag_case
+            env["POLARIS_ARB_PAPER_INITIAL_BANKROLL_USD"] = f"{bankroll_usd:.4f}"
+            env["POLARIS_ARB_PAPER_SPLIT_BY_STRATEGY"] = "true" if split_by_strategy else "false"
+            env["POLARIS_ARB_ENABLE_STRATEGY_A"] = "true" if "A" in enabled else "false"
+            env["POLARIS_ARB_ENABLE_STRATEGY_B"] = "true" if "B" in enabled else "false"
+            env["POLARIS_ARB_ENABLE_STRATEGY_C"] = "true" if "C" in enabled else "false"
+            env["POLARIS_ARB_ENABLE_STRATEGY_F"] = "true" if "F" in enabled else "false"
+            env["POLARIS_ARB_ENABLE_STRATEGY_G"] = "true" if "G" in enabled else "false"
+            _apply_variant_overrides(env, variant)
 
-        cmd: list[str] = [
-            sys.executable,
-            "-m",
-            "polaris.cli",
-            "arb-replay",
-            "--start",
-            start,
-            "--end",
-            end,
-            "--source",
-            source,
-            "--run-tag",
-            run_tag,
-        ]
-        cmd.append("--fast" if fast else "--full")
-        completed = subprocess.run(
-            cmd,
-            env=env,
-            cwd=str(Path.cwd()),
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        log_path.write_text((completed.stdout or "") + (completed.stderr or ""), encoding="utf-8")
-        rows.append(
-            {
-                "name": name,
-                "source": source,
-                "run_tag": run_tag,
-                "split_by_strategy": split_by_strategy,
-                "enabled": sorted(enabled),
-                "exit_code": int(completed.returncode),
-                "log": str(log_path),
-            }
-        )
+            cmd: list[str] = [
+                sys.executable,
+                "-m",
+                "polaris.cli",
+                "arb-replay",
+                "--start",
+                start,
+                "--end",
+                end,
+                "--source",
+                source,
+                "--run-tag",
+                run_tag_case,
+            ]
+            cmd.append("--fast" if fast else "--full")
+            completed = subprocess.run(
+                cmd,
+                env=env,
+                cwd=str(Path.cwd()),
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            log_path.write_text((completed.stdout or "") + (completed.stderr or ""), encoding="utf-8")
+            strategy_set = _canonical_strategy_set(enabled)
+            scope = "isolated" if split_by_strategy else "shared"
+            run_status = "completed" if completed.returncode == 0 else "failed"
+            experiment_run_id = str(uuid4())
+            experiment_rows.append(
+                {
+                    "experiment_run_id": experiment_run_id,
+                    "run_tag": run_tag_case,
+                    "source_code": source,
+                    "profile": profile_name,
+                    "strategy_set": strategy_set,
+                    "scope": scope,
+                    "variant": variant,
+                    "bankroll_usd": bankroll_usd,
+                    "params": {
+                        "start": start,
+                        "end": end,
+                        "fast": bool(fast),
+                        "profile": profile_name,
+                        "strategy_set": strategy_set,
+                        "variant": variant,
+                        "split_by_strategy": split_by_strategy,
+                    },
+                    "metadata": {
+                        "launcher": "arb-replay-matrix",
+                        "enabled_strategies": sorted(enabled),
+                        "exit_code": int(completed.returncode),
+                        "log_path": str(log_path),
+                    },
+                    "status": run_status,
+                }
+            )
+            rows.append(
+                {
+                    "name": f"{profile_name}:{name}",
+                    "source": source,
+                    "run_tag": run_tag_case,
+                    "profile": profile_name,
+                    "strategy_set": strategy_set,
+                    "scope": scope,
+                    "variant": variant,
+                    "split_by_strategy": split_by_strategy,
+                    "enabled": sorted(enabled),
+                    "exit_code": int(completed.returncode),
+                    "log": str(log_path),
+                }
+            )
+
+    async def _record_runs() -> None:
+        db = _create_database(settings)
+        await db.open()
+        try:
+            await _upsert_experiment_runs(
+                db,
+                mode=RunMode.PAPER_REPLAY.value,
+                run_tag=matrix_tag,
+                rows=experiment_rows,
+                started_at=started_at,
+            )
+            for row in experiment_rows:
+                await db.execute(
+                    """
+                    update arb_experiment_run
+                    set status = %s::text, ended_at = now(), updated_at = now()
+                    where experiment_run_id = %s::text
+                    """,
+                    (str(row.get("status") or "completed"), str(row.get("experiment_run_id"))),
+                )
+        finally:
+            await db.close()
+
+    asyncio.run(_record_runs())
 
     typer.echo(json.dumps({"matrix_tag": matrix_tag, "rows": rows}, ensure_ascii=False, indent=2))
 
@@ -1130,6 +1454,7 @@ def arb_summary(
     mode: Annotated[str, typer.Option("--mode", help="all|shadow|paper_live|paper_replay|live")] = "paper_live",
     source_code: Annotated[str, typer.Option("--source", help="source code, or all")] = "polymarket",
     run_tag: Annotated[str, typer.Option("--run-tag", help="current|all|custom")] = "current",
+    by_experiment: Annotated[bool, typer.Option("--by-experiment/--no-by-experiment")] = False,
     output: Annotated[str, typer.Option("--output", help="Optional JSON output path")] = "",
 ) -> None:
     """Show strategy-level overnight summary for Module2."""
@@ -1163,6 +1488,14 @@ def arb_summary(
                 source_code=source_filter,
                 run_tag=run_tag_filter,
             )
+            if by_experiment:
+                result["by_experiment"] = await _arb_summary_by_experiment(
+                    ctx.db,
+                    since_hours=since_hours,
+                    mode_filter=mode_filter,
+                    source_filter=source_filter,
+                    run_tag_filter=run_tag_filter,
+                )
             text = json.dumps(result, ensure_ascii=False, indent=2, default=str)
             if output:
                 out_path = Path(output).expanduser()
@@ -1170,6 +1503,197 @@ def arb_summary(
                 out_path.write_text(text, encoding="utf-8")
                 typer.echo(f"arb-summary saved: {out_path}")
             typer.echo(text)
+        finally:
+            await close_arb_runtime(ctx)
+
+    asyncio.run(_run())
+
+
+@app.command("arb-experiment-score")
+def arb_experiment_score(
+    since_hours: Annotated[int, typer.Option("--since-hours", min=1, max=24 * 30)] = 8,
+    mode: Annotated[str, typer.Option("--mode", help="shadow|paper_live|paper_replay|live")] = "paper_live",
+    source_code: Annotated[str, typer.Option("--source", help="source code, or all")] = "all",
+    run_tag: Annotated[str, typer.Option("--run-tag", help="current|all|custom")] = "current",
+    default_bankroll_usd: Annotated[float, typer.Option("--default-bankroll-usd", min=1.0)] = 50.0,
+    resource_penalty: Annotated[float, typer.Option("--resource-penalty", min=0.0)] = 0.0,
+    persist: Annotated[bool, typer.Option("--persist/--no-persist")] = True,
+    output: Annotated[str, typer.Option("--output", help="Optional JSON output path")] = "",
+) -> None:
+    """Compute experiment scores and rank all matrix sources."""
+    refresh_process_env_from_file(preserve_existing=True)
+    load_settings.cache_clear()
+    settings = load_settings()
+    setup_logging(settings.log_level)
+    _ensure_windows_selector_loop()
+
+    allowed_modes = {"shadow", "paper_live", "paper_replay", "live"}
+    mode_normalized = mode.strip().lower()
+    if mode_normalized not in allowed_modes:
+        raise typer.BadParameter("mode must be one of: shadow, paper_live, paper_replay, live")
+    source_normalized = source_code.strip().lower()
+    source_filter = None if source_normalized == "all" else source_normalized
+
+    async def _run() -> None:
+        ctx = await create_arb_runtime(settings)
+        try:
+            run_tag_filter = await _resolve_run_tag_filter_db(
+                ctx.db,
+                run_tag,
+                mode_filter=mode_normalized,
+                source_filter=source_filter,
+                current_tag=ctx.orchestrator.config.run_tag,
+            )
+            rows = await _compute_experiment_scores(
+                ctx.db,
+                since_hours=since_hours,
+                mode_filter=mode_normalized,
+                source_filter=source_filter,
+                run_tag_filter=run_tag_filter,
+                default_bankroll_usd=default_bankroll_usd,
+                resource_penalty=resource_penalty,
+                persist=persist,
+            )
+            payload = {
+                "window": {
+                    "since_hours": since_hours,
+                    "mode": mode_normalized,
+                    "source_code": source_filter or "all",
+                    "run_tag": run_tag_filter or "all",
+                },
+                "rows": rows,
+            }
+            text = json.dumps(payload, ensure_ascii=False, indent=2, default=str)
+            if output:
+                out_path = Path(output).expanduser()
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                out_path.write_text(text, encoding="utf-8")
+                typer.echo(f"arb-experiment-score saved: {out_path}")
+            typer.echo(text)
+        finally:
+            await close_arb_runtime(ctx)
+
+    asyncio.run(_run())
+
+
+@app.command("arb-experiment-promote")
+def arb_experiment_promote(
+    since_hours: Annotated[int, typer.Option("--since-hours", min=1, max=24 * 30)] = 8,
+    mode: Annotated[str, typer.Option("--mode", help="shadow|paper_live|paper_replay|live")] = "paper_live",
+    source_code: Annotated[str, typer.Option("--source", help="source code, or all")] = "all",
+    run_tag: Annotated[str, typer.Option("--run-tag", help="current|all|custom")] = "current",
+    top_n: Annotated[int, typer.Option("--top-n", min=1, max=20)] = 2,
+    min_score: Annotated[float, typer.Option("--min-score")] = 0.0,
+    max_drawdown_pct: Annotated[float, typer.Option("--max-drawdown-pct", min=0.0, max=1.0)] = 0.08,
+    min_execution_rate: Annotated[float, typer.Option("--min-execution-rate", min=0.0, max=1.0)] = 0.02,
+    max_system_error_rate: Annotated[float, typer.Option("--max-system-error-rate", min=0.0, max=1.0)] = 0.01,
+    apply: Annotated[bool, typer.Option("--apply/--dry-run")] = False,
+) -> None:
+    """Promote top experiment candidates that pass go-live gates."""
+    refresh_process_env_from_file(preserve_existing=True)
+    load_settings.cache_clear()
+    settings = load_settings()
+    setup_logging(settings.log_level)
+    _ensure_windows_selector_loop()
+
+    allowed_modes = {"shadow", "paper_live", "paper_replay", "live"}
+    mode_normalized = mode.strip().lower()
+    if mode_normalized not in allowed_modes:
+        raise typer.BadParameter("mode must be one of: shadow, paper_live, paper_replay, live")
+    source_normalized = source_code.strip().lower()
+    source_filter = None if source_normalized == "all" else source_normalized
+
+    async def _run() -> None:
+        ctx = await create_arb_runtime(settings)
+        try:
+            run_tag_filter = await _resolve_run_tag_filter_db(
+                ctx.db,
+                run_tag,
+                mode_filter=mode_normalized,
+                source_filter=source_filter,
+                current_tag=ctx.orchestrator.config.run_tag,
+            )
+            rows = await _compute_experiment_scores(
+                ctx.db,
+                since_hours=since_hours,
+                mode_filter=mode_normalized,
+                source_filter=source_filter,
+                run_tag_filter=run_tag_filter,
+                default_bankroll_usd=50.0,
+                resource_penalty=0.0,
+                persist=True,
+            )
+            candidates: list[dict[str, object]] = []
+            rejected: list[dict[str, object]] = []
+            for row in rows:
+                evaluation_net = float(row.get("evaluation_net_pnl_usd", 0.0) or 0.0)
+                drawdown_pct = float(row.get("max_drawdown_pct", 0.0) or 0.0)
+                execution_rate = float(row.get("execution_rate", 0.0) or 0.0)
+                system_error_rate = float(row.get("system_error_rate", 0.0) or 0.0)
+                score_total = float(row.get("score_total", 0.0) or 0.0)
+                reasons: list[str] = []
+                if evaluation_net <= 0:
+                    reasons.append("evaluation_net_pnl_usd<=0")
+                if drawdown_pct > max_drawdown_pct:
+                    reasons.append("max_drawdown_pct_exceeded")
+                if execution_rate < min_execution_rate:
+                    reasons.append("execution_rate_too_low")
+                if system_error_rate > max_system_error_rate:
+                    reasons.append("system_error_rate_too_high")
+                if score_total < min_score:
+                    reasons.append("score_below_min")
+
+                if reasons:
+                    copy_row = dict(row)
+                    copy_row["reject_reasons"] = reasons
+                    rejected.append(copy_row)
+                else:
+                    candidates.append(row)
+
+            candidates = sorted(candidates, key=lambda item: float(item.get("score_total", 0.0) or 0.0), reverse=True)
+            promoted = candidates[:top_n]
+
+            if apply and promoted:
+                for row in promoted:
+                    experiment_run_id = str(row.get("experiment_run_id") or "")
+                    if not experiment_run_id:
+                        continue
+                    await ctx.db.execute(
+                        """
+                        update arb_experiment_run
+                        set status = 'promoted',
+                            metadata = coalesce(metadata, '{}'::jsonb) || jsonb_build_object(
+                                'promoted_at', now(),
+                                'promote_score', %s::numeric,
+                                'promote_window_hours', %s::int
+                            ),
+                            updated_at = now()
+                        where experiment_run_id = %s::text
+                        """,
+                        (
+                            float(row.get("score_total", 0.0) or 0.0),
+                            since_hours,
+                            experiment_run_id,
+                        ),
+                    )
+
+            payload = {
+                "mode": mode_normalized,
+                "source_code": source_filter or "all",
+                "run_tag": run_tag_filter or "all",
+                "since_hours": since_hours,
+                "gates": {
+                    "evaluation_net_pnl_usd_gt": 0.0,
+                    "max_drawdown_pct_le": max_drawdown_pct,
+                    "min_execution_rate": min_execution_rate,
+                    "max_system_error_rate": max_system_error_rate,
+                    "min_score": min_score,
+                },
+                "apply": apply,
+                "promoted": promoted,
+                "rejected": rejected,
+            }
+            typer.echo(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
         finally:
             await close_arb_runtime(ctx)
 
@@ -1456,6 +1980,445 @@ def _install_signal_handlers(stop_event: asyncio.Event, reload_event: asyncio.Ev
         return
 
 
+def _to_float(value: object, default: float = 0.0) -> float:
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _to_int(value: object, default: int = 0) -> int:
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _compute_max_drawdown(bankroll_usd: float, pnl_series: list[float]) -> tuple[float, float]:
+    equity = bankroll_usd
+    peak = bankroll_usd
+    max_drawdown = 0.0
+    for pnl in pnl_series:
+        equity += pnl
+        if equity > peak:
+            peak = equity
+        drawdown = peak - equity
+        if drawdown > max_drawdown:
+            max_drawdown = drawdown
+    drawdown_pct = max_drawdown / bankroll_usd if bankroll_usd > 0 else 0.0
+    return max_drawdown, drawdown_pct
+
+
+async def _arb_summary_by_experiment(
+    db: Database,
+    *,
+    since_hours: int,
+    mode_filter: str | None,
+    source_filter: str | None,
+    run_tag_filter: str | None,
+) -> list[dict[str, object]]:
+    rows = await _compute_experiment_scores(
+        db,
+        since_hours=since_hours,
+        mode_filter=mode_filter,
+        source_filter=source_filter,
+        run_tag_filter=run_tag_filter,
+        default_bankroll_usd=50.0,
+        resource_penalty=0.0,
+        persist=False,
+    )
+    summary_rows: list[dict[str, object]] = []
+    for row in rows:
+        summary_rows.append(
+            {
+                "source_code": row.get("source_code"),
+                "profile": row.get("profile"),
+                "strategy_set": row.get("strategy_set"),
+                "scope": row.get("scope"),
+                "variant": row.get("variant"),
+                "bankroll_usd": row.get("bankroll_usd"),
+                "signals_found": row.get("signals_found"),
+                "signals_executed": row.get("signals_executed"),
+                "signals_rejected": row.get("signals_rejected"),
+                "trades": row.get("trades"),
+                "evaluation_net_pnl_usd": row.get("evaluation_net_pnl_usd"),
+                "expected_net_pnl_usd": row.get("expected_net_pnl_usd"),
+                "mark_to_book_net_pnl_usd": row.get("mark_to_book_net_pnl_usd"),
+                "realized_net_pnl_usd": row.get("realized_net_pnl_usd"),
+                "max_drawdown_usd": row.get("max_drawdown_usd"),
+                "max_drawdown_pct": row.get("max_drawdown_pct"),
+                "execution_rate": row.get("execution_rate"),
+                "reject_rate": row.get("reject_rate"),
+                "system_error_rate": row.get("system_error_rate"),
+                "score_total": row.get("score_total"),
+            }
+        )
+    return summary_rows
+
+
+async def _compute_experiment_scores(
+    db: Database,
+    *,
+    since_hours: int,
+    mode_filter: str | None,
+    source_filter: str | None,
+    run_tag_filter: str | None,
+    default_bankroll_usd: float,
+    resource_penalty: float,
+    persist: bool,
+) -> list[dict[str, object]]:
+    now_utc = datetime.now(tz=UTC)
+    window_start = now_utc - timedelta(hours=max(1, since_hours))
+    known_profiles = set(_PAPER_PROFILE_PRESETS.keys())
+    filters = (
+        window_start,
+        mode_filter,
+        mode_filter,
+        source_filter,
+        source_filter,
+        run_tag_filter,
+        run_tag_filter,
+    )
+
+    signal_rows = await db.fetch_all(
+        """
+        select
+            source_code,
+            count(*) as signals_found,
+            sum((status = 'executed')::int) as signals_executed,
+            sum((status = 'rejected')::int) as signals_rejected,
+            sum((status = 'expired')::int) as signals_expired
+        from arb_signal
+        where created_at >= %s::timestamptz
+          and (%s::text is null or mode = %s::text)
+          and (%s::text is null or source_code = %s::text)
+          and (%s::text is null or coalesce(features->>'run_tag', '') = %s::text)
+        group by source_code
+        """,
+        filters,
+    )
+
+    trade_rows = await db.fetch_all(
+        """
+        select
+            source_code,
+            count(*) as trades,
+            sum(
+                (
+                    case
+                        when strategy_code in ('A', 'B', 'C')
+                        then coalesce(nullif(metadata->>'expected_net_pnl_usd', '')::numeric, 0)
+                        else coalesce(nullif(metadata->>'mark_to_book_net_pnl_usd', '')::numeric, net_pnl_usd)
+                    end > 0
+                )::int
+            ) as wins,
+            sum(
+                (
+                    case
+                        when strategy_code in ('A', 'B', 'C')
+                        then coalesce(nullif(metadata->>'expected_net_pnl_usd', '')::numeric, 0)
+                        else coalesce(nullif(metadata->>'mark_to_book_net_pnl_usd', '')::numeric, net_pnl_usd)
+                    end < 0
+                )::int
+            ) as losses,
+            coalesce(sum(net_pnl_usd), 0) as realized_net_pnl_usd,
+            coalesce(
+                sum(coalesce(nullif(metadata->>'mark_to_book_net_pnl_usd', '')::numeric, net_pnl_usd)),
+                0
+            ) as mark_to_book_net_pnl_usd,
+            coalesce(
+                sum(coalesce(nullif(metadata->>'expected_net_pnl_usd', '')::numeric, 0)),
+                0
+            ) as expected_net_pnl_usd,
+            coalesce(
+                sum(
+                    case
+                        when strategy_code in ('A', 'B', 'C')
+                        then coalesce(nullif(metadata->>'expected_net_pnl_usd', '')::numeric, 0)
+                        else coalesce(nullif(metadata->>'mark_to_book_net_pnl_usd', '')::numeric, net_pnl_usd)
+                    end
+                ),
+                0
+            ) as evaluation_net_pnl_usd,
+            coalesce(sum(capital_used_usd), 0) as turnover_usd
+        from arb_trade_result
+        where created_at >= %s::timestamptz
+          and (%s::text is null or mode = %s::text)
+          and (%s::text is null or source_code = %s::text)
+          and (%s::text is null or coalesce(metadata->>'run_tag', '') = %s::text)
+        group by source_code
+        """,
+        filters,
+    )
+
+    timeline_rows = await db.fetch_all(
+        """
+        select
+            source_code,
+            created_at,
+            case
+                when strategy_code in ('A', 'B', 'C')
+                then coalesce(nullif(metadata->>'expected_net_pnl_usd', '')::numeric, 0)
+                else coalesce(nullif(metadata->>'mark_to_book_net_pnl_usd', '')::numeric, net_pnl_usd)
+            end as evaluation_trade_pnl_usd
+        from arb_trade_result
+        where created_at >= %s::timestamptz
+          and (%s::text is null or mode = %s::text)
+          and (%s::text is null or source_code = %s::text)
+          and (%s::text is null or coalesce(metadata->>'run_tag', '') = %s::text)
+        order by source_code asc, created_at asc, trade_id asc
+        """,
+        filters,
+    )
+
+    risk_error_rows = await db.fetch_all(
+        """
+        select
+            source_code,
+            count(*) as system_errors
+        from arb_risk_event
+        where created_at >= %s::timestamptz
+          and (%s::text is null or mode = %s::text)
+          and (%s::text is null or source_code = %s::text)
+          and (%s::text is null or coalesce(payload->>'run_tag', '') = %s::text)
+          and lower(coalesce(severity, '')) in ('error', 'critical')
+        group by source_code
+        """,
+        filters,
+    )
+
+    run_rows: list[dict[str, object]] = []
+    has_experiment_run = await _table_exists(db, "arb_experiment_run")
+    if has_experiment_run:
+        run_rows = await db.fetch_all(
+            """
+            select distinct on (source_code)
+                experiment_run_id,
+                source_code,
+                run_tag,
+                profile,
+                strategy_set,
+                scope,
+                variant,
+                bankroll_usd
+            from arb_experiment_run
+            where (%s::text is null or mode = %s::text)
+              and (%s::text is null or source_code = %s::text)
+              and (%s::text is null or run_tag = %s::text)
+            order by source_code, updated_at desc
+            """,
+            (
+                mode_filter,
+                mode_filter,
+                source_filter,
+                source_filter,
+                run_tag_filter,
+                run_tag_filter,
+            ),
+        )
+
+    signal_map = {str(row["source_code"]): row for row in signal_rows}
+    trade_map = {str(row["source_code"]): row for row in trade_rows}
+    run_map = {str(row["source_code"]): row for row in run_rows}
+    risk_map = {str(row["source_code"]): row for row in risk_error_rows}
+    timeline_map: dict[str, list[float]] = {}
+    for row in timeline_rows:
+        source = str(row["source_code"])
+        timeline_map.setdefault(source, []).append(_to_float(row.get("evaluation_trade_pnl_usd")))
+
+    all_sources = sorted(
+        set(signal_map.keys()) | set(trade_map.keys()) | set(run_map.keys()) | set(risk_map.keys()) | set(timeline_map.keys())
+    )
+    rows: list[dict[str, object]] = []
+    missing_run_rows: list[dict[str, object]] = []
+    for source in all_sources:
+        signal_row = signal_map.get(source, {})
+        trade_row = trade_map.get(source, {})
+        risk_row = risk_map.get(source, {})
+        run_row = run_map.get(source, {})
+
+        dims = parse_experiment_dimensions(source, known_profiles=known_profiles)
+        profile = str(run_row.get("profile") or dims.profile or "unknown")
+        strategy_set = str(run_row.get("strategy_set") or dims.strategy_set or "unknown")
+        scope = str(run_row.get("scope") or dims.scope or "shared")
+        variant = str(run_row.get("variant") or dims.variant or "base")
+        bankroll = _to_float(run_row.get("bankroll_usd"), default_bankroll_usd)
+        if bankroll <= 0:
+            bankroll = default_bankroll_usd
+
+        signals_found = _to_int(signal_row.get("signals_found"))
+        signals_executed = _to_int(signal_row.get("signals_executed"))
+        signals_rejected = _to_int(signal_row.get("signals_rejected"))
+        signals_expired = _to_int(signal_row.get("signals_expired"))
+        trades = _to_int(trade_row.get("trades"))
+        wins = _to_int(trade_row.get("wins"))
+        losses = _to_int(trade_row.get("losses"))
+
+        realized_net = _to_float(trade_row.get("realized_net_pnl_usd"))
+        mark_to_book_net = _to_float(trade_row.get("mark_to_book_net_pnl_usd"))
+        expected_net = _to_float(trade_row.get("expected_net_pnl_usd"))
+        evaluation_net = _to_float(trade_row.get("evaluation_net_pnl_usd"))
+        turnover = _to_float(trade_row.get("turnover_usd"))
+        pnl_gap = evaluation_net - expected_net
+
+        execution_rate = signals_executed / signals_found if signals_found > 0 else 0.0
+        reject_rate = signals_rejected / signals_found if signals_found > 0 else 0.0
+        win_rate = wins / trades if trades > 0 else 0.0
+        system_error_count = _to_int(risk_row.get("system_errors"))
+        system_error_rate = system_error_count / signals_found if signals_found > 0 else 0.0
+
+        max_drawdown_usd, max_drawdown_pct = _compute_max_drawdown(bankroll, timeline_map.get(source, []))
+        score_total, score_breakdown = compute_experiment_score(
+            ExperimentScoreInput(
+                bankroll_usd=bankroll,
+                evaluation_net_pnl_usd=evaluation_net,
+                expected_net_pnl_usd=expected_net,
+                max_drawdown_usd=max_drawdown_usd,
+                reject_rate=reject_rate,
+                execution_rate=execution_rate,
+                system_error_rate=system_error_rate,
+                resource_penalty=resource_penalty,
+            )
+        )
+
+        experiment_run_id = str(run_row.get("experiment_run_id") or "")
+        if not experiment_run_id and has_experiment_run:
+            experiment_run_id = str(uuid4())
+            missing_run_rows.append(
+                {
+                    "experiment_run_id": experiment_run_id,
+                    "run_tag": run_tag_filter or f"window-{since_hours}h",
+                    "source_code": source,
+                    "profile": profile,
+                    "strategy_set": strategy_set,
+                    "scope": scope,
+                    "variant": variant,
+                    "bankroll_usd": bankroll,
+                    "params": {
+                        "since_hours": since_hours,
+                        "mode": mode_filter,
+                        "source_code": source,
+                    },
+                    "metadata": {
+                        "launcher": "arb-experiment-score",
+                    },
+                }
+            )
+
+        rows.append(
+            {
+                "experiment_run_id": experiment_run_id,
+                "mode": mode_filter,
+                "run_tag": str(run_row.get("run_tag") or run_tag_filter or "all"),
+                "source_code": source,
+                "profile": profile,
+                "strategy_set": strategy_set,
+                "scope": scope,
+                "variant": variant,
+                "bankroll_usd": bankroll,
+                "signals_found": signals_found,
+                "signals_executed": signals_executed,
+                "signals_rejected": signals_rejected,
+                "signals_expired": signals_expired,
+                "trades": trades,
+                "wins": wins,
+                "losses": losses,
+                "realized_net_pnl_usd": realized_net,
+                "mark_to_book_net_pnl_usd": mark_to_book_net,
+                "expected_net_pnl_usd": expected_net,
+                "evaluation_net_pnl_usd": evaluation_net,
+                "pnl_gap_vs_expected_usd": pnl_gap,
+                "turnover_usd": turnover,
+                "max_drawdown_usd": max_drawdown_usd,
+                "max_drawdown_pct": max_drawdown_pct,
+                "execution_rate": execution_rate,
+                "reject_rate": reject_rate,
+                "win_rate": win_rate,
+                "system_error_rate": system_error_rate,
+                "resource_penalty": resource_penalty,
+                "score_total": score_total,
+                "score_breakdown": score_breakdown,
+            }
+        )
+
+    rows = sorted(rows, key=lambda item: float(item.get("score_total", 0.0) or 0.0), reverse=True)
+    if has_experiment_run and missing_run_rows:
+        await _upsert_experiment_runs(
+            db,
+            mode=mode_filter,
+            run_tag=run_tag_filter or f"window-{since_hours}h",
+            rows=missing_run_rows,
+            started_at=now_utc,
+        )
+        missing_by_source = {str(row["source_code"]): str(row["experiment_run_id"]) for row in missing_run_rows}
+        for row in rows:
+            source = str(row.get("source_code") or "")
+            if source in missing_by_source and not row.get("experiment_run_id"):
+                row["experiment_run_id"] = missing_by_source[source]
+
+    if persist and has_experiment_run and await _table_exists(db, "arb_experiment_metric"):
+        for row in rows:
+            await db.execute(
+                """
+                insert into arb_experiment_metric(
+                    experiment_run_id, mode, run_tag, source_code, profile, strategy_set, scope, variant,
+                    since_hours, signals_found, signals_executed, signals_rejected, signals_expired,
+                    trades, wins, losses, realized_net_pnl_usd, mark_to_book_net_pnl_usd, expected_net_pnl_usd,
+                    evaluation_net_pnl_usd, pnl_gap_vs_expected_usd, turnover_usd, max_drawdown_usd, max_drawdown_pct,
+                    execution_rate, reject_rate, win_rate, system_error_rate, resource_penalty,
+                    score_total, score_breakdown, metadata, created_at
+                )
+                values (
+                    %s::text, %s::text, %s::text, %s::text, %s::text, %s::text, %s::text, %s::text,
+                    %s::int, %s::int, %s::int, %s::int, %s::int,
+                    %s::int, %s::int, %s::int, %s::numeric, %s::numeric, %s::numeric,
+                    %s::numeric, %s::numeric, %s::numeric, %s::numeric, %s::numeric,
+                    %s::numeric, %s::numeric, %s::numeric, %s::numeric, %s::numeric,
+                    %s::numeric, %s::jsonb, %s::jsonb, now()
+                )
+                """,
+                (
+                    str(row.get("experiment_run_id") or ""),
+                    mode_filter,
+                    str(row.get("run_tag") or ""),
+                    str(row.get("source_code") or ""),
+                    str(row.get("profile") or "unknown"),
+                    str(row.get("strategy_set") or "unknown"),
+                    str(row.get("scope") or "shared"),
+                    str(row.get("variant") or "base"),
+                    int(since_hours),
+                    int(row.get("signals_found") or 0),
+                    int(row.get("signals_executed") or 0),
+                    int(row.get("signals_rejected") or 0),
+                    int(row.get("signals_expired") or 0),
+                    int(row.get("trades") or 0),
+                    int(row.get("wins") or 0),
+                    int(row.get("losses") or 0),
+                    float(row.get("realized_net_pnl_usd") or 0.0),
+                    float(row.get("mark_to_book_net_pnl_usd") or 0.0),
+                    float(row.get("expected_net_pnl_usd") or 0.0),
+                    float(row.get("evaluation_net_pnl_usd") or 0.0),
+                    float(row.get("pnl_gap_vs_expected_usd") or 0.0),
+                    float(row.get("turnover_usd") or 0.0),
+                    float(row.get("max_drawdown_usd") or 0.0),
+                    float(row.get("max_drawdown_pct") or 0.0),
+                    float(row.get("execution_rate") or 0.0),
+                    float(row.get("reject_rate") or 0.0),
+                    float(row.get("win_rate") or 0.0),
+                    float(row.get("system_error_rate") or 0.0),
+                    float(row.get("resource_penalty") or 0.0),
+                    float(row.get("score_total") or 0.0),
+                    json.dumps(row.get("score_breakdown", {}), ensure_ascii=True),
+                    json.dumps({"window_start": window_start.isoformat(), "window_end": now_utc.isoformat()}, ensure_ascii=True),
+                ),
+            )
+    return rows
+
+
 async def _arb_cleanup_counts(
     db: Database,
     *,
@@ -1617,6 +2580,34 @@ async def _arb_cleanup_counts(
                 signal_params,
             )
         )
+    if await _table_exists(db, "arb_experiment_run"):
+        counts["arb_experiment_run"] = _as_int(
+            await db.fetch_one(
+                """
+                select count(*) as c
+                from arb_experiment_run
+                where (%s::text is null or mode = %s::text)
+                  and (%s::text is null or source_code = %s::text)
+                  and (%s::text is null or run_tag = %s::text)
+                  and (%s::timestamptz is null or started_at >= %s::timestamptz)
+                """,
+                signal_params,
+            )
+        )
+    if await _table_exists(db, "arb_experiment_metric"):
+        counts["arb_experiment_metric"] = _as_int(
+            await db.fetch_one(
+                """
+                select count(*) as c
+                from arb_experiment_metric
+                where (%s::text is null or mode = %s::text)
+                  and (%s::text is null or source_code = %s::text)
+                  and (%s::text is null or run_tag = %s::text)
+                  and (%s::timestamptz is null or created_at >= %s::timestamptz)
+                """,
+                signal_params,
+            )
+        )
     counts["arb_replay_run"] = _as_int(
         await db.fetch_one(
             """
@@ -1766,6 +2757,30 @@ async def _arb_cleanup_apply(
               and (%s::text is null or source_code = %s::text)
               and (%s::text is null or run_tag = %s::text)
               and (%s::timestamptz is null or created_at >= %s::timestamptz)
+            """,
+            signal_params,
+        )
+
+    if await _table_exists(db, "arb_experiment_metric"):
+        await db.execute(
+            """
+            delete from arb_experiment_metric
+            where (%s::text is null or mode = %s::text)
+              and (%s::text is null or source_code = %s::text)
+              and (%s::text is null or run_tag = %s::text)
+              and (%s::timestamptz is null or created_at >= %s::timestamptz)
+            """,
+            signal_params,
+        )
+
+    if await _table_exists(db, "arb_experiment_run"):
+        await db.execute(
+            """
+            delete from arb_experiment_run
+            where (%s::text is null or mode = %s::text)
+              and (%s::text is null or source_code = %s::text)
+              and (%s::text is null or run_tag = %s::text)
+              and (%s::timestamptz is null or started_at >= %s::timestamptz)
             """,
             signal_params,
         )
@@ -1925,9 +2940,9 @@ async def _build_arb_doctor_report(
         suggestions.append(
             f"single_risk_usd({config.single_risk_usd:.3f}) 低于 p50(min_order_notional={p50_min_order:.3f})，会导致大量风险门拒绝"
         )
-    if config.max_exposure_usd < (3.0 * config.single_risk_usd):
+    if config.max_exposure_usd < (4.0 * config.single_risk_usd):
         suggestions.append(
-            f"max_exposure_usd({config.max_exposure_usd:.3f}) < 3 * single_risk_usd({config.single_risk_usd:.3f})，并发空间过窄"
+            f"max_exposure_usd({config.max_exposure_usd:.3f}) < 4 * single_risk_usd({config.single_risk_usd:.3f})，并发空间过窄"
         )
     if config.safe_arbitrage_only and (config.enable_strategy_f or config.enable_strategy_g):
         suggestions.append("safe_arbitrage_only=true 会在非 shadow 模式过滤 F/G")
@@ -1964,7 +2979,7 @@ async def _build_arb_doctor_report(
             "daily_stop_loss_usd": config.daily_stop_loss_usd,
             "safe_arbitrage_only": config.safe_arbitrage_only,
             "single_risk_meets_p50_min_order": config.single_risk_usd >= p50_min_order if p50_min_order > 0 else True,
-            "exposure_ge_3x_single_risk": config.max_exposure_usd >= (3.0 * config.single_risk_usd),
+            "exposure_ge_4x_single_risk": config.max_exposure_usd >= (4.0 * config.single_risk_usd),
         },
         "likely_zero_signal": likely_zero_signal,
         "suggestions": suggestions,

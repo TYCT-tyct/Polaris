@@ -13,6 +13,8 @@ async def test_arb_clean_counts_and_apply_support_replay_tables(db) -> None:
     await db.execute(
         """
         truncate table
+            arb_experiment_metric,
+            arb_experiment_run,
             arb_order_event,
             arb_fill,
             arb_order_intent,
@@ -31,6 +33,7 @@ async def test_arb_clean_counts_and_apply_support_replay_tables(db) -> None:
     signal_id = "00000000-0000-0000-0000-000000000101"
     intent_id = "00000000-0000-0000-0000-000000000102"
     replay_run_id = "00000000-0000-0000-0000-000000000103"
+    experiment_run_id = "00000000-0000-0000-0000-000000000108"
     now = datetime.now(tz=UTC)
 
     await db.execute(
@@ -146,6 +149,37 @@ async def test_arb_clean_counts_and_apply_support_replay_tables(db) -> None:
     )
     await db.execute(
         """
+        insert into arb_experiment_run(
+            experiment_run_id, mode, run_tag, source_code, profile, strategy_set, scope, variant,
+            bankroll_usd, status, params, metadata, started_at, created_at, updated_at
+        )
+        values (
+            %s, 'paper_live', 'tag1', 'paper', 'balanced_50', 'ABCFG', 'shared', 'base',
+            50, 'running', '{}'::jsonb, '{}'::jsonb, %s, %s, %s
+        )
+        """,
+        (experiment_run_id, now, now, now),
+    )
+    await db.execute(
+        """
+        insert into arb_experiment_metric(
+            experiment_run_id, mode, run_tag, source_code, profile, strategy_set, scope, variant,
+            since_hours, signals_found, signals_executed, signals_rejected, signals_expired,
+            trades, wins, losses, realized_net_pnl_usd, mark_to_book_net_pnl_usd,
+            expected_net_pnl_usd, evaluation_net_pnl_usd, pnl_gap_vs_expected_usd,
+            turnover_usd, max_drawdown_usd, max_drawdown_pct, execution_rate, reject_rate, win_rate,
+            system_error_rate, resource_penalty, score_total, score_breakdown, metadata, created_at
+        )
+        values (
+            %s, 'paper_live', 'tag1', 'paper', 'balanced_50', 'ABCFG', 'shared', 'base',
+            8, 10, 3, 7, 0, 3, 2, 1, 0.2, 0.1, 0.3, 0.25, -0.05, 12, 0.5, 0.01,
+            0.3, 0.7, 0.66, 0.0, 0.0, 0.15, '{}'::jsonb, '{}'::jsonb, %s
+        )
+        """,
+        (experiment_run_id, now),
+    )
+    await db.execute(
+        """
         insert into arb_param_snapshot(
             param_snapshot_id, strategy_scope, version, status, params, score_total, score_breakdown,
             source_paper_window_start, source_paper_window_end, created_at
@@ -174,6 +208,8 @@ async def test_arb_clean_counts_and_apply_support_replay_tables(db) -> None:
     assert counts["arb_trade_result"] == 1
     assert counts["arb_cash_ledger"] == 1
     assert counts["arb_risk_event"] == 1
+    assert counts["arb_experiment_run"] == 1
+    assert counts["arb_experiment_metric"] == 1
     assert counts["arb_position_lot"] == 1
     assert counts["arb_replay_run"] == 1
     assert counts["arb_replay_metric"] == 1
@@ -195,6 +231,8 @@ async def test_arb_clean_counts_and_apply_support_replay_tables(db) -> None:
     assert deleted["arb_trade_result"] == 1
     assert deleted["arb_cash_ledger"] == 1
     assert deleted["arb_risk_event"] == 1
+    assert deleted["arb_experiment_run"] == 1
+    assert deleted["arb_experiment_metric"] == 1
     assert deleted["arb_position_lot"] == 1
     assert deleted["arb_replay_run"] == 1
     assert deleted["arb_replay_metric"] == 1
