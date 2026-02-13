@@ -1581,7 +1581,7 @@ def m4_semantic_eval(
                     ps.market_id,
                     m.slug,
                     ps.posterior_pmf,
-                    coalesce(ps.metadata->'baseline_posterior_pmf', '{{}}'::jsonb) as baseline_pmf,
+                    coalesce(ps.metadata->'baseline_posterior_pmf', ps.prior_pmf, '{{}}'::jsonb) as baseline_pmf,
                     ps.metadata,
                     tw.end_date,
                     coalesce((ps.metadata->>'replay_as_of')::timestamptz, ps.created_at) as as_of_ts,

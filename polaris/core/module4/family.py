@@ -53,6 +53,10 @@ def aggregate_market_family_rows(
         yes_prior = _extract_yes_probability(prior)
         yes_post = _extract_yes_probability(post)
         yes_base = _extract_yes_probability(baseline) if include_baseline else 0.0
+        if include_baseline and yes_base is None and yes_prior is not None:
+            # Backward compatibility for older snapshots that predate baseline_posterior_pmf.
+            yes_base = float(yes_prior)
+            stats["baseline_missing_fallback_prior"] += 1
         if yes_prior is None or yes_post is None or (include_baseline and yes_base is None):
             stats["yes_probability_missing"] += 1
             continue
@@ -171,4 +175,3 @@ def _normalize_pmf(raw: dict[str, float]) -> dict[str, float]:
 
 def _clip01(value: float) -> float:
     return max(0.0, min(1.0, float(value)))
-

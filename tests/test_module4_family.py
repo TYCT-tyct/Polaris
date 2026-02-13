@@ -81,3 +81,37 @@ def test_aggregate_market_family_rows_keeps_bucket_distribution_rows() -> None:
     assert unit["market_id"] == "mx"
     assert out.stats["passthrough_rows"] == 1
 
+
+def test_aggregate_market_family_rows_falls_back_baseline_to_prior() -> None:
+    now = datetime.now(tz=UTC)
+    rows = [
+        {
+            "run_tag": "r3",
+            "market_id": "m0",
+            "slug": "elon-musk-of-tweets-february-14-february-16-0-39",
+            "prior_pmf": {"Yes": 0.40, "No": 0.60},
+            "posterior_pmf": {"Yes": 0.45, "No": 0.55},
+            "baseline_pmf": {},
+            "metadata": {"semantic_applied": False},
+            "as_of_ts": now,
+            "end_date": now + timedelta(hours=1),
+            "final_count": 20,
+        },
+        {
+            "run_tag": "r3",
+            "market_id": "m1",
+            "slug": "elon-musk-of-tweets-february-14-february-16-40-64",
+            "prior_pmf": {"Yes": 0.60, "No": 0.40},
+            "posterior_pmf": {"Yes": 0.55, "No": 0.45},
+            "baseline_pmf": {},
+            "metadata": {"semantic_applied": True},
+            "as_of_ts": now,
+            "end_date": now + timedelta(hours=1),
+            "final_count": 20,
+        },
+    ]
+    out = aggregate_market_family_rows(rows, include_baseline=True)
+    assert len(out.rows) == 1
+    unit = out.rows[0]
+    assert abs(sum(unit["baseline_pmf"].values()) - 1.0) < 1e-9
+    assert out.stats["baseline_missing_fallback_prior"] == 2
