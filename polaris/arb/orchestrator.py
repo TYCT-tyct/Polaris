@@ -98,6 +98,7 @@ class ArbOrchestrator:
         all_signals = self._scan_all(mode, source_code, snapshots)
         ordered = self._order_signals(all_signals)
         ordered = self._dedupe_signals(ordered)
+        ordered, dropped_incomplete = await self._filter_incomplete_event_group_signals(ordered)
         dropped_by_cap: list[ArbSignal] = []
         if self.config.max_signals_per_cycle > 0 and len(ordered) > self.config.max_signals_per_cycle:
             logger.info(
@@ -112,6 +113,8 @@ class ArbOrchestrator:
             dropped_by_cap = ordered[self.config.max_signals_per_cycle :]
             ordered = ordered[: self.config.max_signals_per_cycle]
         scan_diag = _init_scan_diag_stats(all_signals, ordered)
+        for signal in dropped_incomplete:
+            _note_scan_diag_reason(scan_diag, signal.strategy_code.value, "incomplete_event_group")
         for signal in dropped_by_cap:
             _note_scan_diag_reason(scan_diag, signal.strategy_code.value, "dropped_by_cap")
         scan_ms = int((perf_counter() - scan_started) * 1000)
@@ -514,6 +517,59 @@ class ArbOrchestrator:
         if loaded:
             snapshot_map.update(loaded)
             self._snapshot_cache_by_token.update(loaded)
+
+    async def _filter_incomplete_event_group_signals(self, signals: list[ArbSignal]) -> tuple[list[ArbSignal], list[ArbSignal]]:
+        # Strategy A 属于“全集约束”套利：必须拿到同一 event 下的完整 YES outcome 集合，
+        # 否则会出现“缺腿导致 total_cost_per_share 假低”的假套利，paper/实盘都会亏。
+        event_ids = sorted({str(s.event_id) for s in signals if s.strategy_code == StrategyCode.A and s.event_id})
+        if not event_ids:
+            return signals, []
+        rows = await self.db.fetch_all(
+            """
+            select
+                m.event_id,
+                array_agg(t.token_id order by t.outcome_index) as token_ids
+            from dim_market m
+            join dim_token t on t.market_id = m.market_id
+            where m.event_id = any(%s)
+              and m.active = true
+              and m.closed = false
+              and m.archived = false
+              and (m.neg_risk or m.neg_risk_augmented) = true
+              and t.outcome_side = 'YES'
+              and coalesce(t.is_other_outcome, false) = false
+              and coalesce(t.is_placeholder_outcome, false) = false
+            group by m.event_id
+            """,
+            (event_ids,),
+        )
+        expected_by_event: dict[str, set[str]] = {}
+        for row in rows:
+            eid = str(row.get("event_id") or "")
+            token_list = row.get("token_ids") or []
+            expected_by_event[eid] = {str(tid) for tid in token_list if str(tid).strip()}
+        if not expected_by_event:
+            return signals, []
+
+        kept: list[ArbSignal] = []
+        dropped: list[ArbSignal] = []
+        for s in signals:
+            if s.strategy_code != StrategyCode.A or not s.event_id:
+                kept.append(s)
+                continue
+            expected = expected_by_event.get(str(s.event_id))
+            if not expected:
+                kept.append(s)
+                continue
+            actual = {str(tid) for tid in (s.token_ids or []) if str(tid).strip()}
+            missing = expected - actual
+            if missing:
+                # 记录一些解释信息，便于 scan_diag/信号回放定位问题。
+                s.features["missing_token_count"] = int(len(missing))
+                dropped.append(s)
+                continue
+            kept.append(s)
+        return kept, dropped
 
     async def _maybe_exit_paper_positions(
         self,
