@@ -1421,6 +1421,122 @@ def m4_stage_report(
     asyncio.run(_run())
 
 
+@app.command("m4-dataset-audit")
+def m4_dataset_audit(
+    mode: Annotated[str, typer.Option("--mode", help="paper_replay|paper_live|shadow|live|all")] = "paper_replay",
+    source: Annotated[str, typer.Option("--source", help="source_code|all")] = "module4",
+    run_tag: Annotated[str, typer.Option("--run-tag", help="current|all|custom")] = "all",
+    since_hours: Annotated[int, typer.Option("--since-hours", min=1, max=24 * 120)] = 24 * 14,
+    require_count_buckets: Annotated[bool, typer.Option("--require-count-buckets/--all-markets")] = False,
+) -> None:
+    """Audit scorable Module4 dataset coverage and unscorable reason distribution."""
+    refresh_process_env_from_file(preserve_existing=True)
+    load_settings.cache_clear()
+    settings = load_settings()
+    setup_logging(settings.log_level)
+    _ensure_windows_selector_loop()
+
+    mode_norm = mode.strip().lower()
+    if mode_norm not in {"paper_replay", "paper_live", "shadow", "live", "all"}:
+        raise typer.BadParameter("mode must be one of: paper_replay, paper_live, shadow, live, all")
+    source_norm = source.strip().lower() or "module4"
+    source_filter = None if source_norm == "all" else source_norm
+    mode_filter = None if mode_norm == "all" else mode_norm
+    run_norm = run_tag.strip().lower()
+    since_start = datetime.now(tz=UTC) - timedelta(hours=since_hours)
+
+    async def _run() -> None:
+        db = _create_database(settings)
+        await db.open()
+        try:
+            service = Module4Service(db, settings)
+            run_tag_filter: str | None
+            if run_norm in ("", "all"):
+                run_tag_filter = None
+            elif run_norm == "current":
+                if mode_filter is None or source_filter is None:
+                    raise typer.BadParameter("--run-tag current requires --mode and --source to be specific (not 'all')")
+                run_tag_filter = await service.resolve_run_tag_filter(raw=run_tag, mode=mode_filter, source_code=source_filter)
+            else:
+                run_tag_filter = _sanitize_run_tag(run_tag)
+
+            where_clauses = ["ps.created_at >= %s", "tw.end_date is not null"]
+            params: list[object] = [since_start]
+            if mode_filter is not None:
+                where_clauses.append("ps.mode = %s")
+                params.append(mode_filter)
+            if source_filter is not None:
+                where_clauses.append("ps.source_code = %s")
+                params.append(source_filter)
+            if run_tag_filter:
+                where_clauses.append("ps.run_tag = %s")
+                params.append(run_tag_filter)
+            if require_count_buckets:
+                where_clauses.append(
+                    """
+                    exists (
+                        select 1
+                        from dim_token tk
+                        where tk.market_id = ps.market_id
+                          and tk.outcome_label ~ '[0-9]'
+                    )
+                    """
+                )
+
+            rows = await db.fetch_all(
+                f"""
+                select
+                    ps.run_tag,
+                    ps.market_id,
+                    ps.prior_pmf,
+                    ps.posterior_pmf,
+                    coalesce((ps.metadata->>'replay_as_of')::timestamptz, ps.created_at) as as_of_ts,
+                    tw.end_date,
+                    coalesce(
+                        (
+                            select fm.cumulative_count_est
+                            from fact_tweet_metric_1m fm
+                            where fm.account_id = ps.account_id
+                              and fm.tracking_id = ps.tracking_id
+                              and fm.minute_bucket <= tw.end_date
+                            order by fm.minute_bucket desc
+                            limit 1
+                        ),
+                        (
+                            select max(fd.cumulative_count)::int
+                            from fact_tweet_metric_daily fd
+                            where fd.account_id = ps.account_id
+                              and fd.tracking_id = ps.tracking_id
+                              and fd.metric_date <= tw.end_date::date
+                        ),
+                        0
+                    ) as final_count
+                from m4_posterior_snapshot ps
+                join dim_tracking_window tw
+                  on tw.tracking_id = ps.tracking_id
+                 and tw.account_id = ps.account_id
+                where {' and '.join(where_clauses)}
+                order by ps.created_at asc
+                """,
+                tuple(params),
+            )
+
+            audit = _audit_m4_dataset_rows(rows)
+            payload = {
+                "mode": mode_filter or "all",
+                "source_code": source_filter or "all",
+                "run_tag": run_tag_filter or "all",
+                "since_hours": since_hours,
+                "require_count_buckets": require_count_buckets,
+                **audit,
+            }
+            typer.echo(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
+        finally:
+            await db.close()
+
+    asyncio.run(_run())
+
+
 @app.command("arb-run")
 def arb_run(
     mode: Annotated[str, typer.Option("--mode", help="shadow|paper_live|live")] = "paper_live",
@@ -2547,6 +2663,108 @@ def _argmax_label(pmf: dict[str, float]) -> str:
     if not pmf:
         return ""
     return max(sorted(pmf.keys()), key=lambda key: float(pmf.get(key, 0.0)))
+
+
+def _classify_m4_dataset_row(row: dict[str, object]) -> str | None:
+    end_date = row.get("end_date")
+    as_of_ts = row.get("as_of_ts")
+    if not isinstance(end_date, datetime) or not isinstance(as_of_ts, datetime):
+        return "invalid_time"
+    if (end_date - as_of_ts).total_seconds() <= 0:
+        return "non_positive_hours_to_close"
+    prior = _parse_pmf(row.get("prior_pmf"))
+    posterior = _parse_pmf(row.get("posterior_pmf"))
+    if not prior or not posterior:
+        return "pmf_missing"
+    final_count = int(row.get("final_count") or 0)
+    true_label = infer_true_bucket_label(final_count, posterior.keys())
+    if true_label is None:
+        return "true_label_not_in_bucket_space"
+    return None
+
+
+def _audit_m4_dataset_rows(rows: list[dict[str, object]]) -> dict[str, object]:
+    reasons_global: Counter[str] = Counter()
+    run_stats: dict[str, dict[str, object]] = {}
+    global_markets_total: set[str] = set()
+    global_markets_scorable: set[str] = set()
+    rows_total = 0
+    rows_scorable = 0
+
+    for row in rows:
+        rows_total += 1
+        run_tag = str(row.get("run_tag") or "_missing")
+        market_id = str(row.get("market_id") or "_missing")
+        global_markets_total.add(market_id)
+
+        slot = run_stats.setdefault(
+            run_tag,
+            {
+                "rows_total": 0,
+                "rows_scorable": 0,
+                "markets_total": set(),
+                "markets_scorable": set(),
+                "reasons": Counter(),
+            },
+        )
+        slot["rows_total"] = int(slot["rows_total"]) + 1
+        cast_markets_total = slot["markets_total"]
+        if isinstance(cast_markets_total, set):
+            cast_markets_total.add(market_id)
+
+        reason = _classify_m4_dataset_row(row)
+        if reason is None:
+            rows_scorable += 1
+            global_markets_scorable.add(market_id)
+            slot["rows_scorable"] = int(slot["rows_scorable"]) + 1
+            cast_markets_scorable = slot["markets_scorable"]
+            if isinstance(cast_markets_scorable, set):
+                cast_markets_scorable.add(market_id)
+            continue
+        reasons_global[reason] += 1
+        cast_reasons = slot["reasons"]
+        if isinstance(cast_reasons, Counter):
+            cast_reasons[reason] += 1
+
+    run_rows: list[dict[str, object]] = []
+    for run_tag in sorted(run_stats.keys()):
+        slot = run_stats[run_tag]
+        per_rows_total = int(slot["rows_total"])
+        per_rows_scorable = int(slot["rows_scorable"])
+        per_markets_total = len(slot["markets_total"]) if isinstance(slot["markets_total"], set) else 0
+        per_markets_scorable = len(slot["markets_scorable"]) if isinstance(slot["markets_scorable"], set) else 0
+        cast_reasons = slot["reasons"]
+        run_rows.append(
+            {
+                "run_tag": run_tag,
+                "rows_total": per_rows_total,
+                "rows_scorable": per_rows_scorable,
+                "rows_coverage_pct": round((per_rows_scorable / per_rows_total) * 100.0, 4) if per_rows_total > 0 else 0.0,
+                "markets_total": per_markets_total,
+                "markets_scorable": per_markets_scorable,
+                "markets_coverage_pct": round((per_markets_scorable / per_markets_total) * 100.0, 4)
+                if per_markets_total > 0
+                else 0.0,
+                "unscorable_reason_distribution": dict(cast_reasons) if isinstance(cast_reasons, Counter) else {},
+            }
+        )
+
+    run_rows.sort(key=lambda item: (-int(item.get("rows_total") or 0), str(item.get("run_tag") or "")))
+    rows_unscorable = rows_total - rows_scorable
+    markets_total = len(global_markets_total)
+    markets_scorable = len(global_markets_scorable)
+    return {
+        "rows_total": rows_total,
+        "rows_scorable": rows_scorable,
+        "rows_unscorable": rows_unscorable,
+        "rows_coverage_pct": round((rows_scorable / rows_total) * 100.0, 4) if rows_total > 0 else 0.0,
+        "markets_total": markets_total,
+        "scorable_market_count": markets_scorable,
+        "markets_unscorable": markets_total - markets_scorable,
+        "market_coverage_pct": round((markets_scorable / markets_total) * 100.0, 4) if markets_total > 0 else 0.0,
+        "unscorable_reason_distribution": dict(reasons_global),
+        "run_tag_coverage": run_rows,
+    }
 
 
 async def _arb_summary_by_experiment(
