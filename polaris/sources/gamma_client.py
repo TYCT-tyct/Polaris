@@ -80,6 +80,7 @@ class GammaClient:
             "condition_id": raw.get("conditionId"),
             "event_id": event_id,
             "question": raw.get("question") or "",
+            "description": raw.get("description") or "",
             "slug": raw.get("slug") or f"market-{market_id}",
             "event_slug": event_slug,
             "category": raw.get("category"),

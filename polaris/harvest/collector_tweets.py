@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import re
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timedelta, timezone
+from typing import Any, Sequence
 
 from polaris.db.pool import Database
 from polaris.sources.models import XTrackerPost, XTrackerTracking, XTrackerUser
@@ -193,6 +194,140 @@ class TweetCollector:
         await self.db.set_cursor(last_id_key, latest_id, {"new_rows": len(rows)})
         return len(rows)
 
+    async def sync_metric_1m(
+        self,
+        account_id: str,
+        trackings: Sequence[XTrackerTracking | dict[str, Any]] | None = None,
+        as_of: datetime | None = None,
+    ) -> int:
+        now = as_of or datetime.now(tz=UTC)
+        minute_bucket = now.replace(second=0, microsecond=0)
+        tracking_rows = await self._resolve_tracking_rows(account_id, trackings)
+        if not tracking_rows:
+            return 0
+
+        upserts: list[tuple[Any, ...]] = []
+        for item in tracking_rows:
+            tracking_id = str(item["tracking_id"])
+            start_date = item.get("start_date")
+            end_date = item.get("end_date")
+            if not isinstance(start_date, datetime) or not isinstance(end_date, datetime):
+                continue
+            if minute_bucket < start_date:
+                continue
+
+            last_metric = await self.db.fetch_one(
+                """
+                select cumulative_count
+                from fact_tweet_metric_daily
+                where account_id = %s
+                  and tracking_id = %s
+                  and metric_date <= %s::date
+                order by metric_date desc
+                limit 1
+                """,
+                (account_id, tracking_id, minute_bucket.date()),
+            )
+            metric_cumulative = int(last_metric["cumulative_count"]) if last_metric else None
+
+            effective_end = min(end_date, minute_bucket + timedelta(minutes=1))
+            posts_row = await self.db.fetch_one(
+                """
+                select count(*)::int as c
+                from fact_tweet_post
+                where account_id = %s
+                  and posted_at >= %s
+                  and posted_at < %s
+                """,
+                (account_id, start_date, effective_end),
+            )
+            posts_cumulative = int(posts_row["c"] if posts_row else 0)
+            est_cumulative = posts_cumulative if metric_cumulative is None else max(metric_cumulative, posts_cumulative)
+
+            confidence = 0.35
+            if metric_cumulative is not None:
+                gap = abs(est_cumulative - metric_cumulative)
+                confidence = max(0.1, min(0.99, 1.0 - (gap / max(10.0, metric_cumulative + 1.0))))
+
+            meta = {
+                "metric_cumulative": metric_cumulative,
+                "posts_cumulative": posts_cumulative,
+                "tracking_start": start_date.isoformat(),
+                "tracking_end": end_date.isoformat(),
+            }
+            upserts.append(
+                (
+                    account_id,
+                    tracking_id,
+                    minute_bucket,
+                    est_cumulative,
+                    metric_cumulative,
+                    posts_cumulative,
+                    confidence,
+                    _to_json(meta),
+                )
+            )
+
+        if not upserts:
+            return 0
+
+        await self.db.executemany(
+            """
+            insert into fact_tweet_metric_1m(
+                account_id, tracking_id, minute_bucket, cumulative_count_est, cumulative_count_metric,
+                cumulative_count_posts, source_confidence, metadata, captured_at
+            )
+            values (%s, %s, %s, %s, %s, %s, %s, %s::jsonb, now())
+            on conflict (account_id, tracking_id, minute_bucket) do update
+            set cumulative_count_est = excluded.cumulative_count_est,
+                cumulative_count_metric = excluded.cumulative_count_metric,
+                cumulative_count_posts = excluded.cumulative_count_posts,
+                source_confidence = excluded.source_confidence,
+                metadata = excluded.metadata,
+                captured_at = excluded.captured_at
+            """,
+            upserts,
+        )
+        return len(upserts)
+
+    async def _resolve_tracking_rows(
+        self,
+        account_id: str,
+        trackings: Sequence[XTrackerTracking | dict[str, Any]] | None,
+    ) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        if trackings:
+            for item in trackings:
+                if isinstance(item, XTrackerTracking):
+                    rows.append(
+                        {
+                            "tracking_id": item.tracking_id,
+                            "start_date": item.start_date,
+                            "end_date": item.end_date,
+                        }
+                    )
+                else:
+                    rows.append(
+                        {
+                            "tracking_id": str(item.get("tracking_id") or item.get("id") or ""),
+                            "start_date": item.get("start_date") or item.get("startDate"),
+                            "end_date": item.get("end_date") or item.get("endDate"),
+                        }
+                    )
+            return [row for row in rows if row.get("tracking_id")]
+
+        db_rows = await self.db.fetch_all(
+            """
+            select tracking_id, start_date, end_date
+            from dim_tracking_window
+            where account_id = %s
+              and is_active = true
+            order by start_date desc
+            """,
+            (account_id,),
+        )
+        return db_rows
+
 
 def _collect_new_posts(posts: list[XTrackerPost], last_seen_id: int | None) -> list[XTrackerPost]:
     if last_seen_id is None:
@@ -248,3 +383,9 @@ def _sha1(text: str) -> str:
 
 def _raw_payload_json(post: XTrackerPost) -> str:
     return post.model_dump_json(by_alias=True, exclude_none=True)
+
+
+def _to_json(payload: dict[str, Any]) -> str:
+    import json
+
+    return json.dumps(payload, ensure_ascii=True, separators=(",", ":"))

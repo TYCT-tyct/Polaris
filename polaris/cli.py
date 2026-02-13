@@ -33,6 +33,7 @@ from polaris.arb.experiments import ExperimentScoreInput, compute_experiment_sco
 from polaris.arb.orchestrator import ArbOrchestrator
 from polaris.arb.reporting import ArbReporter
 from polaris.config import PolarisSettings, load_settings, refresh_process_env_from_file
+from polaris.core.module4 import Module4Service
 from polaris.db.pool import Database
 from polaris.harvest.collector_markets import MarketCollector
 from polaris.harvest.collector_quotes import QuoteCollector
@@ -922,6 +923,213 @@ def backup(
     typer.echo(f"backup completed: {backup_dir}")
     typer.echo(f"artifacts={len(artifacts)} keep_last={keep_last} pruned={len(pruned)}")
     typer.echo(f"manifest={manifest_file}")
+
+
+@app.command("m4-rule-compile")
+def m4_rule_compile(
+    market_id: Annotated[str, typer.Option("--market-id", help="Optional market_id filter")] = "",
+    force: Annotated[bool, typer.Option("--force/--no-force")] = False,
+) -> None:
+    """Compile and version market rules for Module4."""
+    refresh_process_env_from_file(preserve_existing=True)
+    load_settings.cache_clear()
+    settings = load_settings()
+    setup_logging(settings.log_level)
+    _ensure_windows_selector_loop()
+
+    async def _run() -> None:
+        db = _create_database(settings)
+        await db.open()
+        try:
+            service = Module4Service(db, settings)
+            rows = await service.compile_rules(market_id=(market_id.strip() or None), force=force)
+            payload = {
+                "count": len(rows),
+                "market_id": market_id or "all",
+                "force": force,
+                "rows": [
+                    {
+                        "rule_version_id": row.rule_version_id,
+                        "market_id": row.market_id,
+                        "rule_hash": row.rule_hash,
+                        "resolution_source": row.parsed_rule.resolution_source,
+                        "notes": list(row.parsed_rule.notes),
+                    }
+                    for row in rows
+                ],
+            }
+            typer.echo(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
+        finally:
+            await db.close()
+
+    asyncio.run(_run())
+
+
+@app.command("m4-run-once")
+def m4_run_once(
+    mode: Annotated[str, typer.Option("--mode", help="paper_live|paper_replay|shadow|live")] = "paper_live",
+    source: Annotated[str, typer.Option("--source", help="Source code tag")] = "module4",
+    run_tag: Annotated[str, typer.Option("--run-tag", help="auto|custom")] = "auto",
+    market_id: Annotated[str, typer.Option("--market-id", help="Optional single market_id")] = "",
+    use_agent: Annotated[bool, typer.Option("--agent/--no-agent")] = True,
+) -> None:
+    """Run one Module4 prediction/decision cycle."""
+    refresh_process_env_from_file(preserve_existing=True)
+    load_settings.cache_clear()
+    settings = load_settings()
+    setup_logging(settings.log_level)
+    _ensure_windows_selector_loop()
+
+    allowed_modes = {"paper_live", "paper_replay", "shadow", "live"}
+    mode_norm = mode.strip().lower()
+    if mode_norm not in allowed_modes:
+        raise typer.BadParameter("mode must be one of: paper_live, paper_replay, shadow, live")
+
+    async def _run() -> None:
+        db = _create_database(settings)
+        await db.open()
+        try:
+            service = Module4Service(db, settings)
+            summary = await service.run_once(
+                mode=mode_norm,
+                source_code=source.strip().lower() or settings.m4_source_code,
+                run_tag=run_tag.strip() or "auto",
+                market_id=market_id.strip() or None,
+                use_agent=use_agent,
+            )
+            payload = {
+                "run_tag": summary.run_tag,
+                "mode": summary.mode,
+                "source_code": summary.source_code,
+                "markets_total": summary.markets_total,
+                "markets_with_prior": summary.markets_with_prior,
+                "snapshots_written": summary.snapshots_written,
+                "decisions_written": summary.decisions_written,
+                "evidence_written": summary.evidence_written,
+                "skipped": summary.skipped,
+            }
+            typer.echo(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
+        finally:
+            await db.close()
+
+    asyncio.run(_run())
+
+
+@app.command("m4-score")
+def m4_score(
+    since_hours: Annotated[int, typer.Option("--since-hours", min=1, max=24 * 60)] = 24,
+    mode: Annotated[str, typer.Option("--mode", help="paper_live|paper_replay|shadow|live")] = "paper_live",
+    source: Annotated[str, typer.Option("--source", help="source_code")] = "module4",
+    run_tag: Annotated[str, typer.Option("--run-tag", help="current|all|custom")] = "current",
+    window_code: Annotated[str, typer.Option("--window", help="fused|short|week")] = "fused",
+    persist: Annotated[bool, typer.Option("--persist/--no-persist")] = True,
+) -> None:
+    """Compute Module4 quality and risk score."""
+    refresh_process_env_from_file(preserve_existing=True)
+    load_settings.cache_clear()
+    settings = load_settings()
+    setup_logging(settings.log_level)
+    _ensure_windows_selector_loop()
+
+    allowed_modes = {"paper_live", "paper_replay", "shadow", "live"}
+    mode_norm = mode.strip().lower()
+    if mode_norm not in allowed_modes:
+        raise typer.BadParameter("mode must be one of: paper_live, paper_replay, shadow, live")
+    source_norm = source.strip().lower() or settings.m4_source_code
+    window_norm = window_code.strip().lower()
+    if window_norm not in {"fused", "short", "week"}:
+        raise typer.BadParameter("window must be one of: fused, short, week")
+
+    async def _run() -> None:
+        db = _create_database(settings)
+        await db.open()
+        try:
+            service = Module4Service(db, settings)
+            run_tag_filter = await service.resolve_run_tag_filter(raw=run_tag, mode=mode_norm, source_code=source_norm)
+            result = await service.score(
+                mode=mode_norm,
+                source_code=source_norm,
+                run_tag=run_tag_filter,
+                window_code=window_norm,
+                since_hours=since_hours,
+                persist=persist,
+            )
+            payload = {
+                "run_tag": result.run_tag,
+                "mode": result.mode,
+                "source_code": result.source_code,
+                "window_code": result.window_code,
+                "since_hours": result.since_hours,
+                "markets_scored": result.markets_scored,
+                "log_score": result.log_score,
+                "ece": result.ece,
+                "brier": result.brier,
+                "realized_net_pnl_usd": result.realized_net_pnl_usd,
+                "max_drawdown_usd": result.max_drawdown_usd,
+                "score_total": result.score_total,
+                "score_breakdown": result.score_breakdown,
+                "metadata": result.metadata,
+            }
+            typer.echo(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
+        finally:
+            await db.close()
+
+    asyncio.run(_run())
+
+
+@app.command("m4-promote")
+def m4_promote(
+    since_hours: Annotated[int, typer.Option("--since-hours", min=1, max=24 * 60)] = 24,
+    mode: Annotated[str, typer.Option("--mode", help="paper_live|paper_replay|shadow|live")] = "paper_live",
+    source: Annotated[str, typer.Option("--source", help="source_code")] = "module4",
+    top_n: Annotated[int, typer.Option("--top-n", min=1, max=20)] = 2,
+    min_score: Annotated[float, typer.Option("--min-score")] = -1.5,
+    max_ece: Annotated[float, typer.Option("--max-ece", min=0.0, max=1.0)] = 0.06,
+    min_log_score: Annotated[float, typer.Option("--min-log-score")] = -2.3,
+) -> None:
+    """Pick top Module4 candidates that pass score gates."""
+    refresh_process_env_from_file(preserve_existing=True)
+    load_settings.cache_clear()
+    settings = load_settings()
+    setup_logging(settings.log_level)
+    _ensure_windows_selector_loop()
+
+    mode_norm = mode.strip().lower()
+    source_norm = source.strip().lower() or settings.m4_source_code
+    if mode_norm not in {"paper_live", "paper_replay", "shadow", "live"}:
+        raise typer.BadParameter("mode must be one of: paper_live, paper_replay, shadow, live")
+
+    async def _run() -> None:
+        db = _create_database(settings)
+        await db.open()
+        try:
+            service = Module4Service(db, settings)
+            rows = await service.top_candidates(
+                mode=mode_norm,
+                source_code=source_norm,
+                since_hours=since_hours,
+                top_n=top_n,
+                min_score=min_score,
+                max_ece=max_ece,
+                min_log_score=min_log_score,
+            )
+            payload = {
+                "mode": mode_norm,
+                "source_code": source_norm,
+                "since_hours": since_hours,
+                "top_n": top_n,
+                "gates": {
+                    "min_score": min_score,
+                    "max_ece": max_ece,
+                    "min_log_score": min_log_score,
+                },
+                "candidates": rows,
+            }
+            typer.echo(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
+        finally:
+            await db.close()
+
+    asyncio.run(_run())
 
 
 @app.command("arb-run")

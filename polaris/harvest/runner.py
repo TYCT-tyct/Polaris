@@ -60,6 +60,11 @@ class HarvestRunner:
                 lambda u=user, t=trackings: self.tweet_collector.sync_metrics(u, t),
             )
             await self._run_posts(handle, user.account_id)
+            await self._run_job(
+                "sync_metric_1m",
+                "xtracker",
+                lambda aid=user.account_id, t=trackings: self.tweet_collector.sync_metric_1m(aid, t),
+            )
             await self._run_job("map_market_tracking", "internal", lambda h=handle: self.mapper.remap(h))
         await self._run_quotes_all_once()
         await self._run_job("agg_1m", "internal", self.quote_collector.aggregate_1m)
@@ -72,6 +77,7 @@ class HarvestRunner:
             TaskSpec(name="quote_top", interval_sec=intervals.quote_top_sync, job=self._run_quotes_top),
             TaskSpec(name="quote_depth", interval_sec=intervals.quote_depth_sync, job=self._run_quotes_depth),
             TaskSpec(name="agg_1m", interval_sec=intervals.agg_1m, job=lambda: self._run_job("agg_1m", "internal", self.quote_collector.aggregate_1m)),
+            TaskSpec(name="m4_counter_1m", interval_sec=intervals.m4_counter_1m, job=lambda: self._sync_all_metric_1m(handles)),
             TaskSpec(name="health_agg", interval_sec=intervals.health_agg, job=lambda: self._run_job("health_agg", "internal", self.health.aggregate_last_minute)),
             TaskSpec(name="retention", interval_sec=intervals.retention, job=lambda: self._run_job("retention", "internal", lambda: self.quote_collector.prune_raw(self.settings.raw_retention_days))),
         ]
@@ -181,6 +187,28 @@ class HarvestRunner:
         else:
             self._post_failures[handle] = 0
             self._post_resume_at.pop(handle, None)
+
+    async def _sync_all_metric_1m(self, handles: list[str]) -> None:
+        for handle in handles:
+            await self._sync_handle_metric_1m(handle)
+
+    async def _sync_handle_metric_1m(self, handle: str) -> None:
+        row = await self.db.fetch_one(
+            "select account_id from dim_account where lower(handle) = lower(%s) limit 1",
+            (handle,),
+        )
+        if row is None:
+            user = await self._run_job("sync_account", "xtracker", lambda: self.tweet_collector.sync_account(handle))
+            if user is None:
+                return
+            account_id = user.account_id
+        else:
+            account_id = str(row["account_id"])
+        await self._run_job(
+            "sync_metric_1m",
+            "xtracker",
+            lambda aid=account_id: self.tweet_collector.sync_metric_1m(aid, None),
+        )
 
     async def _run_job(
         self,

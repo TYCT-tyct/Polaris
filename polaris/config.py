@@ -31,6 +31,7 @@ class PollIntervals(BaseModel):
     orderbook_l2_sync: int = 60
     mapping_sync: int = 300
     agg_1m: int = 60
+    m4_counter_1m: int = 60
     health_agg: int = 60
     retention: int = 86400
 
@@ -72,6 +73,7 @@ class PolarisSettings(BaseSettings):
     orderbook_l2_sync_interval: int = Field(default=60)
     mapping_sync_interval: int = Field(default=300)
     agg_1m_interval: int = Field(default=60)
+    m4_counter_1m_interval: int = Field(default=60)
     health_agg_interval: int = Field(default=60)
     retention_interval: int = Field(default=86400)
 
@@ -203,6 +205,33 @@ class PolarisSettings(BaseSettings):
     clob_ws_reconnect_min_sec: float = Field(default=0.5)
     clob_ws_reconnect_max_sec: float = Field(default=8.0)
 
+    # module4: omega-r2 (prediction and decision)
+    m4_enabled: bool = Field(default=True)
+    m4_mode: str = Field(default="paper_live")
+    m4_source_code: str = Field(default="module4")
+    m4_run_tag: str = Field(default="auto")
+    m4_target_handle: str = Field(default="elonmusk")
+    m4_short_window_hours: int = Field(default=48)
+    m4_week_window_days: int = Field(default=7)
+    m4_window_weight_short: float = Field(default=0.65)
+    m4_window_weight_week: float = Field(default=0.35)
+    m4_prior_spread_ref: float = Field(default=0.08)
+    m4_prior_depth_ref: float = Field(default=250.0)
+    m4_prior_sample_ref: int = Field(default=20)
+    m4_collapse_dispersion: float = Field(default=25.0)
+    m4_collapse_tail_default_short: int = Field(default=8)
+    m4_collapse_tail_default_week: int = Field(default=20)
+    m4_agent_enabled: bool = Field(default=True)
+    m4_agent_max_calls: int = Field(default=2)
+    m4_agent_timeout_sec: float = Field(default=3.0)
+    m4_agent_single_source_uncertainty: float = Field(default=0.06)
+    m4_decision_min_reliability: float = Field(default=0.35)
+    m4_decision_min_net_edge: float = Field(default=0.01)
+    m4_fee_bps: float = Field(default=0.0)
+    m4_slippage_bps: float = Field(default=20.0)
+    m4_latency_buffer_bps: float = Field(default=10.0)
+    m4_score_since_hours: int = Field(default=24)
+
     @property
     def handles(self) -> list[str]:
         return [part.strip() for part in self.default_handles.split(",") if part.strip()]
@@ -223,6 +252,7 @@ class PolarisSettings(BaseSettings):
             orderbook_l2_sync=self.orderbook_l2_sync_interval,
             mapping_sync=self.mapping_sync_interval,
             agg_1m=self.agg_1m_interval,
+            m4_counter_1m=self.m4_counter_1m_interval,
             health_agg=self.health_agg_interval,
             retention=self.retention_interval,
         )

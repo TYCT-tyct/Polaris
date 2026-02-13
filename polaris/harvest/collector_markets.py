@@ -125,6 +125,7 @@ class MarketCollector:
                 m["condition_id"],
                 m["event_id"],
                 m["question"],
+                m.get("description") or "",
                 m["slug"],
                 m["event_slug"],
                 m["category"],
@@ -149,7 +150,7 @@ class MarketCollector:
         await self.db.executemany(
             """
             insert into dim_market(
-                market_id, gamma_market_id, condition_id, event_id, question, slug, event_slug, category,
+                market_id, gamma_market_id, condition_id, event_id, question, description, slug, event_slug, category,
                 end_date, start_date, neg_risk, active, closed, archived, neg_risk_augmented, spread,
                 liquidity, volume, resolution_source, updated_from_source_at, captured_at
             )
@@ -158,6 +159,7 @@ class MarketCollector:
             set gamma_market_id = excluded.gamma_market_id,
                 condition_id = excluded.condition_id,
                 question = excluded.question,
+                description = excluded.description,
                 slug = excluded.slug,
                 event_slug = excluded.event_slug,
                 category = excluded.category,
@@ -178,6 +180,7 @@ class MarketCollector:
             where dim_market.gamma_market_id is distinct from excluded.gamma_market_id
                or dim_market.condition_id is distinct from excluded.condition_id
                or dim_market.question is distinct from excluded.question
+               or dim_market.description is distinct from excluded.description
                or dim_market.slug is distinct from excluded.slug
                or dim_market.event_slug is distinct from excluded.event_slug
                or dim_market.category is distinct from excluded.category
