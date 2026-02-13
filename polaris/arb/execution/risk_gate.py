@@ -66,7 +66,7 @@ class RiskGate:
                       and source_code = %s
                       and (%s::text is null or strategy_code = %s::text)
                       and coalesce(payload->>'run_tag', '') = %s
-                    order by created_at desc
+                    order by ledger_id desc
                     limit 1
                 ) as cash_balance,
                 exists(

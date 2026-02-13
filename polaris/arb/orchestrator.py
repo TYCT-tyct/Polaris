@@ -1022,11 +1022,11 @@ class ArbOrchestrator:
                 # paper shared 资金池用 strategy_code='shared' 作为单一账本，避免混入各策略行导致余额口径漂移。
                 row = await self.db.fetch_one(
                     """
-                    select balance_after_usd
-                    from arb_cash_ledger
-                    where mode = %s and source_code = %s and strategy_code = 'shared'
-                      and coalesce(payload->>'run_tag', '') = %s
-                    order by created_at desc
+                     select balance_after_usd
+                     from arb_cash_ledger
+                     where mode = %s and source_code = %s and strategy_code = 'shared'
+                       and coalesce(payload->>'run_tag', '') = %s
+                    order by ledger_id desc
                     limit 1
                     """,
                     (mode.value, source_code, self.config.run_tag),
@@ -1038,7 +1038,7 @@ class ArbOrchestrator:
                     from arb_cash_ledger
                     where mode = %s and source_code = %s
                       and coalesce(payload->>'run_tag', '') = %s
-                    order by created_at desc
+                    order by ledger_id desc
                     limit 1
                     """,
                     (mode.value, source_code, self.config.run_tag),
@@ -1050,7 +1050,7 @@ class ArbOrchestrator:
                 from arb_cash_ledger
                 where mode = %s and source_code = %s and strategy_code = %s
                   and coalesce(payload->>'run_tag', '') = %s
-                order by created_at desc
+                order by ledger_id desc
                 limit 1
                 """,
                 (mode.value, source_code, strategy_code.value, self.config.run_tag),
