@@ -4,6 +4,7 @@ import asyncio
 from collections import Counter
 import importlib
 import json
+import math
 import re
 import signal
 import subprocess
@@ -33,7 +34,8 @@ from polaris.arb.experiments import ExperimentScoreInput, compute_experiment_sco
 from polaris.arb.orchestrator import ArbOrchestrator
 from polaris.arb.reporting import ArbReporter
 from polaris.config import PolarisSettings, load_settings, refresh_process_env_from_file
-from polaris.core.module4 import Module4Service
+from polaris.core.module4 import Module4Service, expected_calibration_error, multiclass_brier
+from polaris.core.module4.buckets import infer_true_bucket_label
 from polaris.db.pool import Database
 from polaris.harvest.collector_markets import MarketCollector
 from polaris.harvest.collector_quotes import QuoteCollector
@@ -1132,6 +1134,281 @@ def m4_promote(
     asyncio.run(_run())
 
 
+@app.command("m4-replay")
+def m4_replay(
+    start: Annotated[str, typer.Option("--start", help="ISO datetime, e.g. 2026-02-10T00:00:00Z")],
+    end: Annotated[str, typer.Option("--end", help="ISO datetime, e.g. 2026-02-13T00:00:00Z")],
+    step_minutes: Annotated[int, typer.Option("--step-minutes", min=5, max=720)] = 60,
+    source: Annotated[str, typer.Option("--source", help="source_code")] = "module4",
+    run_tag: Annotated[str, typer.Option("--run-tag", help="auto|custom")] = "auto",
+    market_id: Annotated[str, typer.Option("--market-id", help="optional single market_id")] = "",
+    use_agent: Annotated[bool, typer.Option("--agent/--no-agent")] = False,
+    include_closed: Annotated[bool, typer.Option("--include-closed/--open-only")] = True,
+    max_steps: Annotated[int, typer.Option("--max-steps", min=1, max=5000)] = 1000,
+) -> None:
+    """Replay Module4 predictions over historical timestamps (no future leakage)."""
+    refresh_process_env_from_file(preserve_existing=True)
+    load_settings.cache_clear()
+    settings = load_settings()
+    setup_logging(settings.log_level)
+    _ensure_windows_selector_loop()
+
+    try:
+        start_ts = parse_iso_datetime(start)
+    except ValueError as exc:
+        raise typer.BadParameter(f"invalid --start datetime: {start}") from exc
+    try:
+        end_ts = parse_iso_datetime(end)
+    except ValueError as exc:
+        raise typer.BadParameter(f"invalid --end datetime: {end}") from exc
+    if end_ts <= start_ts:
+        raise typer.BadParameter("end must be later than start")
+
+    async def _run() -> None:
+        db = _create_database(settings)
+        await db.open()
+        try:
+            service = Module4Service(db, settings)
+            await service.compile_rules(force=False)
+            cursor = start_ts
+            steps = 0
+            aggregate = {
+                "markets_total": 0,
+                "markets_with_prior": 0,
+                "snapshots_written": 0,
+                "decisions_written": 0,
+                "evidence_written": 0,
+            }
+            skipped_total: Counter[str] = Counter()
+            while cursor <= end_ts:
+                steps += 1
+                summary = await service.run_once(
+                    mode="paper_replay",
+                    source_code=source.strip().lower() or "module4",
+                    run_tag=run_tag.strip() or "auto",
+                    market_id=market_id.strip() or None,
+                    use_agent=use_agent,
+                    as_of=cursor,
+                    include_closed=include_closed,
+                )
+                aggregate["markets_total"] += summary.markets_total
+                aggregate["markets_with_prior"] += summary.markets_with_prior
+                aggregate["snapshots_written"] += summary.snapshots_written
+                aggregate["decisions_written"] += summary.decisions_written
+                aggregate["evidence_written"] += summary.evidence_written
+                skipped_total.update(summary.skipped)
+                if steps >= max_steps:
+                    break
+                cursor += timedelta(minutes=step_minutes)
+
+            payload = {
+                "mode": "paper_replay",
+                "source_code": source.strip().lower() or "module4",
+                "run_tag": summary.run_tag if steps > 0 else run_tag,
+                "start": start_ts.isoformat(),
+                "end": end_ts.isoformat(),
+                "step_minutes": step_minutes,
+                "steps": steps,
+                "max_steps": max_steps,
+                "include_closed": include_closed,
+                "agent_enabled": use_agent,
+                "aggregate": aggregate,
+                "skipped": dict(skipped_total),
+            }
+            typer.echo(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
+        finally:
+            await db.close()
+
+    asyncio.run(_run())
+
+
+@app.command("m4-stage-report")
+def m4_stage_report(
+    mode: Annotated[str, typer.Option("--mode", help="paper_replay|paper_live|shadow|live")] = "paper_replay",
+    source: Annotated[str, typer.Option("--source", help="source_code")] = "module4",
+    run_tag: Annotated[str, typer.Option("--run-tag", help="current|all|custom")] = "current",
+    since_hours: Annotated[int, typer.Option("--since-hours", min=1, max=24 * 120)] = 24 * 14,
+    ece_bins: Annotated[int, typer.Option("--ece-bins", min=5, max=30)] = 10,
+) -> None:
+    """Stage-wise accuracy report by time-to-close; compares prior vs posterior."""
+    refresh_process_env_from_file(preserve_existing=True)
+    load_settings.cache_clear()
+    settings = load_settings()
+    setup_logging(settings.log_level)
+    _ensure_windows_selector_loop()
+
+    mode_norm = mode.strip().lower()
+    if mode_norm not in {"paper_replay", "paper_live", "shadow", "live"}:
+        raise typer.BadParameter("mode must be one of: paper_replay, paper_live, shadow, live")
+    source_norm = source.strip().lower() or "module4"
+    since_start = datetime.now(tz=UTC) - timedelta(hours=since_hours)
+    # stage boundaries in hours to close: [0, 0.5), [0.5, 1), [1, 3), [3, 6), [6, 12), [12, 24), [24, 48), [48, inf)
+    stage_bins: list[tuple[str, float, float]] = [
+        ("0-30m", 0.0, 0.5),
+        ("30m-1h", 0.5, 1.0),
+        ("1h-3h", 1.0, 3.0),
+        ("3h-6h", 3.0, 6.0),
+        ("6h-12h", 6.0, 12.0),
+        ("12h-24h", 12.0, 24.0),
+        ("24h-48h", 24.0, 48.0),
+        ("48h+", 48.0, 10_000.0),
+    ]
+
+    async def _run() -> None:
+        db = _create_database(settings)
+        await db.open()
+        try:
+            service = Module4Service(db, settings)
+            run_tag_filter = await service.resolve_run_tag_filter(raw=run_tag, mode=mode_norm, source_code=source_norm)
+            params: list[object] = [since_start, mode_norm, source_norm]
+            run_clause = ""
+            if run_tag_filter:
+                run_clause = "and ps.run_tag = %s"
+                params.append(run_tag_filter)
+            rows = await db.fetch_all(
+                f"""
+                select
+                    ps.market_id,
+                    ps.tracking_id,
+                    ps.account_id,
+                    ps.prior_pmf,
+                    ps.posterior_pmf,
+                    ps.created_at,
+                    coalesce((ps.metadata->>'replay_as_of')::timestamptz, ps.created_at) as as_of_ts,
+                    tw.end_date,
+                    coalesce(
+                        (
+                            select fm.cumulative_count_est
+                            from fact_tweet_metric_1m fm
+                            where fm.account_id = ps.account_id
+                              and fm.tracking_id = ps.tracking_id
+                              and fm.minute_bucket <= tw.end_date
+                            order by fm.minute_bucket desc
+                            limit 1
+                        ),
+                        (
+                            select max(fd.cumulative_count)::int
+                            from fact_tweet_metric_daily fd
+                            where fd.account_id = ps.account_id
+                              and fd.tracking_id = ps.tracking_id
+                              and fd.metric_date <= tw.end_date::date
+                        ),
+                        0
+                    ) as final_count
+                from m4_posterior_snapshot ps
+                join dim_tracking_window tw
+                  on tw.tracking_id = ps.tracking_id
+                 and tw.account_id = ps.account_id
+                where ps.created_at >= %s
+                  and ps.mode = %s
+                  and ps.source_code = %s
+                  and ps.window_code = 'fused'
+                  {run_clause}
+                  and tw.end_date is not null
+                order by ps.created_at asc
+                """,
+                tuple(params),
+            )
+
+            grouped: dict[str, dict[str, list[float] | list[tuple[float, int]] | int]] = {
+                name: {
+                    "count": 0,
+                    "prior_log": [],
+                    "post_log": [],
+                    "prior_brier": [],
+                    "post_brier": [],
+                    "prior_points": [],
+                    "post_points": [],
+                }
+                for name, _, _ in stage_bins
+            }
+            total_points = 0
+            skipped = 0
+            for row in rows:
+                end_date = row.get("end_date")
+                as_of_ts = row.get("as_of_ts")
+                if not isinstance(end_date, datetime) or not isinstance(as_of_ts, datetime):
+                    skipped += 1
+                    continue
+                hours_to_close = (end_date - as_of_ts).total_seconds() / 3600.0
+                if hours_to_close <= 0:
+                    skipped += 1
+                    continue
+                stage_name = _pick_stage(stage_bins, hours_to_close)
+                if stage_name is None:
+                    skipped += 1
+                    continue
+                prior = _parse_pmf(row.get("prior_pmf"))
+                posterior = _parse_pmf(row.get("posterior_pmf"))
+                if not prior or not posterior:
+                    skipped += 1
+                    continue
+                final_count = int(row.get("final_count") or 0)
+                true_label = infer_true_bucket_label(final_count, posterior.keys())
+                if true_label is None:
+                    skipped += 1
+                    continue
+                p_prior = max(1e-9, float(prior.get(true_label, 0.0)))
+                p_post = max(1e-9, float(posterior.get(true_label, 0.0)))
+                g = grouped[stage_name]
+                g["count"] = int(g["count"]) + 1
+                g["prior_log"].append(math.log(p_prior))
+                g["post_log"].append(math.log(p_post))
+                g["prior_brier"].append(multiclass_brier(prior, true_label))
+                g["post_brier"].append(multiclass_brier(posterior, true_label))
+                pred_prior = _argmax_label(prior)
+                pred_post = _argmax_label(posterior)
+                g["prior_points"].append((float(prior.get(pred_prior, 0.0)), 1 if pred_prior == true_label else 0))
+                g["post_points"].append((float(posterior.get(pred_post, 0.0)), 1 if pred_post == true_label else 0))
+                total_points += 1
+
+            report_rows: list[dict[str, object]] = []
+            for name, _, _ in stage_bins:
+                g = grouped[name]
+                count = int(g["count"])
+                if count <= 0:
+                    report_rows.append({"stage": name, "count": 0})
+                    continue
+                prior_log = sum(g["prior_log"]) / count
+                post_log = sum(g["post_log"]) / count
+                prior_brier = sum(g["prior_brier"]) / count
+                post_brier = sum(g["post_brier"]) / count
+                prior_ece = expected_calibration_error(g["prior_points"], bins=ece_bins)
+                post_ece = expected_calibration_error(g["post_points"], bins=ece_bins)
+                report_rows.append(
+                    {
+                        "stage": name,
+                        "count": count,
+                        "prior_log_score": round(prior_log, 8),
+                        "posterior_log_score": round(post_log, 8),
+                        "log_score_gain_pct": round(((post_log - prior_log) / max(1e-9, abs(prior_log))) * 100.0, 4),
+                        "prior_ece": round(prior_ece, 8),
+                        "posterior_ece": round(post_ece, 8),
+                        "ece_delta": round(post_ece - prior_ece, 8),
+                        "prior_brier": round(prior_brier, 8),
+                        "posterior_brier": round(post_brier, 8),
+                        "brier_delta": round(post_brier - prior_brier, 8),
+                    }
+                )
+
+            payload = {
+                "mode": mode_norm,
+                "source_code": source_norm,
+                "run_tag": run_tag_filter or "all",
+                "since_hours": since_hours,
+                "ece_bins": ece_bins,
+                "points_total": total_points,
+                "rows_loaded": len(rows),
+                "skipped": skipped,
+                "stage_report": report_rows,
+            }
+            typer.echo(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
+        finally:
+            await db.close()
+
+    asyncio.run(_run())
+
+
 @app.command("arb-run")
 def arb_run(
     mode: Annotated[str, typer.Option("--mode", help="shadow|paper_live|live")] = "paper_live",
@@ -2219,6 +2496,45 @@ def _compute_max_drawdown(bankroll_usd: float, pnl_series: list[float]) -> tuple
             max_drawdown = drawdown
     drawdown_pct = max_drawdown / bankroll_usd if bankroll_usd > 0 else 0.0
     return max_drawdown, drawdown_pct
+
+
+def _pick_stage(stage_bins: list[tuple[str, float, float]], hours_to_close: float) -> str | None:
+    for name, lower, upper in stage_bins:
+        if lower <= hours_to_close < upper:
+            return name
+    return None
+
+
+def _parse_pmf(value: object) -> dict[str, float]:
+    if isinstance(value, dict):
+        out: dict[str, float] = {}
+        for key, raw in value.items():
+            try:
+                out[str(key)] = float(raw)
+            except (TypeError, ValueError):
+                continue
+        return out
+    if isinstance(value, str):
+        try:
+            decoded = json.loads(value)
+        except json.JSONDecodeError:
+            return {}
+        if not isinstance(decoded, dict):
+            return {}
+        out: dict[str, float] = {}
+        for key, raw in decoded.items():
+            try:
+                out[str(key)] = float(raw)
+            except (TypeError, ValueError):
+                continue
+        return out
+    return {}
+
+
+def _argmax_label(pmf: dict[str, float]) -> str:
+    if not pmf:
+        return ""
+    return max(sorted(pmf.keys()), key=lambda key: float(pmf.get(key, 0.0)))
 
 
 async def _arb_summary_by_experiment(

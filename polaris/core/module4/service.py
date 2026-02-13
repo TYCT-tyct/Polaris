@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from typing import Any
 
 from polaris.config import PolarisSettings
@@ -100,16 +100,22 @@ class Module4Service:
         run_tag: str,
         market_id: str | None = None,
         use_agent: bool | None = None,
+        as_of: datetime | None = None,
+        include_closed: bool = False,
     ) -> Module4RunSummary:
         run_tag_norm = _normalize_run_tag(run_tag)
-        markets = await self._load_target_markets(market_id=market_id)
+        now = as_of or datetime.now(tz=UTC)
+        markets = await self._load_target_markets(
+            market_id=market_id,
+            as_of=now,
+            include_closed=include_closed,
+        )
         snapshots_written = 0
         decisions_written = 0
         evidence_written = 0
         markets_with_prior = 0
         skipped: dict[str, int] = {}
         use_agent_final = self._settings.m4_agent_enabled if use_agent is None else bool(use_agent)
-        now = datetime.now(tz=UTC)
 
         for market in markets:
             rule_version = await self._rules.compile_market(market["market_id"], force=False)
@@ -120,6 +126,7 @@ class Module4Service:
             observed = await self._load_observed_count(
                 account_id=market["account_id"],
                 tracking_id=market["tracking_id"],
+                as_of=now,
             )
             progress = compute_progress(now, market["start_ts"], market["end_ts"])
             regime = await self._regime.estimate(
@@ -133,6 +140,7 @@ class Module4Service:
                 market_id=market["market_id"],
                 window_code="fused",
                 run_tag=run_tag_norm,
+                as_of=now,
             )
 
             if evidence is not None:
@@ -146,12 +154,18 @@ class Module4Service:
                 evidence_written += 1
 
             posteriors: list[M4Posterior] = []
+            prior_reliabilities: list[float] = []
             for window_code in ("short", "week"):
-                prior = await self._prior.build(market["market_id"], window_code=window_code)
+                prior = await self._prior.build(
+                    market["market_id"],
+                    window_code=window_code,
+                    as_of=now,
+                )
                 if prior is None:
                     _inc(skipped, f"prior_missing_{window_code}")
                     continue
                 markets_with_prior += 1
+                prior_reliabilities.append(prior.prior_reliability)
                 uncertainty = (evidence.uncertainty_delta if evidence else 0.0) + ((1.0 - prior.prior_reliability) * 0.15)
                 posterior = self._collapse.update(
                     market_id=market["market_id"],
@@ -175,6 +189,7 @@ class Module4Service:
                         "prior_meta": prior.metadata,
                         "regime_meta": regime.metadata,
                         "evidence_tags": list(evidence.event_tags) if evidence else [],
+                        "replay_as_of": now.isoformat(),
                     },
                 )
                 snapshots_written += 1
@@ -184,12 +199,7 @@ class Module4Service:
                 continue
 
             fused = self._conductor.fuse_posteriors(posteriors)
-            reliabilities = []
-            for window_code in ("short", "week"):
-                prior = await self._prior.build(market["market_id"], window_code=window_code)
-                if prior is not None:
-                    reliabilities.append(prior.prior_reliability)
-            prior_reliability = (sum(reliabilities) / len(reliabilities)) if reliabilities else 0.0
+            prior_reliability = (sum(prior_reliabilities) / len(prior_reliabilities)) if prior_reliabilities else 0.0
             decision = self._conductor.decide(posterior=fused, prior_reliability=prior_reliability)
             await self._persist_snapshot(
                 run_tag=run_tag_norm,
@@ -202,6 +212,7 @@ class Module4Service:
                 metadata={
                     "component_windows": [p.window_code for p in posteriors],
                     "evidence_tags": list(evidence.event_tags) if evidence else [],
+                    "replay_as_of": now.isoformat(),
                 },
             )
             snapshots_written += 1
@@ -216,6 +227,7 @@ class Module4Service:
                 metadata={
                     "evidence_tags": list(evidence.event_tags) if evidence else [],
                     "evidence_confidence": evidence.confidence if evidence else 0.0,
+                    "replay_as_of": now.isoformat(),
                 },
             )
             decisions_written += 1
@@ -249,6 +261,23 @@ class Module4Service:
             window_code=window_code,
             since_hours=since_hours,
             persist=persist,
+        )
+
+    async def score_staged(
+        self,
+        *,
+        mode: str,
+        source_code: str,
+        run_tag: str | None,
+        window_code: str = "fused",
+        since_hours: int | None = None,
+    ) -> dict[str, M4ScoreResult]:
+        return await self._scorer.score_staged(
+            mode=mode,
+            source_code=source_code,
+            run_tag=run_tag,
+            window_code=window_code,
+            since_hours=since_hours,
         )
 
     async def top_candidates(
@@ -299,9 +328,19 @@ class Module4Service:
             return str(row["run_tag"])
         return None
 
-    async def _load_target_markets(self, *, market_id: str | None = None) -> list[dict[str, Any]]:
-        params: list[Any] = []
+    async def _load_target_markets(
+        self,
+        *,
+        market_id: str | None = None,
+        as_of: datetime | None = None,
+        include_closed: bool = False,
+    ) -> list[dict[str, Any]]:
+        as_of_ts = as_of or datetime.now(tz=UTC)
+        params: list[Any] = [as_of_ts, as_of_ts, as_of_ts]
         market_clause = ""
+        state_clause = ""
+        if not include_closed:
+            state_clause = "and m.closed = false and m.active = true"
         if market_id:
             market_clause = "and m.market_id = %s"
             params.append(market_id)
@@ -330,13 +369,15 @@ class Module4Service:
             left join dim_tracking_window tw
               on tw.tracking_id = r.tracking_id
              and tw.account_id = r.account_id
-            where m.closed = false
-              and m.active = true
+            where
+                  coalesce(m.start_date, tw.start_date) <= %s
+              and coalesce(m.end_date, tw.end_date) > %s
+              and coalesce(m.end_date, tw.end_date) > %s - interval '8 days'
+              {state_clause}
               and (
                     m.question ilike '%%tweet%%'
                  or m.slug ilike '%%tweet%%'
               )
-              and coalesce(m.end_date, tw.end_date) > now() - interval '8 days'
               {market_clause}
             order by coalesce(m.end_date, tw.end_date) asc, m.market_id asc
             """,
@@ -361,17 +402,18 @@ class Module4Service:
             )
         return out
 
-    async def _load_observed_count(self, *, account_id: str, tracking_id: str) -> int:
+    async def _load_observed_count(self, *, account_id: str, tracking_id: str, as_of: datetime) -> int:
         row = await self._db.fetch_one(
             """
             select cumulative_count_est
             from fact_tweet_metric_1m
             where account_id = %s
               and tracking_id = %s
+              and minute_bucket <= %s
             order by minute_bucket desc
             limit 1
             """,
-            (account_id, tracking_id),
+            (account_id, tracking_id, as_of),
         )
         if row and row.get("cumulative_count_est") is not None:
             return int(row["cumulative_count_est"])
@@ -381,8 +423,9 @@ class Module4Service:
             from fact_tweet_metric_daily
             where account_id = %s
               and tracking_id = %s
+              and metric_date <= %s::date
             """,
-            (account_id, tracking_id),
+            (account_id, tracking_id, as_of),
         )
         return int(day["c"] if day and day["c"] is not None else 0)
 
@@ -394,6 +437,7 @@ class Module4Service:
         market_id: str,
         window_code: str,
         run_tag: str,
+        as_of: datetime,
     ) -> M4Evidence | None:
         if not enabled:
             return None
@@ -402,6 +446,7 @@ class Module4Service:
             market_id=market_id,
             window_code=window_code,
             run_tag=run_tag,
+            as_of=as_of,
         )
 
     async def _persist_snapshot(
@@ -573,4 +618,3 @@ def _normalize_run_tag(raw: str) -> str:
 
 def _to_json(payload: object) -> str:
     return json.dumps(payload, ensure_ascii=True, separators=(",", ":"), default=str)
-

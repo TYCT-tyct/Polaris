@@ -40,12 +40,14 @@ class RegimeEngine:
             from fact_tweet_post
             where account_id = %s
               and posted_at >= %s
+              and posted_at <= %s
             """,
             (
                 now - timedelta(minutes=30),
                 now - timedelta(minutes=120),
                 account_id,
                 now - timedelta(minutes=120),
+                now,
             ),
         )
         posts_30m = int(row["c30"] if row and row["c30"] is not None else 0)

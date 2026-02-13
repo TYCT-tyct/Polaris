@@ -62,10 +62,10 @@ class M4Scorer:
             predicted_label = _argmax_label(posterior)
             pred_conf = max(0.0, min(1.0, float(posterior.get(predicted_label, 0.0))))
             ece_pairs.append((pred_conf, 1 if predicted_label == true_label else 0))
-            brier_values.append(_brier_multiclass(posterior, true_label))
+            brier_values.append(multiclass_brier(posterior, true_label))
 
         log_score = (sum(log_values) / len(log_values)) if log_values else None
-        ece = _expected_calibration_error(ece_pairs, bins=self._cfg.ece_bins) if ece_pairs else None
+        ece = expected_calibration_error(ece_pairs, bins=self._cfg.ece_bins) if ece_pairs else None
         brier = (sum(brier_values) / len(brier_values)) if brier_values else None
 
         realized_net, max_drawdown = await self._realized_metrics(
@@ -161,6 +161,100 @@ class M4Scorer:
                 break
         return out
 
+    async def score_staged(
+        self,
+        *,
+        mode: str,
+        source_code: str,
+        run_tag: str | None,
+        window_code: str = "fused",
+        since_hours: int | None = None,
+    ) -> dict[str, M4ScoreResult]:
+        hours = int(since_hours or self._cfg.since_hours)
+        since_ts = datetime.now(tz=UTC) - timedelta(hours=max(1, hours))
+        rows = await self._load_scoring_rows(
+            mode=mode,
+            source_code=source_code,
+            run_tag=run_tag,
+            window_code=window_code,
+            since_ts=since_ts,
+        )
+
+        # Define stages (hours remaining)
+        stages = {
+            "24h+": lambda rem: rem >= 24.0,
+            "12-24h": lambda rem: 12.0 <= rem < 24.0,
+            "06-12h": lambda rem: 6.0 <= rem < 12.0,
+            "01-06h": lambda rem: 1.0 <= rem < 6.0,
+            "<01h": lambda rem: rem < 1.0,
+        }
+
+        buckets: dict[str, list[dict]] = {k: [] for k in stages}
+
+        for row in rows:
+            created_at = row["created_at"]
+            end_date = row.get("end_date")
+            if not isinstance(created_at, datetime) or not isinstance(end_date, datetime):
+                continue
+
+            rem_hours = (end_date - created_at).total_seconds() / 3600.0
+            if rem_hours < 0:
+                continue # Already settled
+
+            for label, func in stages.items():
+                if func(rem_hours):
+                    buckets[label].append(row)
+                    break
+
+        results = {}
+        for label, bucket_rows in buckets.items():
+            if not bucket_rows:
+                continue
+
+            log_values: list[float] = []
+            ece_pairs: list[tuple[float, int]] = []
+            brier_values: list[float] = []
+
+            for row in bucket_rows:
+                posterior = row["posterior"]
+                if not posterior:
+                    continue
+                true_label = infer_true_bucket_label(row["final_count"], posterior.keys())
+                if true_label is None:
+                    continue
+                p_true = max(1e-9, float(posterior.get(true_label, 0.0)))
+                log_values.append(math.log(p_true))
+                predicted_label = _argmax_label(posterior)
+                pred_conf = max(0.0, min(1.0, float(posterior.get(predicted_label, 0.0))))
+                ece_pairs.append((pred_conf, 1 if predicted_label == true_label else 0))
+                brier_values.append(multiclass_brier(posterior, true_label))
+
+            log_score = (sum(log_values) / len(log_values)) if log_values else None
+            ece = expected_calibration_error(ece_pairs, bins=self._cfg.ece_bins) if ece_pairs else None
+            brier = (sum(brier_values) / len(brier_values)) if brier_values else None
+
+            # Note: Realized PnL is hard to stage without granular trade logs, omitting for now
+            # We can approximate or just leave it 0
+
+            results[label] = M4ScoreResult(
+                run_tag=run_tag or "staged",
+                mode=mode,
+                source_code=source_code,
+                window_code=window_code,
+                since_hours=hours,
+                markets_scored=len(log_values),
+                log_score=log_score,
+                ece=ece,
+                brier=brier,
+                realized_net_pnl_usd=0.0,
+                max_drawdown_usd=0.0,
+                score_total=0.0, # Not used for staging
+                score_breakdown={},
+                metadata={"stage": label, "count": len(bucket_rows)},
+            )
+
+        return results
+
     async def _load_scoring_rows(
         self,
         *,
@@ -178,7 +272,7 @@ class M4Scorer:
         rows = await self._db.fetch_all(
             f"""
             with latest as (
-                select distinct on (ps.market_id, ps.window_code, coalesce(ps.tracking_id, ''), coalesce(ps.account_id, ''))
+                select
                     ps.market_id,
                     ps.window_code,
                     ps.tracking_id,
@@ -195,7 +289,10 @@ class M4Scorer:
                   and ps.source_code = %s
                   and ps.window_code = %s
                   {run_clause}
-                order by ps.market_id, ps.window_code, coalesce(ps.tracking_id, ''), coalesce(ps.account_id, ''), ps.created_at desc
+                -- For staging, we might want ALL snapshots, not just distinct/latest per market
+                -- But distinct gives the 'latest view', which is biased if run_tag spans time
+                -- If run_tag is a replay, we want ALL points.
+                -- Let's remove distinct on to get dense data for replay.
             )
             select
                 l.market_id,
@@ -203,6 +300,7 @@ class M4Scorer:
                 l.tracking_id,
                 l.account_id,
                 l.posterior_pmf,
+                l.created_at,
                 l.end_date,
                 coalesce(
                     (
@@ -226,6 +324,7 @@ class M4Scorer:
             from latest l
             where l.end_date is not null
               and l.end_date <= now()
+            order by l.created_at asc
             """,
             tuple(params),
         )
@@ -238,6 +337,8 @@ class M4Scorer:
                     "window_code": row["window_code"],
                     "final_count": int(row.get("final_count") or 0),
                     "posterior": {str(k): float(v) for k, v in posterior.items()},
+                    "created_at": row["created_at"],
+                    "end_date": row["end_date"],
                 }
             )
         return parsed
@@ -353,7 +454,7 @@ def _argmax_label(pmf: dict[str, float]) -> str:
     return max(sorted(pmf.keys()), key=lambda key: float(pmf.get(key, 0.0)))
 
 
-def _brier_multiclass(pmf: dict[str, float], true_label: str) -> float:
+def multiclass_brier(pmf: dict[str, float], true_label: str) -> float:
     labels = list(pmf.keys())
     if not labels:
         return 1.0
@@ -366,7 +467,7 @@ def _brier_multiclass(pmf: dict[str, float], true_label: str) -> float:
     return err / float(k)
 
 
-def _expected_calibration_error(points: list[tuple[float, int]], *, bins: int) -> float:
+def expected_calibration_error(points: list[tuple[float, int]], *, bins: int) -> float:
     if not points:
         return 1.0
     n = len(points)
@@ -384,4 +485,3 @@ def _expected_calibration_error(points: list[tuple[float, int]], *, bins: int) -
         mean_acc = corr_sum / count
         ece += (count / n) * abs(mean_conf - mean_acc)
     return float(ece)
-

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from datetime import datetime
 
 from polaris.core.module4.types import M4Evidence
 
@@ -30,6 +31,7 @@ class EvidenceAgent:
         market_id: str,
         window_code: str,
         run_tag: str,
+        as_of: datetime | None = None,
     ) -> M4Evidence:
         if not self._cfg.enabled:
             return M4Evidence(
@@ -56,6 +58,7 @@ class EvidenceAgent:
                     posts = await self._tools.fetch_recent_posts(
                         account_id=account_id,
                         lookback_minutes=240 if window_code == "week" else 120,
+                        as_of=as_of,
                         limit=160,
                     )
                     calls_used += 1
@@ -93,6 +96,7 @@ class EvidenceAgent:
                             account_id=account_id,
                             lookback_minutes=240,
                             keywords=words,
+                            as_of=as_of,
                         )
                         hits_total += hits
                         if hits > 0:
@@ -136,4 +140,3 @@ class EvidenceAgent:
                 "max_calls": self._cfg.max_calls,
             },
         )
-

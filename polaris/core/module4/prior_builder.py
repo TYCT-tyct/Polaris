@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from polaris.db.pool import Database
@@ -23,22 +24,41 @@ class MarketPriorBuilder:
         self._db = db
         self._cfg = config or PriorBuilderConfig()
 
-    async def build(self, market_id: str, *, window_code: str) -> PriorBuildResult | None:
+    async def build(
+        self,
+        market_id: str,
+        *,
+        window_code: str,
+        as_of: datetime | None = None,
+    ) -> PriorBuildResult | None:
+        as_of_ts = as_of or datetime.now(tz=UTC)
         quote_rows = await self._db.fetch_all(
             """
+            with latest_quote as (
+                select distinct on (token_id)
+                    token_id,
+                    best_bid,
+                    best_ask,
+                    mid,
+                    spread
+                from fact_quote_top_raw
+                where market_id = %s
+                  and captured_at <= %s
+                order by token_id, captured_at desc
+            )
             select
                 t.token_id,
                 t.outcome_label,
-                q.best_bid,
-                q.best_ask,
-                q.mid,
-                q.spread
+                lq.best_bid,
+                lq.best_ask,
+                lq.mid,
+                lq.spread
             from dim_token t
-            left join view_quote_latest q on q.token_id = t.token_id
+            left join latest_quote lq on lq.token_id = t.token_id
             where t.market_id = %s
             order by t.outcome_index asc, t.token_id asc
             """,
-            (market_id,),
+            (market_id, as_of_ts, market_id),
         )
         if not quote_rows:
             return None
@@ -52,12 +72,13 @@ class MarketPriorBuilder:
                     ask_depth_2pct
                 from fact_quote_depth_raw
                 where market_id = %s
+                  and captured_at <= %s
                 order by token_id, captured_at desc
             )
             select token_id, bid_depth_2pct, ask_depth_2pct
             from latest
             """,
-            (market_id,),
+            (market_id, as_of_ts),
         )
         depth_by_token = {
             str(row["token_id"]): (float(row["bid_depth_2pct"] or 0.0) + float(row["ask_depth_2pct"] or 0.0))
@@ -69,9 +90,10 @@ class MarketPriorBuilder:
             select count(*)::int as c
             from fact_quote_top_raw
             where token_id = any(%s::text[])
-              and captured_at >= now() - interval '10 minutes'
+              and captured_at >= %s
+              and captured_at <= %s
             """,
-            (token_ids,),
+            (token_ids, as_of_ts - timedelta(minutes=10), as_of_ts),
         )
         sample_count_10m = int(sample_count_row["c"] if sample_count_row else 0)
 

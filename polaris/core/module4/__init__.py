@@ -3,7 +3,7 @@ from .conductor import Conductor, ConductorConfig
 from .prior_builder import MarketPriorBuilder, PriorBuilderConfig
 from .regime_engine import RegimeEngine, compute_progress
 from .rule_compiler import RuleCompiler, RuleVersion, compile_rule_policy, compute_rule_hash
-from .scorer import M4ScoreConfig, M4Scorer
+from .scorer import M4ScoreConfig, M4Scorer, expected_calibration_error, multiclass_brier
 from .service import Module4RunSummary, Module4Service
 from .types import (
     BucketRange,
@@ -45,4 +45,6 @@ __all__ = [
     "compile_rule_policy",
     "compute_progress",
     "compute_rule_hash",
+    "expected_calibration_error",
+    "multiclass_brier",
 ]
