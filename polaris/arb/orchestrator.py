@@ -27,11 +27,13 @@ from polaris.arb.contracts import (
 from polaris.arb.execution.order_router import OrderRouter
 from polaris.arb.execution.risk_gate import RiskGate, RiskRuntimeState
 from polaris.arb.execution.sizer import capped_notional
+from polaris.arb.execution.fill_simulator import simulate_buy_fill, simulate_sell_fill
 from polaris.arb.strategies.strategy_a import StrategyA
 from polaris.arb.strategies.strategy_b import StrategyB
 from polaris.arb.strategies.strategy_c import StrategyC
 from polaris.arb.strategies.strategy_f import StrategyF
 from polaris.arb.strategies.strategy_g import StrategyG
+from polaris.arb.paper.exit_rules import decide_exit_reason, exit_rule_for_strategy
 from polaris.db.pool import Database
 from polaris.sources.clob_client import ClobClient
 
@@ -60,6 +62,7 @@ class ArbOrchestrator:
         self._universe_cache_until: datetime | None = None
         self._last_snapshot_metrics: dict[str, int | float | bool] = {}
         self._last_portfolio_snapshot_at: dict[str, datetime] = {}
+        self._last_exit_check_at: datetime | None = None
 
         self.strategy_a = StrategyA(config)
         self.strategy_b = StrategyB(config)
@@ -341,6 +344,8 @@ class ArbOrchestrator:
         if scan_diag:
             await self._record_scan_diag(mode, source_code, scan_diag)
         if mode in {RunMode.PAPER_LIVE, RunMode.PAPER_REPLAY}:
+            await self._maybe_exit_paper_positions(mode, source_code, risk_states, cash_balances, snapshot_map)
+        if mode in {RunMode.PAPER_LIVE, RunMode.PAPER_REPLAY}:
             await self._maybe_record_portfolio_snapshots(mode, source_code, risk_states, cash_balances, snapshot_map)
 
         if mode == RunMode.PAPER_LIVE:
@@ -358,6 +363,368 @@ class ArbOrchestrator:
             "process_ms": process_ms,
             "total_ms": total_ms,
         }
+
+    async def _maybe_exit_paper_positions(
+        self,
+        mode: RunMode,
+        source_code: str,
+        risk_states: dict[str, RiskRuntimeState],
+        cash_balances: dict[str, float],
+        snapshot_map: dict[str, TokenSnapshot],
+    ) -> int:
+        if not self.config.paper_exit_enabled:
+            return 0
+        now = datetime.now(tz=UTC)
+        interval = max(1, int(self.config.paper_exit_check_interval_sec))
+        if self._last_exit_check_at is not None and (now - self._last_exit_check_at).total_seconds() < interval:
+            return 0
+        self._last_exit_check_at = now
+        return await self._exit_paper_positions(mode, source_code, risk_states, cash_balances, snapshot_map, now=now)
+
+    async def _exit_paper_positions(
+        self,
+        mode: RunMode,
+        source_code: str,
+        risk_states: dict[str, RiskRuntimeState],
+        cash_balances: dict[str, float],
+        snapshot_map: dict[str, TokenSnapshot],
+        *,
+        now: datetime,
+        limit: int = 200,
+    ) -> int:
+        run_tag = self.config.run_tag
+        # 只处理当前 run_tag 的 open lot，避免和别的后台任务互相干扰。
+        lots = await self.db.fetch_all(
+            """
+            select
+                position_id,
+                strategy_code,
+                market_id,
+                token_id,
+                side,
+                open_price,
+                open_size,
+                open_notional_usd,
+                remaining_size,
+                opened_at,
+                open_intent_id
+            from arb_position_lot
+            where mode = %s
+              and source_code = %s
+              and run_tag = %s
+              and status = 'open'
+              and coalesce(remaining_size, 0) > 0
+            order by opened_at asc
+            limit %s
+            """,
+            (mode.value, source_code, run_tag, int(limit)),
+        )
+        if not lots:
+            return 0
+
+        closed = 0
+        for lot in lots:
+            strategy_code = str(lot["strategy_code"] or "").strip().upper()
+            rule = exit_rule_for_strategy(self.config, strategy_code)
+            if rule is None:
+                continue
+
+            token_id = str(lot["token_id"])
+            snap = snapshot_map.get(token_id)
+            if snap is None:
+                await self.risk_gate.record_risk_event(
+                    mode,
+                    StrategyCode(strategy_code) if strategy_code in {"A", "B", "C", "F", "G"} else None,
+                    source_code,
+                    RiskDecision(
+                        allowed=False,
+                        level=RiskLevel.WARN,
+                        reason="paper_exit_missing_snapshot",
+                        payload={"run_tag": run_tag, "token_id": token_id, "position_id": str(lot["position_id"])},
+                    ),
+                )
+                continue
+
+            open_notional = float(lot["open_notional_usd"] or 0.0)
+            if open_notional <= 0:
+                continue
+            remaining = float(lot["remaining_size"] or lot["open_size"] or 0.0)
+            if remaining <= 0:
+                continue
+
+            opened_at = lot["opened_at"]
+            hold_minutes = max(0.0, (now - opened_at).total_seconds() / 60.0) if opened_at else 0.0
+
+            # 先用“立即平仓”的可执行成交额估计浮动盈亏，再决定是否触发退出。
+            open_side = str(lot["side"] or "BUY").upper()
+            close_side = "SELL" if open_side == "BUY" else "BUY"
+            if close_side == "SELL":
+                sim = simulate_sell_fill(snap.bids, remaining, allow_partial=False)
+                close_notional = sim.notional if sim is not None else 0.0
+                unrealized = close_notional - open_notional
+            else:
+                sim = simulate_buy_fill(snap.asks, remaining, allow_partial=False)
+                close_notional = sim.notional if sim is not None else 0.0
+                unrealized = open_notional - close_notional
+
+            reason, pnl_pct = decide_exit_reason(
+                rule,
+                hold_minutes=hold_minutes,
+                unrealized_pnl_usd=unrealized,
+                open_notional_usd=open_notional,
+            )
+            if reason is None:
+                continue
+            if sim is None or close_notional <= 0:
+                await self.risk_gate.record_risk_event(
+                    mode,
+                    StrategyCode(strategy_code) if strategy_code in {"A", "B", "C", "F", "G"} else None,
+                    source_code,
+                    RiskDecision(
+                        allowed=False,
+                        level=RiskLevel.WARN,
+                        reason="paper_exit_insufficient_liquidity",
+                        payload={
+                            "run_tag": run_tag,
+                            "token_id": token_id,
+                            "position_id": str(lot["position_id"]),
+                            "exit_reason": reason,
+                        },
+                    ),
+                )
+                continue
+
+            # 执行平仓：写 intent/event/fill + 现金流水 + 平仓 lot + 交易结果。
+            close_price = float(sim.avg_price)
+            fee = float(close_notional) * max(0.0, float(self.config.fee_bps)) / 10_000.0
+            gross_pnl = unrealized
+            net_pnl = gross_pnl - fee
+
+            # 资金池：paper_split_by_strategy=false 时全部记入 shared 现金账本。
+            ledger_strategy = strategy_code if self._paper_strategy_split(mode) else "shared"
+            scope_key = f"{mode.value}:{source_code}:{strategy_code}" if self._paper_strategy_split(mode) else f"{mode.value}:{source_code}:shared"
+            state = risk_states.get(scope_key)
+            if state is None:
+                state = await self.risk_gate.load_state(
+                    mode,
+                    source_code,
+                    strategy_code=StrategyCode(strategy_code) if self._paper_strategy_split(mode) else None,
+                )
+                risk_states[scope_key] = state
+                cash_balances[scope_key] = await self._load_latest_cash_balance(
+                    mode,
+                    source_code,
+                    StrategyCode(strategy_code) if self._paper_strategy_split(mode) else None,
+                )
+
+            intent_row = await self.db.fetch_one(
+                """
+                insert into arb_order_intent(
+                    signal_id, mode, strategy_code, source_code, order_index, market_id, token_id,
+                    side, order_type, limit_price, shares, notional_usd, status, payload, created_at
+                )
+                values (null, %s, %s, %s, 0, %s, %s, %s, 'PAPER_CLOSE', null, %s, %s, 'filled',
+                        %s::jsonb, %s)
+                returning intent_id
+                """,
+                (
+                    mode.value,
+                    strategy_code,
+                    source_code,
+                    str(lot["market_id"]),
+                    token_id,
+                    close_side,
+                    remaining,
+                    close_notional,
+                    json.dumps(
+                        {
+                            "run_tag": run_tag,
+                            "execution_backend": self.config.execution_backend,
+                            "trade_kind": "exit",
+                            "exit_reason": reason,
+                            "pnl_pct": pnl_pct,
+                            "position_id": str(lot["position_id"]),
+                            "open_intent_id": str(lot["open_intent_id"]) if lot.get("open_intent_id") else None,
+                        },
+                        ensure_ascii=True,
+                    ),
+                    now,
+                ),
+            )
+            intent_id = str(intent_row["intent_id"]) if intent_row else None
+            if not intent_id:
+                continue
+
+            await self.db.execute(
+                """
+                insert into arb_order_event(intent_id, event_type, status_code, message, payload, created_at)
+                values (%s, 'fill', 200, 'paper_close_fill', %s::jsonb, %s)
+                """,
+                (
+                    intent_id,
+                    json.dumps(
+                        {"run_tag": run_tag, "position_id": str(lot["position_id"]), "exit_reason": reason},
+                        ensure_ascii=True,
+                    ),
+                    now,
+                ),
+            )
+            await self.db.execute(
+                """
+                insert into arb_fill(intent_id, market_id, token_id, side, fill_price, fill_size, fill_notional_usd, fee_usd, created_at)
+                values (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    intent_id,
+                    str(lot["market_id"]),
+                    token_id,
+                    close_side,
+                    close_price,
+                    remaining,
+                    close_notional,
+                    fee,
+                    now,
+                ),
+            )
+
+            before = float(cash_balances.get(scope_key, state.cash_balance_usd))
+            if close_side == "SELL":
+                delta = close_notional
+                entry_type = "sell_proceeds"
+            else:
+                delta = -close_notional
+                entry_type = "buy_cost"
+            after = before + delta
+            await self.db.execute(
+                """
+                insert into arb_cash_ledger(
+                    mode, strategy_code, source_code, entry_type, amount_usd,
+                    balance_before_usd, balance_after_usd, ref_signal_id, ref_intent_id, payload, created_at
+                )
+                values (%s, %s, %s, %s, %s, %s, %s, null, %s, %s::jsonb, %s)
+                """,
+                (
+                    mode.value,
+                    ledger_strategy,
+                    source_code,
+                    entry_type,
+                    float(delta),
+                    before,
+                    after,
+                    intent_id,
+                    json.dumps(
+                        {
+                            "run_tag": run_tag,
+                            "execution_backend": self.config.execution_backend,
+                            "trade_kind": "exit",
+                            "exit_reason": reason,
+                            "position_id": str(lot["position_id"]),
+                            "strategy_code": strategy_code,
+                        },
+                        ensure_ascii=True,
+                    ),
+                    now,
+                ),
+            )
+            if fee > 0:
+                before_fee = after
+                after_fee = before_fee - fee
+                await self.db.execute(
+                    """
+                    insert into arb_cash_ledger(
+                        mode, strategy_code, source_code, entry_type, amount_usd,
+                        balance_before_usd, balance_after_usd, ref_signal_id, ref_intent_id, payload, created_at
+                    )
+                    values (%s, %s, %s, 'fee', %s, %s, %s, null, %s, %s::jsonb, %s)
+                    """,
+                    (
+                        mode.value,
+                        ledger_strategy,
+                        source_code,
+                        -float(fee),
+                        before_fee,
+                        after_fee,
+                        intent_id,
+                        json.dumps(
+                            {
+                                "run_tag": run_tag,
+                                "execution_backend": self.config.execution_backend,
+                                "trade_kind": "exit",
+                                "exit_reason": reason,
+                                "position_id": str(lot["position_id"]),
+                                "strategy_code": strategy_code,
+                                "fee_usd": fee,
+                            },
+                            ensure_ascii=True,
+                        ),
+                        now,
+                    ),
+                )
+                after = after_fee
+
+            cash_balances[scope_key] = after
+            state.cash_balance_usd = after
+            state.exposure_usd = max(0.0, float(state.exposure_usd) - open_notional)
+
+            await self.db.execute(
+                """
+                update arb_position_lot
+                set status = 'closed',
+                    remaining_size = 0,
+                    closed_at = %s,
+                    close_price = %s,
+                    realized_pnl_usd = %s
+                where position_id = %s
+                """,
+                (now, close_price, net_pnl, str(lot["position_id"])),
+            )
+            await self.db.execute(
+                """
+                insert into arb_trade_result(
+                    signal_id, mode, strategy_code, source_code, status,
+                    gross_pnl_usd, fees_usd, slippage_usd, net_pnl_usd, capital_used_usd,
+                    hold_minutes, opened_at, closed_at, metadata, created_at
+                )
+                values (
+                    null, %s, %s, %s, 'closed',
+                    %s, %s, 0, %s, %s,
+                    %s, %s, %s, %s::jsonb, %s
+                )
+                """,
+                (
+                    mode.value,
+                    strategy_code,
+                    source_code,
+                    gross_pnl,
+                    fee,
+                    net_pnl,
+                    open_notional,
+                    hold_minutes,
+                    opened_at,
+                    now,
+                    json.dumps(
+                        {
+                            "run_tag": run_tag,
+                            "execution_backend": self.config.execution_backend,
+                            "trade_kind": "exit",
+                            "exit_reason": reason,
+                            "position_id": str(lot["position_id"]),
+                            "open_intent_id": str(lot["open_intent_id"]) if lot.get("open_intent_id") else None,
+                            "close_intent_id": intent_id,
+                            "open_notional_usd": open_notional,
+                            "close_notional_usd": close_notional,
+                            "open_side": open_side,
+                            "close_side": close_side,
+                            "pnl_pct": pnl_pct,
+                        },
+                        ensure_ascii=True,
+                    ),
+                    now,
+                ),
+            )
+            closed += 1
+
+        return closed
 
     async def run_forever(self, mode: RunMode, source_code: str = "polymarket") -> None:
         while True:

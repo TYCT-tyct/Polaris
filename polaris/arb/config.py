@@ -63,6 +63,16 @@ class ArbConfig:
     paper_split_by_strategy: bool
     paper_enforce_bankroll: bool
     paper_portfolio_snapshot_interval_sec: int
+    paper_exit_enabled: bool
+    paper_exit_check_interval_sec: int
+    paper_exit_strategies: tuple[str, ...]
+    paper_exit_min_hold_minutes: int
+    paper_exit_f_take_profit_pct: float
+    paper_exit_f_stop_loss_pct: float
+    paper_exit_f_max_hold_minutes: int
+    paper_exit_g_take_profit_pct: float
+    paper_exit_g_stop_loss_pct: float
+    paper_exit_g_max_hold_minutes: int
 
     enable_strategy_a: bool
     enable_strategy_b: bool
@@ -145,6 +155,20 @@ def arb_config_from_settings(settings: PolarisSettings) -> ArbConfig:
         paper_split_by_strategy=settings.arb_paper_split_by_strategy,
         paper_enforce_bankroll=settings.arb_paper_enforce_bankroll,
         paper_portfolio_snapshot_interval_sec=settings.arb_paper_portfolio_snapshot_interval_sec,
+        paper_exit_enabled=settings.arb_paper_exit_enabled,
+        paper_exit_check_interval_sec=settings.arb_paper_exit_check_interval_sec,
+        paper_exit_strategies=tuple(
+            part.strip().upper()
+            for part in (settings.arb_paper_exit_strategies or "F,G").split(",")
+            if part.strip()
+        ),
+        paper_exit_min_hold_minutes=settings.arb_paper_exit_min_hold_minutes,
+        paper_exit_f_take_profit_pct=settings.arb_paper_exit_f_take_profit_pct,
+        paper_exit_f_stop_loss_pct=settings.arb_paper_exit_f_stop_loss_pct,
+        paper_exit_f_max_hold_minutes=settings.arb_paper_exit_f_max_hold_minutes,
+        paper_exit_g_take_profit_pct=settings.arb_paper_exit_g_take_profit_pct,
+        paper_exit_g_stop_loss_pct=settings.arb_paper_exit_g_stop_loss_pct,
+        paper_exit_g_max_hold_minutes=settings.arb_paper_exit_g_max_hold_minutes,
         enable_strategy_a=settings.arb_enable_strategy_a,
         enable_strategy_b=settings.arb_enable_strategy_b,
         enable_strategy_c=settings.arb_enable_strategy_c,

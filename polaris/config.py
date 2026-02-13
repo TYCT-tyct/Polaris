@@ -130,6 +130,16 @@ class PolarisSettings(BaseSettings):
     arb_paper_split_by_strategy: bool = Field(default=False)
     arb_paper_enforce_bankroll: bool = Field(default=True)
     arb_paper_portfolio_snapshot_interval_sec: int = Field(default=60)
+    arb_paper_exit_enabled: bool = Field(default=True)
+    arb_paper_exit_check_interval_sec: int = Field(default=60)
+    arb_paper_exit_strategies: str = Field(default="F,G")
+    arb_paper_exit_min_hold_minutes: int = Field(default=3)
+    arb_paper_exit_f_take_profit_pct: float = Field(default=0.02)
+    arb_paper_exit_f_stop_loss_pct: float = Field(default=0.03)
+    arb_paper_exit_f_max_hold_minutes: int = Field(default=240)
+    arb_paper_exit_g_take_profit_pct: float = Field(default=0.015)
+    arb_paper_exit_g_stop_loss_pct: float = Field(default=0.025)
+    arb_paper_exit_g_max_hold_minutes: int = Field(default=180)
 
     # module2: strategy switches
     arb_enable_strategy_a: bool = Field(default=True)
