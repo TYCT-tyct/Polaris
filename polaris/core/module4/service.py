@@ -59,6 +59,7 @@ class Module4Service:
         )
         self._regime = RegimeEngine(db)
         semantic_provider = (settings.m4_semantic_provider or "").strip().lower()
+        semantic_timeout = _provider_timeout_floor(semantic_provider, settings.m4_semantic_timeout_sec)
         semantic_api_key = settings.m4_semantic_api_key
         if not semantic_api_key:
             if semantic_provider == "minimax":
@@ -72,7 +73,7 @@ class Module4Service:
                 model=settings.m4_semantic_model,
                 api_key=semantic_api_key,
                 base_url=settings.m4_semantic_base_url,
-                timeout_sec=settings.m4_semantic_timeout_sec,
+                timeout_sec=semantic_timeout,
                 max_calls=settings.m4_semantic_max_calls,
                 confidence_floor=settings.m4_semantic_confidence_floor,
                 json_strict=settings.m4_semantic_json_strict,
@@ -96,7 +97,7 @@ class Module4Service:
             EvidenceAgentConfig(
                 enabled=settings.m4_agent_enabled,
                 max_calls=settings.m4_semantic_max_calls,
-                timeout_sec=settings.m4_semantic_timeout_sec,
+                timeout_sec=semantic_timeout,
                 confidence_floor=settings.m4_semantic_confidence_floor,
                 fail_mode=settings.m4_semantic_fail_mode,
                 model=settings.m4_semantic_model,
@@ -684,3 +685,10 @@ def _normalize_run_tag(raw: str) -> str:
 
 def _to_json(payload: object) -> str:
     return json.dumps(payload, ensure_ascii=True, separators=(",", ":"), default=str)
+
+
+def _provider_timeout_floor(provider: str, configured: float) -> float:
+    value = float(configured)
+    if provider == "minimax":
+        return max(8.0, value)
+    return max(0.2, value)

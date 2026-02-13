@@ -171,12 +171,48 @@ def _parse_json_payload(text: str, *, strict: bool) -> dict[str, Any]:
         raw = raw.strip("`")
         if raw.lower().startswith("json"):
             raw = raw[4:].strip()
-    parsed = json.loads(raw)
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        candidate = _extract_first_json_object(raw)
+        if candidate is None:
+            raise
+        parsed = json.loads(candidate)
     if strict and not isinstance(parsed, dict):
         raise ValueError("semantic payload must be a JSON object")
     if isinstance(parsed, dict):
         return parsed
     return {}
+
+
+def _extract_first_json_object(text: str) -> str | None:
+    start = text.find("{")
+    if start < 0:
+        return None
+    depth = 0
+    in_string = False
+    escaped = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+            continue
+        if ch == "{":
+            depth += 1
+            continue
+        if ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : i + 1]
+    return None
 
 
 def _to_signal(payload: dict[str, Any], *, model: str, usage: dict[str, Any], raw_text: str) -> M4SemanticSignal:

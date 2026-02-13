@@ -111,6 +111,33 @@ async def test_llm_semantic_agent_parse_failure_returns_error(monkeypatch: pytes
 
 
 @pytest.mark.asyncio
+async def test_llm_semantic_agent_parses_json_after_think_prefix(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def _fake_call(**_: object) -> tuple[str, dict]:
+        return (
+            "<think>internal reasoning</think>\n"
+            '{"regime_probs":{"quiet":0.2,"active":0.3,"burst":0.5},'
+            '"delta_progress":0.02,"delta_uncertainty":0.05,"mean_shift_hint":0.2,'
+            '"confidence":0.78,"evidence_span":["wild"],"reason_codes":["semantic"]}',
+            {},
+        )
+
+    monkeypatch.setattr(llm_mod, "_call_openai_chat", _fake_call)
+    agent = LLMSemanticAgent(_cfg())
+    out = await agent.analyze_posts(
+        market_id="m1",
+        window_code="short",
+        as_of=None,
+        observed_count=3,
+        progress=0.5,
+        posts=_posts(),
+    )
+
+    assert out.parse_ok is True
+    assert out.error_code is None
+    assert out.confidence == pytest.approx(0.78)
+
+
+@pytest.mark.asyncio
 async def test_llm_semantic_agent_minimax_uses_cn_base_url(monkeypatch: pytest.MonkeyPatch) -> None:
     captured: dict[str, object] = {}
 
