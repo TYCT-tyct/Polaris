@@ -60,6 +60,11 @@ class StrategyA:
             if not executable:
                 continue
 
+            # 防御：若 basket 的总成本远离 1，通常意味着“事件篮子不完整”(universe 被 token limit 截断)。
+            # 真实的“买齐全集必得 1”套利，total_cost_per_share 不太可能低到这种程度。
+            if total_cost_per_share < float(self.config.a_min_total_cost_per_share):
+                continue
+
             edge_pct = 1.0 - total_cost_per_share
             if edge_pct < self.config.a_min_edge_pct:
                 continue

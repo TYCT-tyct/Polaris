@@ -129,6 +129,7 @@ class PolarisSettings(BaseSettings):
     arb_paper_initial_bankroll_usd: float = Field(default=10.0)
     arb_paper_split_by_strategy: bool = Field(default=False)
     arb_paper_enforce_bankroll: bool = Field(default=True)
+    arb_paper_portfolio_snapshot_interval_sec: int = Field(default=60)
 
     # module2: strategy switches
     arb_enable_strategy_a: bool = Field(default=True)
@@ -141,6 +142,7 @@ class PolarisSettings(BaseSettings):
 
     # module2: strategy thresholds
     arb_a_min_edge_pct: float = Field(default=0.015)
+    arb_a_min_total_cost_per_share: float = Field(default=0.70)
     arb_b_min_edge_pct: float = Field(default=0.012)
     arb_c_min_edge_pct: float = Field(default=0.015)
     arb_c_max_candidates_per_event: int = Field(default=1)

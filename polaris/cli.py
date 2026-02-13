@@ -1573,6 +1573,34 @@ async def _arb_cleanup_counts(
             signal_params,
         )
     )
+    if await _table_exists(db, "arb_scan_diag"):
+        counts["arb_scan_diag"] = _as_int(
+            await db.fetch_one(
+                """
+                select count(*) as c
+                from arb_scan_diag
+                where (%s::text is null or mode = %s::text)
+                  and (%s::text is null or source_code = %s::text)
+                  and (%s::text is null or run_tag = %s::text)
+                  and (%s::timestamptz is null or created_at >= %s::timestamptz)
+                """,
+                signal_params,
+            )
+        )
+    if await _table_exists(db, "arb_portfolio_snapshot"):
+        counts["arb_portfolio_snapshot"] = _as_int(
+            await db.fetch_one(
+                """
+                select count(*) as c
+                from arb_portfolio_snapshot
+                where (%s::text is null or mode = %s::text)
+                  and (%s::text is null or source_code = %s::text)
+                  and (%s::text is null or run_tag = %s::text)
+                  and (%s::timestamptz is null or created_at >= %s::timestamptz)
+                """,
+                signal_params,
+            )
+        )
     counts["arb_replay_run"] = _as_int(
         await db.fetch_one(
             """
@@ -1601,19 +1629,41 @@ async def _arb_cleanup_counts(
         )
     )
     if include_position_lot:
-        counts["arb_position_lot"] = _as_int(
-            await db.fetch_one(
-                """
-                select count(*) as c
-                from arb_position_lot
-                where (%s::text is null or mode = %s::text)
-                  and (%s::text is null or source_code = %s::text)
-                  and (%s::text is null or coalesce(run_tag, '') = %s::text)
-                  and (%s::timestamptz is null or opened_at >= %s::timestamptz)
-                """,
-                signal_params,
+        has_run_tag = await _table_has_column(db, "arb_position_lot", "run_tag")
+        if has_run_tag:
+            counts["arb_position_lot"] = _as_int(
+                await db.fetch_one(
+                    """
+                    select count(*) as c
+                    from arb_position_lot
+                    where (%s::text is null or mode = %s::text)
+                      and (%s::text is null or source_code = %s::text)
+                      and (%s::text is null or coalesce(run_tag, '') = %s::text)
+                      and (%s::timestamptz is null or opened_at >= %s::timestamptz)
+                    """,
+                    signal_params,
+                )
             )
-        )
+        else:
+            counts["arb_position_lot"] = _as_int(
+                await db.fetch_one(
+                    """
+                    select count(*) as c
+                    from arb_position_lot
+                    where (%s::text is null or mode = %s::text)
+                      and (%s::text is null or source_code = %s::text)
+                      and (%s::timestamptz is null or opened_at >= %s::timestamptz)
+                    """,
+                    (
+                        mode_filter,
+                        mode_filter,
+                        source_filter,
+                        source_filter,
+                        since_start,
+                        since_start,
+                    ),
+                )
+            )
     if include_param_snapshot:
         counts["arb_param_snapshot"] = _as_int(
             await db.fetch_one(
@@ -1680,6 +1730,30 @@ async def _arb_cleanup_apply(
         replay_params,
     )
 
+    if await _table_exists(db, "arb_scan_diag"):
+        await db.execute(
+            """
+            delete from arb_scan_diag
+            where (%s::text is null or mode = %s::text)
+              and (%s::text is null or source_code = %s::text)
+              and (%s::text is null or run_tag = %s::text)
+              and (%s::timestamptz is null or created_at >= %s::timestamptz)
+            """,
+            signal_params,
+        )
+
+    if await _table_exists(db, "arb_portfolio_snapshot"):
+        await db.execute(
+            """
+            delete from arb_portfolio_snapshot
+            where (%s::text is null or mode = %s::text)
+              and (%s::text is null or source_code = %s::text)
+              and (%s::text is null or run_tag = %s::text)
+              and (%s::timestamptz is null or created_at >= %s::timestamptz)
+            """,
+            signal_params,
+        )
+
     if include_param_snapshot:
         await db.execute(
             """
@@ -1690,16 +1764,35 @@ async def _arb_cleanup_apply(
             (run_tag_filter, run_tag_filter, since_start, since_start),
         )
     if include_position_lot:
-        await db.execute(
-            """
-            delete from arb_position_lot
-            where (%s::text is null or mode = %s::text)
-              and (%s::text is null or source_code = %s::text)
-              and (%s::text is null or coalesce(run_tag, '') = %s::text)
-              and (%s::timestamptz is null or opened_at >= %s::timestamptz)
-            """,
-            signal_params,
-        )
+        has_run_tag = await _table_has_column(db, "arb_position_lot", "run_tag")
+        if has_run_tag:
+            await db.execute(
+                """
+                delete from arb_position_lot
+                where (%s::text is null or mode = %s::text)
+                  and (%s::text is null or source_code = %s::text)
+                  and (%s::text is null or coalesce(run_tag, '') = %s::text)
+                  and (%s::timestamptz is null or opened_at >= %s::timestamptz)
+                """,
+                signal_params,
+            )
+        else:
+            await db.execute(
+                """
+                delete from arb_position_lot
+                where (%s::text is null or mode = %s::text)
+                  and (%s::text is null or source_code = %s::text)
+                  and (%s::timestamptz is null or opened_at >= %s::timestamptz)
+                """,
+                (
+                    mode_filter,
+                    mode_filter,
+                    source_filter,
+                    source_filter,
+                    since_start,
+                    since_start,
+                ),
+            )
 
     await db.execute(
         """
@@ -1874,6 +1967,26 @@ def _pct(values: list[float], p: float) -> float:
     sorted_values = sorted(values)
     idx = int(round((p / 100.0) * (len(sorted_values) - 1)))
     return float(sorted_values[idx])
+
+
+async def _table_exists(db: Database, table: str) -> bool:
+    row = await db.fetch_one("select to_regclass(%s) as reg", (f"public.{table}",))
+    return bool(row and row.get("reg"))
+
+
+async def _table_has_column(db: Database, table: str, column: str) -> bool:
+    row = await db.fetch_one(
+        """
+        select 1
+        from information_schema.columns
+        where table_schema = 'public'
+          and table_name = %s
+          and column_name = %s
+        limit 1
+        """,
+        (table, column),
+    )
+    return row is not None
 
 
 def _summarize_cycle_stats(rows: list[dict[str, int]]) -> dict[str, object]:

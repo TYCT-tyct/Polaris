@@ -62,6 +62,7 @@ class ArbConfig:
     paper_initial_bankroll_usd: float
     paper_split_by_strategy: bool
     paper_enforce_bankroll: bool
+    paper_portfolio_snapshot_interval_sec: int
 
     enable_strategy_a: bool
     enable_strategy_b: bool
@@ -72,6 +73,7 @@ class ArbConfig:
     strategy_priority: tuple[str, ...]
 
     a_min_edge_pct: float
+    a_min_total_cost_per_share: float
     b_min_edge_pct: float
     c_min_edge_pct: float
     c_max_candidates_per_event: int
@@ -142,6 +144,7 @@ def arb_config_from_settings(settings: PolarisSettings) -> ArbConfig:
         paper_initial_bankroll_usd=settings.arb_paper_initial_bankroll_usd,
         paper_split_by_strategy=settings.arb_paper_split_by_strategy,
         paper_enforce_bankroll=settings.arb_paper_enforce_bankroll,
+        paper_portfolio_snapshot_interval_sec=settings.arb_paper_portfolio_snapshot_interval_sec,
         enable_strategy_a=settings.arb_enable_strategy_a,
         enable_strategy_b=settings.arb_enable_strategy_b,
         enable_strategy_c=settings.arb_enable_strategy_c,
@@ -150,6 +153,7 @@ def arb_config_from_settings(settings: PolarisSettings) -> ArbConfig:
         c_live_enabled=settings.arb_c_live_enabled,
         strategy_priority=tuple(settings.arb_priority),
         a_min_edge_pct=settings.arb_a_min_edge_pct,
+        a_min_total_cost_per_share=settings.arb_a_min_total_cost_per_share,
         b_min_edge_pct=settings.arb_b_min_edge_pct,
         c_min_edge_pct=settings.arb_c_min_edge_pct,
         c_max_candidates_per_event=settings.arb_c_max_candidates_per_event,

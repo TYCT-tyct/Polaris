@@ -59,6 +59,7 @@ class ArbOrchestrator:
         self._universe_cache_rows: list[dict[str, Any]] = []
         self._universe_cache_until: datetime | None = None
         self._last_snapshot_metrics: dict[str, int | float | bool] = {}
+        self._last_portfolio_snapshot_at: dict[str, datetime] = {}
 
         self.strategy_a = StrategyA(config)
         self.strategy_b = StrategyB(config)
@@ -88,8 +89,7 @@ class ArbOrchestrator:
         all_signals = self._scan_all(mode, source_code, snapshots)
         ordered = self._order_signals(all_signals)
         ordered = self._dedupe_signals(ordered)
-        scan_diag = _init_scan_diag_stats(all_signals, ordered)
-        scan_ms = int((perf_counter() - scan_started) * 1000)
+        dropped_by_cap: list[ArbSignal] = []
         if self.config.max_signals_per_cycle > 0 and len(ordered) > self.config.max_signals_per_cycle:
             logger.info(
                 "arb signal cap applied",
@@ -100,7 +100,12 @@ class ArbOrchestrator:
                     "cap": self.config.max_signals_per_cycle,
                 },
             )
+            dropped_by_cap = ordered[self.config.max_signals_per_cycle :]
             ordered = ordered[: self.config.max_signals_per_cycle]
+        scan_diag = _init_scan_diag_stats(all_signals, ordered)
+        for signal in dropped_by_cap:
+            _note_scan_diag_reason(scan_diag, signal.strategy_code.value, "dropped_by_cap")
+        scan_ms = int((perf_counter() - scan_started) * 1000)
         process_started = perf_counter()
         executed = 0
         snapshot_map = {item.token_id: item for item in snapshots}
@@ -191,8 +196,8 @@ class ArbOrchestrator:
             await self._record_signals(rejected)
 
         status_updates: list[tuple[str, str]] = []
-        cash_rows: list[tuple[str, str, str, str, float, float, float, str, str]] = []
-        lot_rows: list[tuple[str, str, str, str, str, str, float, float, float, float, float]] = []
+        cash_rows: list[tuple[str, str, str, str, float, float, float, str, str | None, str]] = []
+        open_lot_rows: list[tuple[str, str, str, str, str, str, str, str | None, float, float, float, float]] = []
         if approved:
             await self._record_signals([(signal, SignalStatus.NEW, None) for signal, _, _, _ in approved])
             concurrency = max(1, self.config.execution_concurrency)
@@ -221,55 +226,122 @@ class ArbOrchestrator:
                 success = result.status == "filled"
                 hold_minutes = float(result.hold_minutes or 0.0)
                 should_release_exposure = True
-                if signal.mode == RunMode.LIVE:
+                if signal.mode in {RunMode.PAPER_LIVE, RunMode.PAPER_REPLAY}:
+                    # paper 需要持仓与资金占用真实演化：成交后不释放敞口，直到后续平仓/到期。
+                    should_release_exposure = not success
+                elif signal.mode == RunMode.LIVE:
+                    # live 允许短持仓快速释放敞口，避免长时间占用导致后续信号完全无法下单。
                     should_release_exposure = (not success) or hold_minutes <= 1.0
                 self.risk_gate.settle_execution(
                     state=risk_state,
                     success=success,
                     capital_required_usd=notional,
-                    realized_pnl_usd=result.net_pnl_usd if success else 0.0,
+                    # paper 的 net_pnl_usd 目前是“口径化结果”(比如立即回补成本)，不代表现金已实现收益。
+                    realized_pnl_usd=result.net_pnl_usd if (success and signal.mode == RunMode.LIVE) else 0.0,
                     release_exposure=should_release_exposure,
                 )
                 if not success:
                     status_updates.append((SignalStatus.REJECTED.value, str(signal.signal_id)))
                     continue
 
+                # 如果 paper 出现部分成交，使用实际成交名义金额替换预留敞口，避免风控把“没成交的那部分”也算进占用。
+                if signal.mode in {RunMode.PAPER_LIVE, RunMode.PAPER_REPLAY}:
+                    actual = float(result.capital_used_usd or 0.0)
+                    reserved = max(0.0, float(notional))
+                    delta = max(0.0, reserved - actual)
+                    if delta > 0:
+                        risk_state.exposure_usd = max(0.0, risk_state.exposure_usd - delta)
+                        if self.config.paper_enforce_bankroll:
+                            risk_state.cash_balance_usd += delta
+
                 executed += 1
-                before = cash_balances[scope_key]
-                after = before + result.net_pnl_usd
-                cash_balances[scope_key] = after
-                cash_rows.append(
-                    (
-                        signal.mode.value,
-                        signal.strategy_code.value,
-                        signal.source_code,
-                        "trade_net_pnl",
-                        result.net_pnl_usd,
-                        before,
-                        after,
-                        str(signal.signal_id),
-                        json.dumps(
-                            {
-                                "status": result.status,
-                                "run_tag": self.config.run_tag,
-                                "execution_backend": self.config.execution_backend,
-                            },
-                            ensure_ascii=True,
-                        ),
+
+                if signal.mode in {RunMode.PAPER_LIVE, RunMode.PAPER_REPLAY}:
+                    ledger_strategy = (
+                        signal.strategy_code.value
+                        if self._paper_strategy_split(signal.mode)
+                        else "shared"
                     )
-                )
-                lot_rows.extend(_position_rows(signal, result.fills, result.net_pnl_usd))
+                    before = cash_balances[scope_key]
+                    intent_by_token = {intent.token_id: str(intent.intent_id) for intent in _plan.intents}
+                    for fill in result.fills:
+                        intent_id = intent_by_token.get(fill.token_id)
+                        amount = float(fill.fill_notional_usd)
+                        if fill.side.upper() == "BUY":
+                            entry_type = "buy_cost"
+                            amount = -amount
+                        else:
+                            entry_type = "sell_proceeds"
+                        after = before + amount
+                        cash_rows.append(
+                            (
+                                signal.mode.value,
+                                ledger_strategy,
+                                signal.source_code,
+                                entry_type,
+                                amount,
+                                before,
+                                after,
+                                str(signal.signal_id),
+                                intent_id,
+                                json.dumps(
+                                    {
+                                        "run_tag": self.config.run_tag,
+                                        "execution_backend": self.config.execution_backend,
+                                        "fill": {
+                                            "market_id": fill.market_id,
+                                            "token_id": fill.token_id,
+                                            "side": fill.side,
+                                            "price": fill.fill_price,
+                                            "size": fill.fill_size,
+                                            "notional_usd": fill.fill_notional_usd,
+                                        },
+                                    },
+                                    ensure_ascii=True,
+                                ),
+                            )
+                        )
+                        before = after
+                        if float(fill.fee_usd or 0.0) > 0:
+                            after = before - float(fill.fee_usd)
+                            cash_rows.append(
+                                (
+                                    signal.mode.value,
+                                    ledger_strategy,
+                                    signal.source_code,
+                                    "fee",
+                                    -float(fill.fee_usd),
+                                    before,
+                                    after,
+                                    str(signal.signal_id),
+                                    intent_id,
+                                    json.dumps(
+                                        {
+                                            "run_tag": self.config.run_tag,
+                                            "execution_backend": self.config.execution_backend,
+                                            "fill": {"token_id": fill.token_id, "fee_usd": fill.fee_usd},
+                                        },
+                                        ensure_ascii=True,
+                                    ),
+                                )
+                            )
+                            before = after
+                    cash_balances[scope_key] = before
+                    open_lot_rows.extend(_open_position_rows(signal, _plan, result.fills))
+
                 scan_diag[signal.strategy_code.value]["executed"] += 1
                 status_updates.append((SignalStatus.EXECUTED.value, str(signal.signal_id)))
 
         if cash_rows:
             await self._record_cash_ledger_rows(cash_rows)
-        if lot_rows:
-            await self._record_position_lot_rows(lot_rows)
+        if open_lot_rows:
+            await self._record_position_lot_open_rows(open_lot_rows)
         if status_updates:
             await self._mark_signal_status_many(status_updates)
         if scan_diag:
             await self._record_scan_diag(mode, source_code, scan_diag)
+        if mode in {RunMode.PAPER_LIVE, RunMode.PAPER_REPLAY}:
+            await self._maybe_record_portfolio_snapshots(mode, source_code, risk_states, cash_balances, snapshot_map)
 
         if mode == RunMode.PAPER_LIVE:
             await self._maybe_run_optimization()
@@ -382,7 +454,8 @@ class ArbOrchestrator:
                     state,
                     success=filled,
                     capital_required_usd=capital_required,
-                    realized_pnl_usd=result.net_pnl_usd if filled else 0.0,
+                    realized_pnl_usd=0.0,
+                    release_exposure=not filled,
                 )
                 if filled:
                     expected_gross = float(result.metadata.get("expected_gross_pnl_usd") or 0.0)
@@ -650,6 +723,65 @@ class ArbOrchestrator:
             """,
             (now, window_end, self.config.universe_min_liquidity, self.config.universe_token_limit),
         )
+        if rows:
+            # NegRisk 事件的策略(A/C)对“事件篮子完整性”敏感。
+            # 如果 universe 按 token limit 截断，会出现只拿到部分 outcome，从而产生“假套利”(例如 total_cost_per_share=0.003)。
+            # 这里对已命中的 negRisk event 做一次扩展：把该 event 下的全部 token 拉全（不再受 liquidity 过滤）。
+            neg_event_ids = sorted(
+                {
+                    str(row["event_id"])
+                    for row in rows
+                    if row.get("is_neg_risk") and row.get("event_id") is not None
+                }
+            )
+            if neg_event_ids:
+                expanded = await self.db.fetch_all(
+                    """
+                    select
+                        t.token_id,
+                        t.market_id,
+                        t.outcome_label,
+                        t.outcome_side,
+                        t.outcome_index,
+                        t.min_order_size,
+                        t.tick_size,
+                        t.is_other_outcome,
+                        t.is_placeholder_outcome,
+                        m.event_id,
+                        m.condition_id,
+                        (m.neg_risk or m.neg_risk_augmented) as is_neg_risk,
+                        m.question,
+                        m.end_date
+                    from dim_token t
+                    join dim_market m on m.market_id = t.market_id
+                    where m.active = true
+                      and m.closed = false
+                      and m.archived = false
+                      and m.end_date is not null
+                      and m.end_date > %s
+                      and m.end_date <= %s
+                      and m.event_id = any(%s::text[])
+                    order by m.end_date asc, m.liquidity desc nulls last, t.outcome_index asc
+                    """,
+                    (now, window_end, neg_event_ids),
+                )
+                by_token: dict[str, dict[str, Any]] = {str(row["token_id"]): row for row in rows}
+                for row in expanded:
+                    by_token[str(row["token_id"])] = row
+                rows = list(by_token.values())
+                # 若扩展后超出 token limit，优先保留 negRisk token，其余按 end_date/liquidity 排序截断。
+                if self.config.universe_token_limit > 0 and len(rows) > self.config.universe_token_limit:
+                    neg_rows = [row for row in rows if row.get("is_neg_risk")]
+                    other_rows = [row for row in rows if not row.get("is_neg_risk")]
+                    other_rows.sort(
+                        key=lambda item: (
+                            item.get("end_date") or now,
+                            -(float(item.get("liquidity") or 0.0)),
+                            int(item.get("outcome_index") or 0),
+                        )
+                    )
+                    remaining = max(0, self.config.universe_token_limit - len(neg_rows))
+                    rows = neg_rows + other_rows[:remaining]
         self._universe_cache_rows = rows
         self._universe_cache_until = now + timedelta(seconds=refresh_sec) if refresh_sec > 0 else None
         return rows
@@ -886,17 +1018,31 @@ class ArbOrchestrator:
         strategy_code: StrategyCode | None = None,
     ) -> float:
         if strategy_code is None:
-            row = await self.db.fetch_one(
-                """
-                select balance_after_usd
-                from arb_cash_ledger
-                where mode = %s and source_code = %s
-                  and coalesce(payload->>'run_tag', '') = %s
-                order by created_at desc
-                limit 1
-                """,
-                (mode.value, source_code, self.config.run_tag),
-            )
+            if mode in {RunMode.PAPER_LIVE, RunMode.PAPER_REPLAY}:
+                # paper shared 资金池用 strategy_code='shared' 作为单一账本，避免混入各策略行导致余额口径漂移。
+                row = await self.db.fetch_one(
+                    """
+                    select balance_after_usd
+                    from arb_cash_ledger
+                    where mode = %s and source_code = %s and strategy_code = 'shared'
+                      and coalesce(payload->>'run_tag', '') = %s
+                    order by created_at desc
+                    limit 1
+                    """,
+                    (mode.value, source_code, self.config.run_tag),
+                )
+            else:
+                row = await self.db.fetch_one(
+                    """
+                    select balance_after_usd
+                    from arb_cash_ledger
+                    where mode = %s and source_code = %s
+                      and coalesce(payload->>'run_tag', '') = %s
+                    order by created_at desc
+                    limit 1
+                    """,
+                    (mode.value, source_code, self.config.run_tag),
+                )
         else:
             row = await self.db.fetch_one(
                 """
@@ -922,8 +1068,9 @@ class ArbOrchestrator:
             """
             insert into arb_cash_ledger(
                 mode, strategy_code, source_code, entry_type, amount_usd,
-                balance_before_usd, balance_after_usd, ref_signal_id, payload, created_at
-            ) values (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, now())
+                balance_before_usd, balance_after_usd, ref_signal_id, ref_intent_id,
+                payload, created_at
+            ) values (%s, %s, %s, %s, %s, %s, %s, %s, null, %s::jsonb, now())
             """,
             (
                 signal.mode.value,
@@ -946,29 +1093,33 @@ class ArbOrchestrator:
         )
         return after
 
-    async def _record_cash_ledger_rows(self, rows: list[tuple[str, str, str, str, float, float, float, str, str]]) -> None:
+    async def _record_cash_ledger_rows(
+        self,
+        rows: list[tuple[str, str, str, str, float, float, float, str, str | None, str]],
+    ) -> None:
         if not rows:
             return
         await self.db.executemany(
             """
             insert into arb_cash_ledger(
                 mode, strategy_code, source_code, entry_type, amount_usd,
-                balance_before_usd, balance_after_usd, ref_signal_id, payload, created_at
-            ) values (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, now())
+                balance_before_usd, balance_after_usd, ref_signal_id, ref_intent_id,
+                payload, created_at
+            ) values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, now())
             """,
             rows,
         )
 
     async def _record_position_lots(self, result) -> None:
         signal = result.signal
-        rows = _position_rows(signal, result.fills, result.net_pnl_usd)
+        rows = _open_position_rows(signal, None, result.fills)
         if not rows:
             return
-        await self._record_position_lot_rows(rows)
+        await self._record_position_lot_open_rows(rows)
 
-    async def _record_position_lot_rows(
+    async def _record_position_lot_open_rows(
         self,
-        rows: list[tuple[str, str, str, str, str, str, str, float, float, float, float, float]],
+        rows: list[tuple[str, str, str, str, str, str, str, str | None, float, float, float, float]],
     ) -> None:
         if not rows:
             return
@@ -976,10 +1127,10 @@ class ArbOrchestrator:
             """
             insert into arb_position_lot(
                 mode, strategy_code, source_code, run_tag, market_id, token_id, side,
-                open_price, open_size, open_notional_usd, remaining_size,
-                status, opened_at, closed_at, close_price, realized_pnl_usd
+                open_intent_id, open_price, open_size, open_notional_usd, remaining_size,
+                status, opened_at
             )
-            values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 0, 'closed', now(), now(), %s, %s)
+            values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'open', now())
             """,
             rows,
         )
@@ -1024,6 +1175,71 @@ class ArbOrchestrator:
             """,
             payload,
         )
+
+    async def _maybe_record_portfolio_snapshots(
+        self,
+        mode: RunMode,
+        source_code: str,
+        risk_states: dict[str, RiskRuntimeState],
+        cash_balances: dict[str, float],
+        snapshot_map: dict[str, TokenSnapshot],
+    ) -> None:
+        interval = max(1, int(self.config.paper_portfolio_snapshot_interval_sec))
+        now = datetime.now(tz=UTC)
+        for scope_key, state in risk_states.items():
+            last = self._last_portfolio_snapshot_at.get(scope_key)
+            if last and (now - last).total_seconds() < interval:
+                continue
+            self._last_portfolio_snapshot_at[scope_key] = now
+
+            scope = state.strategy_code.value if state.strategy_code else "shared"
+            strategy_filter = state.strategy_code.value if state.strategy_code else None
+            sql = """
+                select token_id, remaining_size, open_notional_usd
+                from arb_position_lot
+                where mode = %s
+                  and source_code = %s
+                  and run_tag = %s
+                  and status = 'open'
+            """
+            params: list[object] = [mode.value, source_code, self.config.run_tag]
+            if strategy_filter:
+                sql += " and strategy_code = %s"
+                params.append(strategy_filter)
+            lots = await self.db.fetch_all(sql, tuple(params))
+
+            exposure = 0.0
+            mtm_value = 0.0
+            for row in lots:
+                exposure += float(row.get("open_notional_usd") or 0.0)
+                token_id = str(row.get("token_id") or "")
+                size = float(row.get("remaining_size") or 0.0)
+                snap = snapshot_map.get(token_id)
+                bid = float(snap.best_bid) if snap and snap.best_bid is not None else 0.0
+                mtm_value += bid * size
+
+            cash = float(cash_balances.get(scope_key, self.config.paper_initial_bankroll_usd))
+            nav = cash + mtm_value
+            await self.db.execute(
+                """
+                insert into arb_portfolio_snapshot(
+                    mode, source_code, run_tag, scope,
+                    cash_balance_usd, exposure_usd, nav_mtm_usd, open_lots,
+                    payload, created_at
+                ) values (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, now())
+                """,
+                (
+                    mode.value,
+                    source_code,
+                    self.config.run_tag,
+                    scope,
+                    cash,
+                    exposure,
+                    nav,
+                    int(len(lots)),
+                    json.dumps({"execution_backend": self.config.execution_backend}, ensure_ascii=True),
+                ),
+            )
 
     async def _maybe_run_optimization(self) -> None:
         now = datetime.now(tz=UTC)
@@ -1203,28 +1419,34 @@ def _signal_rank_key(signal: ArbSignal, priority: dict[str, int]) -> tuple[float
     )
 
 
-def _position_rows(
+def _open_position_rows(
     signal: ArbSignal,
+    plan: ExecutionPlan | None,
     fills: list[FillEvent],
-    realized_pnl_usd: float,
-) -> list[tuple[str, str, str, str, str, str, str, float, float, float, float, float]]:
-    return [
-        (
-            signal.mode.value,
-            signal.strategy_code.value,
-            signal.source_code,
-            str(signal.features.get("run_tag", "")),
-            fill.market_id,
-            fill.token_id,
-            fill.side,
-            fill.fill_price,
-            fill.fill_size,
-            fill.fill_notional_usd,
-            fill.fill_price,
-            realized_pnl_usd,
+) -> list[tuple[str, str, str, str, str, str, str, str | None, float, float, float, float]]:
+    run_tag = str(signal.features.get("run_tag", ""))
+    intent_by_token: dict[str, str] = {}
+    if plan is not None:
+        intent_by_token = {intent.token_id: str(intent.intent_id) for intent in plan.intents}
+    rows: list[tuple[str, str, str, str, str, str, str, str | None, float, float, float, float]] = []
+    for fill in fills:
+        rows.append(
+            (
+                signal.mode.value,
+                signal.strategy_code.value,
+                signal.source_code,
+                run_tag,
+                fill.market_id,
+                fill.token_id,
+                fill.side,
+                intent_by_token.get(fill.token_id),
+                float(fill.fill_price),
+                float(fill.fill_size),
+                float(fill.fill_notional_usd),
+                float(fill.fill_size),
+            )
         )
-        for fill in fills
-    ]
+    return rows
 
 
 def _init_scan_diag_stats(all_signals: list[ArbSignal], ordered_signals: list[ArbSignal]) -> dict[str, dict[str, Any]]:
@@ -1250,6 +1472,14 @@ def _note_scan_diag_reject(stats: dict[str, dict[str, Any]], strategy_code: str,
         {"evaluated": 0, "processed": 0, "approved": 0, "executed": 0, "rejected": 0, "expired": 0, "reasons": Counter()},
     )
     bucket["rejected"] += 1
+    bucket["reasons"][reason] += 1
+
+
+def _note_scan_diag_reason(stats: dict[str, dict[str, Any]], strategy_code: str, reason: str) -> None:
+    bucket = stats.setdefault(
+        strategy_code,
+        {"evaluated": 0, "processed": 0, "approved": 0, "executed": 0, "rejected": 0, "expired": 0, "reasons": Counter()},
+    )
     bucket["reasons"][reason] += 1
 
 

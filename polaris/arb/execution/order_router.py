@@ -74,39 +74,67 @@ class OrderRouter:
                 snapshots,
                 slippage_bps=self.config.slippage_bps,
             )
+        multi_leg = len(plan.intents) > 1
+        min_fill_ratio = float(self.config.patch_fill_threshold)
+
         if rust_result is not None:
-            fills = rust_result.fills
-            total_notional = rust_result.capital_used_usd
-            if persist and rust_result.events:
-                event_rows.extend(rust_result.events)
+            candidate_fills = list(rust_result.fills)
+            # 防御：多腿套利需要“接近全成”。否则纸面里会出现非对冲暴露，既不真实也会误判收益。
+            if multi_leg:
+                by_token = {fill.token_id: fill for fill in candidate_fills}
+                ok = True
+                for intent in plan.intents:
+                    fill = by_token.get(intent.token_id)
+                    if fill is None:
+                        ok = False
+                        break
+                    if intent.shares is not None and float(intent.shares) > 0:
+                        ratio = float(fill.fill_size) / float(intent.shares)
+                        if ratio + 1e-12 < min_fill_ratio:
+                            ok = False
+                            break
+                if not ok:
+                    candidate_fills = []
+                    total_notional = 0.0
+
+            fills = candidate_fills
+            total_notional = float(rust_result.capital_used_usd or 0.0) if fills else 0.0
             if persist:
-                for fill in fills:
-                    fill_rows.append(
-                        (
-                            str(_find_intent_id(plan, fill.token_id)),
-                            fill.market_id,
-                            fill.token_id,
-                            fill.side,
-                            fill.fill_price,
-                            fill.fill_size,
-                            fill.fill_notional_usd,
-                            fill.fee_usd,
-                        )
-                    )
-        else:
-            for intent in plan.intents:
-                snap = snapshots.get(intent.token_id)
-                if snap is None:
-                    if persist:
+                # rust 事件与成交写入：仅在 trade 判定为“有效成交”时保留 fills；否则按 reject 处理。
+                if fills and rust_result.events:
+                    event_rows.extend(rust_result.events)
+                else:
+                    for intent in plan.intents:
                         event_rows.append(
                             (
                                 str(intent.intent_id),
                                 "reject",
-                                404,
-                                "missing_snapshot",
+                                422,
+                                "paper_multi_leg_incomplete",
                                 json.dumps({}, ensure_ascii=True),
                             )
                         )
+                if fills:
+                    for fill in fills:
+                        fill_rows.append(
+                            (
+                                str(_find_intent_id(plan, fill.token_id)),
+                                fill.market_id,
+                                fill.token_id,
+                                fill.side,
+                                fill.fill_price,
+                                fill.fill_size,
+                                fill.fill_notional_usd,
+                                fill.fee_usd,
+                            )
+                        )
+        else:
+            simulated: list[tuple[Any, FillEvent | None, str, float]] = []
+            for intent in plan.intents:
+                snap = snapshots.get(intent.token_id)
+                if snap is None:
+                    requested = float(intent.shares or 0.0)
+                    simulated.append((intent, None, "missing_snapshot", requested))
                     continue
                 fill, reject_reason, requested = _simulate_intent_fill(
                     intent.limit_price,
@@ -117,52 +145,137 @@ class OrderRouter:
                     order_type=intent.order_type,
                     slippage_bps=self.config.slippage_bps,
                 )
-                if fill is None:
+                simulated.append((intent, fill, reject_reason, requested))
+
+            if multi_leg:
+                ok = True
+                for _intent, fill, _reject_reason, requested in simulated:
+                    if fill is None:
+                        ok = False
+                        break
+                    ratio = float(fill.fill_size) / float(requested) if requested > 0 else 0.0
+                    if ratio + 1e-12 < min_fill_ratio:
+                        ok = False
+                        break
+                if not ok:
                     if persist:
+                        for intent, fill, reject_reason, requested in simulated:
+                            if fill is None:
+                                event_rows.append(
+                                    (
+                                        str(intent.intent_id),
+                                        "reject",
+                                        422,
+                                        reject_reason,
+                                        json.dumps({}, ensure_ascii=True),
+                                    )
+                                )
+                                continue
+                            ratio = float(fill.fill_size) / float(requested) if requested > 0 else 0.0
+                            event_rows.append(
+                                (
+                                    str(intent.intent_id),
+                                    "reject",
+                                    422,
+                                    "paper_multi_leg_partial_fill",
+                                    json.dumps(
+                                        {
+                                            "requested_size": requested,
+                                            "filled_size": fill.fill_size,
+                                            "fill_ratio": ratio,
+                                            "min_ratio": min_fill_ratio,
+                                        },
+                                        ensure_ascii=True,
+                                    ),
+                                )
+                            )
+                    fills = []
+                    total_notional = 0.0
+                else:
+                    for intent, fill, _reject_reason, requested in simulated:
+                        assert fill is not None
+                        fills.append(fill)
+                        total_notional += fill.fill_notional_usd
+                        if persist:
+                            event_name = "partial_fill" if fill.fill_size + 1e-12 < requested else "fill"
+                            message = "paper_partial_fill" if event_name == "partial_fill" else "paper_fill"
+                            event_rows.append(
+                                (
+                                    str(intent.intent_id),
+                                    event_name,
+                                    200,
+                                    message,
+                                    json.dumps(
+                                        {
+                                            "price": fill.fill_price,
+                                            "size": fill.fill_size,
+                                            "requested_size": requested,
+                                            "notional": fill.fill_notional_usd,
+                                        },
+                                        ensure_ascii=True,
+                                    ),
+                                )
+                            )
+                            fill_rows.append(
+                                (
+                                    str(intent.intent_id),
+                                    fill.market_id,
+                                    fill.token_id,
+                                    fill.side,
+                                    fill.fill_price,
+                                    fill.fill_size,
+                                    fill.fill_notional_usd,
+                                    fill.fee_usd,
+                                )
+                            )
+            else:
+                for intent, fill, reject_reason, requested in simulated:
+                    if fill is None:
+                        if persist:
+                            event_rows.append(
+                                (
+                                    str(intent.intent_id),
+                                    "reject",
+                                    422,
+                                    reject_reason,
+                                    json.dumps({}, ensure_ascii=True),
+                                )
+                            )
+                        continue
+                    fills.append(fill)
+                    total_notional += fill.fill_notional_usd
+                    if persist:
+                        event_name = "partial_fill" if fill.fill_size + 1e-12 < requested else "fill"
+                        message = "paper_partial_fill" if event_name == "partial_fill" else "paper_fill"
                         event_rows.append(
                             (
                                 str(intent.intent_id),
-                                "reject",
-                                422,
-                                reject_reason,
-                                json.dumps({}, ensure_ascii=True),
+                                event_name,
+                                200,
+                                message,
+                                json.dumps(
+                                    {
+                                        "price": fill.fill_price,
+                                        "size": fill.fill_size,
+                                        "requested_size": requested,
+                                        "notional": fill.fill_notional_usd,
+                                    },
+                                    ensure_ascii=True,
+                                ),
                             )
                         )
-                    continue
-                fills.append(fill)
-                total_notional += fill.fill_notional_usd
-                if persist:
-                    event_name = "partial_fill" if fill.fill_size + 1e-12 < requested else "fill"
-                    message = "paper_partial_fill" if event_name == "partial_fill" else "paper_fill"
-                    event_rows.append(
-                        (
-                            str(intent.intent_id),
-                            event_name,
-                            200,
-                            message,
-                            json.dumps(
-                                {
-                                    "price": fill.fill_price,
-                                    "size": fill.fill_size,
-                                    "requested_size": requested,
-                                    "notional": fill.fill_notional_usd,
-                                },
-                                ensure_ascii=True,
-                            ),
+                        fill_rows.append(
+                            (
+                                str(intent.intent_id),
+                                fill.market_id,
+                                fill.token_id,
+                                fill.side,
+                                fill.fill_price,
+                                fill.fill_size,
+                                fill.fill_notional_usd,
+                                fill.fee_usd,
+                            )
                         )
-                    )
-                    fill_rows.append(
-                        (
-                            str(intent.intent_id),
-                            fill.market_id,
-                            fill.token_id,
-                            fill.side,
-                            fill.fill_price,
-                            fill.fill_size,
-                            fill.fill_notional_usd,
-                            fill.fee_usd,
-                        )
-                    )
         if persist:
             await self._record_order_events(event_rows)
             await self._record_fills(fill_rows)
