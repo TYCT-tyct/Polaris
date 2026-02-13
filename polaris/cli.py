@@ -974,6 +974,7 @@ def m4_run_once(
     run_tag: Annotated[str, typer.Option("--run-tag", help="auto|custom")] = "auto",
     market_id: Annotated[str, typer.Option("--market-id", help="Optional single market_id")] = "",
     use_agent: Annotated[bool, typer.Option("--agent/--no-agent")] = True,
+    require_count_buckets: Annotated[bool, typer.Option("--require-count-buckets/--all-tweet-markets")] = False,
 ) -> None:
     """Run one Module4 prediction/decision cycle."""
     refresh_process_env_from_file(preserve_existing=True)
@@ -998,6 +999,7 @@ def m4_run_once(
                 run_tag=run_tag.strip() or "auto",
                 market_id=market_id.strip() or None,
                 use_agent=use_agent,
+                require_count_buckets=require_count_buckets,
             )
             payload = {
                 "run_tag": summary.run_tag,
@@ -1144,6 +1146,7 @@ def m4_replay(
     market_id: Annotated[str, typer.Option("--market-id", help="optional single market_id")] = "",
     use_agent: Annotated[bool, typer.Option("--agent/--no-agent")] = False,
     include_closed: Annotated[bool, typer.Option("--include-closed/--open-only")] = True,
+    require_count_buckets: Annotated[bool, typer.Option("--require-count-buckets/--all-tweet-markets")] = False,
     max_steps: Annotated[int, typer.Option("--max-steps", min=1, max=5000)] = 1000,
 ) -> None:
     """Replay Module4 predictions over historical timestamps (no future leakage)."""
@@ -1190,6 +1193,7 @@ def m4_replay(
                     use_agent=use_agent,
                     as_of=cursor,
                     include_closed=include_closed,
+                    require_count_buckets=require_count_buckets,
                 )
                 aggregate["markets_total"] += summary.markets_total
                 aggregate["markets_with_prior"] += summary.markets_with_prior
@@ -1211,6 +1215,7 @@ def m4_replay(
                 "steps": steps,
                 "max_steps": max_steps,
                 "include_closed": include_closed,
+                "require_count_buckets": require_count_buckets,
                 "agent_enabled": use_agent,
                 "aggregate": aggregate,
                 "skipped": dict(skipped_total),

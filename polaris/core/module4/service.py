@@ -102,6 +102,7 @@ class Module4Service:
         use_agent: bool | None = None,
         as_of: datetime | None = None,
         include_closed: bool = False,
+        require_count_buckets: bool = False,
     ) -> Module4RunSummary:
         run_tag_norm = _normalize_run_tag(run_tag)
         now = as_of or datetime.now(tz=UTC)
@@ -109,6 +110,7 @@ class Module4Service:
             market_id=market_id,
             as_of=now,
             include_closed=include_closed,
+            require_count_buckets=require_count_buckets,
         )
         snapshots_written = 0
         decisions_written = 0
@@ -317,13 +319,24 @@ class Module4Service:
         market_id: str | None = None,
         as_of: datetime | None = None,
         include_closed: bool = False,
+        require_count_buckets: bool = False,
     ) -> list[dict[str, Any]]:
         as_of_ts = as_of or datetime.now(tz=UTC)
         params: list[Any] = [as_of_ts, as_of_ts, as_of_ts]
         market_clause = ""
         state_clause = ""
+        bucket_clause = ""
         if not include_closed:
             state_clause = "and m.closed = false and m.active = true"
+        if require_count_buckets:
+            bucket_clause = """
+              and exists (
+                    select 1
+                    from dim_token tk
+                    where tk.market_id = m.market_id
+                      and tk.outcome_label ~ '[0-9]'
+              )
+            """
         if market_id:
             market_clause = "and m.market_id = %s"
             params.append(market_id)
@@ -361,12 +374,7 @@ class Module4Service:
                     m.question ilike '%%tweet%%'
                  or m.slug ilike '%%tweet%%'
               )
-              and exists (
-                    select 1
-                    from dim_token tk
-                    where tk.market_id = m.market_id
-                      and tk.outcome_label ~ '[0-9]'
-              )
+              {bucket_clause}
               {market_clause}
             order by coalesce(m.end_date, tw.end_date) asc, m.market_id asc
             """,
